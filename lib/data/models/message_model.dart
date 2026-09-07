@@ -95,6 +95,10 @@ class MessageModel extends Equatable {
     );
   }
 
+  /// View-once content and empty media placeholders are never copied.
+  String? get copyableText =>
+      !isViewOnce && content?.trim().isNotEmpty == true ? content : null;
+
   ReplyPreviewModel get asReplyPreview => ReplyPreviewModel(
     id: id,
     senderId: senderId,

@@ -369,7 +369,7 @@ def clear_chat_history(chat_id):
 
     if for_all:
         member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-        chat = Chat.query.get(chat_id)
+        chat = db.session.get(Chat, chat_id)
         if chat and chat.chat_type == 'private':
             pass  # در خصوصی هر طرف می‌تواند برای همه پاک کند (مثل تلگرام با محدودیت)
         elif not member or member.role not in ('owner', 'admin'):
@@ -520,39 +520,66 @@ def mark_view_once(message_id):
 @messages_bp.route('/statuses', methods=['POST'])
 @jwt_required()
 def get_message_statuses():
-    """گرفتن وضعیت فعلی چند پیام (برای آپدیت تیک‌ها به صورت real-time/polling)"""
+    """Reconcile loaded messages over HTTP, including read and received ones.
+
+    Deletion is state, not a new message: after_id polling alone cannot deliver
+    it. Clients send bounded batches of loaded IDs (and quoted original IDs).
+    This also works after missed polls, without clocks or a schema migration.
+    The existing statuses/viewed_at fields remain backwards compatible.
+    """
     user_id = get_jwt_identity()
-    data = request.get_json() or {}
-    message_ids = data.get('message_ids') or []
-    if not message_ids:
-        return jsonify({'statuses': {}}), 200
+    data = request.get_json()
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'درخواست نامعتبر است'}), 400
+    message_ids = data.get('message_ids', [])
+    if (not isinstance(message_ids, list) or len(message_ids) > 100
+            or any(not isinstance(mid, str) or not mid or len(mid) > 36
+                   for mid in message_ids)):
+        return jsonify({'error': 'حداکثر ۱۰۰ شناسه پیام معتبر مجاز است'}), 400
 
-    if not isinstance(message_ids, list) or len(message_ids) > 100:
-        return jsonify({'error': 'حداکثر ۱۰۰ پیام مجاز است'}), 400
+    chat_id = data.get('chat_id')
+    if chat_id is not None:
+        if not isinstance(chat_id, str) or not user_in_chat(user_id, chat_id):
+            return jsonify({'error': 'دسترسی ندارید'}), 403
 
-    result = {}
-    viewed_at = {}
-    for mid in message_ids:
-        msg = db.session.get(Message, mid)
-        if not msg:
-            continue
-        if not user_in_chat(user_id, msg.chat_id):
-            continue
-        if msg.is_view_once:
-            viewed_at[mid] = msg.viewed_at.isoformat() if msg.viewed_at else None
-        # Read/delivery ticks still belong only to the sender.
-        if msg.sender_id != user_id:
-            continue
+    # Membership is checked BEFORE exposing even a deleted ID. Never reveal
+    # existence, read receipts or view-once state from an unrelated chat.
+    query = Message.query.join(Chat, Message.chat_id == Chat.id).join(
+        ChatMember, ChatMember.chat_id == Chat.id
+    ).filter(
+        Message.id.in_(message_ids),
+        ChatMember.user_id == user_id,
+        ChatMember.is_deleted.is_(False),
+        Chat.is_deleted.is_(False),
+        Chat.is_deleted_for_all.is_(False),
+    )
+    if chat_id is not None:
+        query = query.filter(Message.chat_id == chat_id)
+    messages = query.all()
+    hidden_ids = {row.message_id for row in MessageHide.query.filter(
+        MessageHide.user_id == user_id,
+        MessageHide.message_id.in_([msg.id for msg in messages]),
+    ).all()}
+    deleted_ids = {msg.id for msg in messages
+                   if msg.is_deleted or msg.is_deleted_for_all
+                   or msg.id in hidden_ids}
+    visible = [msg for msg in messages if msg.id not in deleted_ids]
+    sent_ids = [msg.id for msg in visible if msg.sender_id == user_id]
+    statuses = {mid: 'sent' for mid in sent_ids}
+    rank = {'sent': 0, 'delivered': 1, 'read': 2}
+    for status in MessageStatus.query.filter(
+        MessageStatus.message_id.in_(sent_ids),
+        MessageStatus.user_id != user_id,
+    ).all():
+        previous = statuses[status.message_id]
+        if rank.get(status.status, 0) > rank[previous]:
+            statuses[status.message_id] = status.status
 
-        statuses = MessageStatus.query.filter(
-            MessageStatus.message_id == mid,
-            MessageStatus.user_id != user_id,
-        ).all()
-        if any(s.status == 'read' for s in statuses):
-            result[mid] = 'read'
-        elif any(s.status == 'delivered' for s in statuses):
-            result[mid] = 'delivered'
-        else:
-            result[mid] = 'sent'
-
-    return jsonify({'statuses': result, 'viewed_at': viewed_at}), 200
+    return jsonify({
+        'statuses': statuses,
+        'viewed_at': {msg.id: msg.viewed_at.isoformat() if msg.viewed_at else None
+                      for msg in visible if msg.is_view_once},
+        'deleted_ids': sorted(deleted_ids),
+    }), 200

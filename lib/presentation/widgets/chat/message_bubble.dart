@@ -1,6 +1,7 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
+import '../../../core/utils/chat_invite_link.dart';
 import '../../../data/models/message_model.dart';
 import '../../../data/models/reply_preview_model.dart';
 import '../../../data/services/media_playback_coordinator.dart';
@@ -8,6 +9,7 @@ import '../media/media_labels.dart';
 import '../media/video_message_player.dart';
 import '../media/voice_message_player.dart';
 import 'reply_preview.dart';
+import 'message_text.dart';
 
 class MessageBubble extends StatelessWidget {
   final MessageModel message;
@@ -19,6 +21,7 @@ class MessageBubble extends StatelessWidget {
   final VoidCallback? onReplyTap;
   final VoidCallback? onOpenPhoto;
   final VoidCallback? onOpenViewOnce;
+  final ValueChanged<ChatInviteLink>? onInviteTap;
   final MediaPlaybackCoordinator? coordinator;
   final bool highlighted;
   final bool showSender;
@@ -34,6 +37,7 @@ class MessageBubble extends StatelessWidget {
     this.onReplyTap,
     this.onOpenPhoto,
     this.onOpenViewOnce,
+    this.onInviteTap,
     this.coordinator,
     this.highlighted = false,
     this.showSender = false,
@@ -179,16 +183,23 @@ class MessageBubble extends StatelessWidget {
                 coordinator: coordinator,
               )
             else
-              Text(
-                message.content?.isNotEmpty == true
+              MessageText(
+                text: message.content?.isNotEmpty == true
                     ? message.content!
                     : labels.type(message.messageType),
                 style: TextStyle(color: fg, fontSize: 15, height: 1.35),
+                linkColor: isMine ? Colors.white : theme.colorScheme.primary,
+                onInviteTap: onInviteTap,
               ),
             if (hasCaption)
               Padding(
                 padding: const EdgeInsets.only(top: 7),
-                child: Text(message.content!, style: TextStyle(color: fg)),
+                child: MessageText(
+                  text: message.content!,
+                  style: TextStyle(color: fg),
+                  linkColor: isMine ? Colors.white : theme.colorScheme.primary,
+                  onInviteTap: onInviteTap,
+                ),
               ),
             const SizedBox(height: 4),
             Align(

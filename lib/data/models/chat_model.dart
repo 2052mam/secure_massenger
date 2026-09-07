@@ -61,7 +61,19 @@ class ChatModel extends Equatable {
   }
 
   @override
-  List<Object?> get props => [id, chatType, title, unreadCount, updatedAt];
+  List<Object?> get props => [
+    id,
+    chatType,
+    title,
+    username,
+    avatarUrl,
+    isPinned,
+    isMuted,
+    unreadCount,
+    lastMessage,
+    updatedAt,
+    otherUser,
+  ];
 }
 
 class LastMessageModel {

@@ -35,6 +35,7 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
   bool _error = false;
   bool _ready = false;
   bool _fullscreen = false;
+  MaterialPageRoute<void>? _fullscreenRoute;
   int _generation = 0;
 
   @override
@@ -64,6 +65,8 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
     });
     if (previous != null) {
       try {
+        // Retry can start while the full-screen pop animation is finishing.
+        await _fullscreenRoute?.completed;
         await previous.dispose();
       } catch (_) {}
     }
@@ -104,19 +107,21 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
     if (_fullscreen || !_ready || controller == null) return;
     setState(() => _fullscreen = true);
     try {
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => _FullscreenVideo(
-            controller: controller,
-            coordinator: widget.coordinator,
-            playbackOwner: this,
-            onRetry: () {
-              if (mounted) unawaited(_init());
-            },
-          ),
+      final route = MaterialPageRoute<void>(
+        builder: (_) => _FullscreenVideo(
+          controller: controller,
+          coordinator: widget.coordinator,
+          playbackOwner: this,
+          onRetry: () {
+            if (mounted) unawaited(_init());
+          },
         ),
       );
+      _fullscreenRoute = route;
+      await Navigator.of(context).push(route);
+      await route.completed;
     } finally {
+      _fullscreenRoute = null;
       // The SAME controller retains playback position, speed and volume.
       if (mounted) setState(() => _fullscreen = false);
     }
@@ -127,7 +132,28 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
     ++_generation;
     WidgetsBinding.instance.removeObserver(this);
     widget.coordinator?.release(this);
-    unawaited(_controller?.dispose().catchError((Object _) {}));
+    final controller = _controller;
+    final route = _fullscreenRoute;
+    if (route != null && controller != null) {
+      // Live deletion can remove this bubble while full screen still uses its
+      // controller. Close that route, then dispose after its controls detach.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        unawaited(controller.pause().catchError((Object _) {}));
+        final navigator = route.navigator;
+        if (navigator != null && navigator.mounted && route.isActive) {
+          navigator.removeRoute(route);
+        }
+      });
+      unawaited(
+        route.completed
+            .then((_) async {
+              await controller.dispose();
+            })
+            .catchError((Object _) {}),
+      );
+    } else {
+      unawaited(controller?.dispose().catchError((Object _) {}));
+    }
     super.dispose();
   }
 

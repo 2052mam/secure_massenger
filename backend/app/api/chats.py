@@ -6,6 +6,7 @@ from app.models.user import User, BlockList
 from app.models.chat import Chat, ChatMember, ChatBackground
 from app.models.message import Message, MessageStatus, PinnedMessage
 from app.models.audit import AuditLog
+from app.services.message_payloads import visible_messages
 from datetime import datetime
 import uuid
 
@@ -28,32 +29,14 @@ def list_chats():
         if not chat:
             continue
 
-        last_msg = Message.query.filter_by(
-            chat_id=chat.id, is_deleted_for_all=False
-        ).order_by(Message.created_at.desc()).first()
-
-        unread = 0
+        visible = visible_messages(user_id).filter(Message.chat_id == chat.id)
+        last_msg = visible.order_by(Message.created_at.desc(), Message.id.desc()).first()
+        unread_query = visible.filter(Message.sender_id != user_id)
         if m.last_read_message_id:
-            read_msg = Message.query.get(m.last_read_message_id)
-            if read_msg:
-                unread = Message.query.filter(
-                    Message.chat_id == chat.id,
-                    Message.is_deleted_for_all == False,
-                    Message.sender_id != user_id,
-                    Message.created_at > read_msg.created_at,
-                ).count()
-            else:
-                unread = Message.query.filter(
-                    Message.chat_id == chat.id,
-                    Message.is_deleted_for_all == False,
-                    Message.sender_id != user_id,
-                ).count()
-        else:
-            unread = Message.query.filter(
-                Message.chat_id == chat.id,
-                Message.is_deleted_for_all == False,
-                Message.sender_id != user_id,
-            ).count()
+            read_msg = db.session.get(Message, m.last_read_message_id)
+            if read_msg and read_msg.chat_id == chat.id:
+                unread_query = unread_query.filter(Message.created_at > read_msg.created_at)
+        unread = unread_query.count()
 
         # برای چت خصوصی طرف مقابل را پیدا کن
         other_user = None
@@ -66,7 +49,7 @@ def list_chats():
                 ChatMember.is_deleted == False
             ).first()
             if other_member:
-                other_user = User.query.get(other_member.user_id)
+                other_user = User.query.filter_by(id=other_member.user_id, is_deleted=False).first()
                 if other_user:
                     title = other_user.display_name
                     avatar = other_user.avatar_url if other_user.show_profile_photo else None
@@ -418,11 +401,26 @@ def add_member(chat_id):
         # اگه خودش داره عضو میشه اجازه بده
         if target_id != user_id:
             return jsonify({'error': 'دسترسی ندارید'}), 403
-    existing = ChatMember.query.filter_by(
-        chat_id=chat_id, user_id=target_id, is_deleted=False).first()
-    if existing:
+    target_user = User.query.filter_by(id=target_id, is_deleted=False, is_active=True).first()
+    if target_user is None:
+        return jsonify({'error': 'کاربر یافت نشد'}), 404
+    existing = ChatMember.query.filter_by(chat_id=chat_id, user_id=target_id).first()
+    if existing and not existing.is_deleted:
         return jsonify({'message': 'قبلاً عضو است'}), 200
-    db.session.add(ChatMember(chat_id=chat_id, user_id=target_id, role='member'))
+    is_admin = member and member.role in ('owner', 'admin')
+    if (existing and existing.deleted_by and existing.deleted_by != target_id
+            and not is_admin):
+        return jsonify({'error': 'امکان عضویت وجود ندارد'}), 403
+    role = ('owner' if chat.created_by == target_id else
+            'subscriber' if chat.chat_type == 'channel' else 'member')
+    if existing:
+        existing.is_deleted = False
+        existing.deleted_at = None
+        existing.deleted_by = None
+        existing.joined_at = datetime.utcnow()
+        existing.role = role
+    else:
+        db.session.add(ChatMember(chat_id=chat_id, user_id=target_id, role=role))
     db.session.commit()
     return jsonify({'ok': True}), 201
 
@@ -441,6 +439,7 @@ def remove_member(chat_id):
     if target:
         target.is_deleted = True
         target.deleted_at = datetime.utcnow()
+        target.deleted_by = user_id
         db.session.commit()
     return jsonify({'ok': True}), 200
 
@@ -454,6 +453,7 @@ def leave_chat(chat_id):
         return jsonify({'error': 'عضو نیستید'}), 403
     member.is_deleted = True
     member.deleted_at = datetime.utcnow()
+    member.deleted_by = user_id
     db.session.commit()
     return jsonify({'ok': True}), 200
 
@@ -486,6 +486,16 @@ def get_chat_info(chat_id):
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
     if not member and not chat.is_public:
         return jsonify({'error': 'دسترسی ندارید'}), 403
+    # The header must work before either participant has sent a message.
+    # Use the same privacy-filtered user serializer as profiles and the list.
+    other_user = None
+    if member and chat.chat_type in ('private', 'support'):
+        other_user = User.query.join(ChatMember, ChatMember.user_id == User.id).filter(
+            ChatMember.chat_id == chat_id,
+            ChatMember.user_id != user_id,
+            ChatMember.is_deleted.is_(False),
+            User.is_deleted.is_(False),
+        ).first()
     members_count = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).count()
     my_role = member.role if member else None
     return jsonify({
@@ -499,6 +509,7 @@ def get_chat_info(chat_id):
         'created_by': chat.created_by,
         'members_count': members_count,
         'my_role': my_role,
+        'other_user': other_user.to_dict() if other_user else None,
         'created_at': chat.created_at.isoformat(),
     }), 200
 
@@ -552,10 +563,10 @@ def get_invite_link(chat_id):
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
     if not member or member.role not in ('owner', 'admin'):
         return jsonify({'error': 'دسترسی ندارید'}), 403
-    if chat.username:
-        link = f't.me/{chat.username}'
-    else:
-        link = f'securemessenger://join/{chat_id}'
+    if chat.chat_type not in ('group', 'channel'):
+        return jsonify({'error': 'این چت لینک دعوت ندارد'}), 400
+    from app.services.chat_invites import create_invite_link
+    link = create_invite_link(chat)
     return jsonify({'invite_link': link, 'chat_id': chat_id}), 200
 
 
@@ -605,3 +616,91 @@ def set_permissions(chat_id):
         pass
     db.session.commit()
     return jsonify({'ok': True, 'permissions': perms}), 200
+
+
+def _invite_chat_for_request():
+    """Resolve a bearer invite without granting access merely by previewing it."""
+    from app.services.chat_invites import InvalidInvite, resolve_invite
+
+    user = User.query.filter_by(id=get_jwt_identity(), is_deleted=False,
+                                is_active=True).first()
+    if user is None:
+        return None, (jsonify({'error': 'دسترسی ندارید'}), 403)
+    data = request.get_json() or {}
+    if not isinstance(data, dict):
+        return None, (jsonify({'error': 'درخواست نامعتبر است'}), 400)
+    try:
+        chat = resolve_invite(data.get('invite_link'))
+    except InvalidInvite:
+        return None, (jsonify({'error': 'لینک دعوت نامعتبر است یا دیگر در دسترس نیست'}), 404)
+    member = ChatMember.query.filter_by(chat_id=chat.id, user_id=user.id).first()
+    if (member and member.is_deleted and member.deleted_by
+            and member.deleted_by != user.id):
+        return None, (jsonify({'error': 'امکان عضویت با این لینک وجود ندارد'}), 403)
+    return chat, None
+
+
+def _invite_preview(chat, user_id):
+    member = ChatMember.query.filter_by(chat_id=chat.id, user_id=user_id,
+                                       is_deleted=False).first()
+    return {
+        'id': chat.id,
+        'chat_type': chat.chat_type,
+        'title': chat.title,
+        'description': chat.description,
+        'avatar_url': chat.avatar_url,
+        'members_count': ChatMember.query.filter_by(chat_id=chat.id, is_deleted=False).count(),
+        'is_member': member is not None,
+    }
+
+
+@chats_bp.route('/invite-preview', methods=['POST'])
+@jwt_required()
+def preview_invite():
+    chat, error = _invite_chat_for_request()
+    if error is not None:
+        return error
+    return jsonify(_invite_preview(chat, get_jwt_identity())), 200
+
+
+@chats_bp.route('/join', methods=['POST'])
+@jwt_required()
+def join_by_invite():
+    from sqlalchemy.exc import IntegrityError
+
+    chat, error = _invite_chat_for_request()
+    if error is not None:
+        return error
+    user_id = get_jwt_identity()
+    chat_id = chat.id
+    member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id).with_for_update().first()
+    if member and not member.is_deleted:
+        return jsonify(_invite_preview(chat, user_id)), 200
+
+    role = ('owner' if chat.created_by == user_id else
+            'subscriber' if chat.chat_type == 'channel' else 'member')
+    if member:
+        # Reuse the soft-deleted row (uq_chat_member), never insert a duplicate
+        # or restore a former admin's privileges after leaving.
+        member.is_deleted = False
+        member.deleted_at = None
+        member.deleted_by = None
+        member.joined_at = datetime.utcnow()
+        member.role = role
+    else:
+        db.session.add(ChatMember(chat_id=chat_id, user_id=user_id, role=role))
+    db.session.add(AuditLog(
+        actor_id=user_id, action='join_chat_by_invite', entity_type='chat',
+        entity_id=chat_id, ip_address=get_client_ip(),
+    ))
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # A repeated tap / second device may have inserted the same membership
+        # while this request was in flight. Success is idempotent.
+        db.session.rollback()
+        member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id,
+                                           is_deleted=False).first()
+        if member is None:
+            raise
+    return jsonify(_invite_preview(chat, user_id)), 200

@@ -2,9 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
-import '../../../core/theme/app_theme.dart';
 import '../../../data/services/api_service.dart';
-import '../../../data/services/storage_service.dart';
 import '../../../data/models/user_model.dart';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -42,6 +40,7 @@ class _TwoFactorSetupScreenState extends ConsumerState<TwoFactorSetupScreen> {
   }
 
   Future<void> _verify() async {
+    if (_loading) return;
     if (_codeCtrl.text.trim().length != 6) {
       setState(() => _error = 'کد ۶ رقمی وارد کنید');
       return;
@@ -57,6 +56,7 @@ class _TwoFactorSetupScreenState extends ConsumerState<TwoFactorSetupScreen> {
         'code': _codeCtrl.text.trim(),
       });
 
+      if (!mounted) return;
       final user = UserModel.fromJson(res['user'] as Map<String, dynamic>);
       await ref
           .read(authNotifierProvider.notifier)
@@ -66,14 +66,11 @@ class _TwoFactorSetupScreenState extends ConsumerState<TwoFactorSetupScreen> {
             res['refresh_token'] as String? ?? '',
           );
 
-      // جاش این رو بذار:
-      if (!mounted) return;
-      Navigator.of(context).popUntil((route) => route.isFirst);
-      
+      // The session-keyed app Navigator now owns the transition to chats.
     } on ApiException catch (e) {
-      setState(() => _error = e.message);
+      if (mounted) setState(() => _error = e.message);
     } catch (_) {
-      setState(() => _error = 'خطا در تأیید کد');
+      if (mounted) setState(() => _error = 'خطا در تأیید کد');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -107,7 +104,9 @@ class _TwoFactorSetupScreenState extends ConsumerState<TwoFactorSetupScreen> {
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
-                        widget.warning.isNotEmpty ? widget.warning : 'کلید 2FA فقط یک‌بار نمایش داده می‌شود و قابل بازیابی نیست. حتماً آن را در Google Authenticator ذخیره کنید.',
+                        widget.warning.isNotEmpty
+                            ? widget.warning
+                            : 'کلید 2FA فقط یک‌بار نمایش داده می‌شود و قابل بازیابی نیست. حتماً آن را در Google Authenticator ذخیره کنید.',
                         style: const TextStyle(fontSize: 13),
                       ),
                     ),

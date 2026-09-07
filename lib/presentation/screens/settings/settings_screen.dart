@@ -239,8 +239,9 @@ class SettingsScreen extends ConsumerWidget {
                   );
                 } catch (e) {
                   if (context.mounted) {
-                    ScaffoldMessenger.of(context)
-                        .showSnackBar(SnackBar(content: Text(e.toString())));
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(SnackBar(content: Text(e.toString())));
                   }
                 }
               },
@@ -273,14 +274,16 @@ class SettingsScreen extends ConsumerWidget {
                         builder: (_) => ChatScreen(
                           chatId: chatId,
                           title: isFa ? 'پشتیبانی' : 'Support',
+                          chatType: 'support',
                         ),
                       ),
                     );
                   }
                 } catch (e) {
                   if (context.mounted) {
-                    ScaffoldMessenger.of(context)
-                        .showSnackBar(SnackBar(content: Text(e.toString())));
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(SnackBar(content: Text(e.toString())));
                   }
                 }
               },
@@ -299,14 +302,16 @@ class SettingsScreen extends ConsumerWidget {
                         builder: (_) => ChatScreen(
                           chatId: chatId,
                           title: isFa ? 'پیام‌های ذخیره‌شده' : 'Saved Messages',
+                          chatType: 'saved',
                         ),
                       ),
                     );
                   }
                 } catch (e) {
                   if (context.mounted) {
-                    ScaffoldMessenger.of(context)
-                        .showSnackBar(SnackBar(content: Text(e.toString())));
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(SnackBar(content: Text(e.toString())));
                   }
                 }
               },

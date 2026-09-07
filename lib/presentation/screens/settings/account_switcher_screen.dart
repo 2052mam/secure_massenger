@@ -2,11 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../data/services/account_service.dart';
-import '../../../data/services/api_service.dart';
-import '../../../data/services/storage_service.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/locale_provider.dart';
-import '../auth/login_screen.dart';
+import '../home/main_shell.dart';
+import '../../widgets/chat/chat_avatar.dart';
 
 class AccountSwitcherScreen extends ConsumerStatefulWidget {
   const AccountSwitcherScreen({super.key});
@@ -19,6 +18,7 @@ class AccountSwitcherScreen extends ConsumerStatefulWidget {
 class _AccountSwitcherScreenState extends ConsumerState<AccountSwitcherScreen> {
   List<SavedAccount> _accounts = [];
   bool _loading = true;
+  bool _busy = false;
 
   @override
   void initState() {
@@ -28,38 +28,71 @@ class _AccountSwitcherScreenState extends ConsumerState<AccountSwitcherScreen> {
 
   Future<void> _load() async {
     final list = await AccountService.list();
+    if (!mounted) return;
     setState(() {
       _accounts = list;
       _loading = false;
     });
   }
 
-  Future<void> _switchTo(SavedAccount acc) async {
-    await StorageService.saveToken(acc.accessToken);
-    await StorageService.saveRefreshToken(acc.refreshToken);
-    await StorageService.saveUserId(acc.userId);
-    ApiService().setToken(acc.accessToken);
-    await AccountService.save(acc); // set active
-    await ref.read(authNotifierProvider.notifier).checkSession();
-    if (mounted) {
-      Navigator.of(context).popUntil((r) => r.isFirst);
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('سوییچ به @${acc.username}')));
+  Future<void> _switchTo(SavedAccount account) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final previousId = ref.read(authNotifierProvider).valueOrNull?.id;
+      await ref.read(authNotifierProvider.notifier).switchAccount(account);
+      if (!mounted) return;
+      // Different identities reset the Navigator in app.dart. Selecting the
+      // current account needs only to return to its chat list.
+      if (previousId == account.userId) {
+        ref.read(shellIndexProvider.notifier).state = 0;
+        Navigator.of(context).popUntil((route) => route.isFirst);
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+      }
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<void> _addAccount() async {
-    // خروج نرم بدون پاک کردن لیست اکانت‌ها
-    await StorageService.clearTokens();
-    ApiService().setToken(null);
-    ref.read(authNotifierProvider.notifier).setUser(null);
-    // go to login - force null user
-    await ref.read(authNotifierProvider.notifier).logoutKeepAccounts();
-    if (mounted) {
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const LoginScreen()),
-        (_) => false,
-      );
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      // Do not replace the root route with a standalone LoginScreen. The app
+      // observes this identity change and owns login -> register/2FA -> chats.
+      await ref.read(authNotifierProvider.notifier).logoutKeepAccounts();
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _removeAccount(SavedAccount account) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      if (ref.read(authNotifierProvider).valueOrNull?.id == account.userId) {
+        await ref.read(authNotifierProvider.notifier).logout();
+      } else {
+        await AccountService.remove(account.userId);
+        await _load();
+      }
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
+    } finally {
+      if (mounted) setState(() => _busy = false);
     }
   }
 
@@ -68,42 +101,33 @@ class _AccountSwitcherScreenState extends ConsumerState<AccountSwitcherScreen> {
     final isFa = ref.watch(localeProvider).languageCode == 'fa';
 
     return Scaffold(
-      appBar: AppBar(title: Text(isFa ? 'مدیریت اکانت‌ها' : 'Accounts')),
+      appBar: AppBar(
+        title: Text(isFa ? 'مدیریت اکانت‌ها' : 'Accounts'),
+        bottom: _busy
+            ? const PreferredSize(
+                preferredSize: Size.fromHeight(2),
+                child: LinearProgressIndicator(minHeight: 2),
+              )
+            : null,
+      ),
       body: _loading
           ? const Center(child: CircularProgressIndicator())
           : ListView(
               children: [
                 ..._accounts.map(
                   (a) => ListTile(
-                    leading: CircleAvatar(
-                      backgroundImage: null,
-                      foregroundImage:
-                          a.avatarUrl != null && a.avatarUrl!.isNotEmpty
-                          ? NetworkImage(
-                              a.avatarUrl!,
-                              headers: {
-                                'Authorization': 'Bearer ${a.accessToken}',
-                              },
-                            )
-                          : null,
-                      child: a.avatarUrl == null || a.avatarUrl!.isEmpty
-                          ? Text(
-                              a.displayName.isNotEmpty
-                                  ? a.displayName[0].toUpperCase()
-                                  : '?',
-                            )
-                          : null,
+                    leading: ChatAvatar(
+                      title: a.displayName,
+                      url: a.avatarUrl,
+                      token: a.accessToken,
                     ),
                     title: Text(a.displayName),
                     subtitle: Text('@${a.username}'),
                     trailing: IconButton(
                       icon: const Icon(Icons.logout, size: 20),
-                      onPressed: () async {
-                        await AccountService.remove(a.userId);
-                        _load();
-                      },
+                      onPressed: _busy ? null : () => _removeAccount(a),
                     ),
-                    onTap: () => _switchTo(a),
+                    onTap: _busy ? null : () => _switchTo(a),
                   ),
                 ),
                 const Divider(),
@@ -111,7 +135,9 @@ class _AccountSwitcherScreenState extends ConsumerState<AccountSwitcherScreen> {
                   leading: const Icon(Icons.add_circle_outline),
                   title: Text(isFa ? 'افزودن اکانت' : 'Add account'),
                   subtitle: Text(isFa ? 'حداکثر ۳ اکانت' : 'Max 3 accounts'),
-                  onTap: _accounts.length >= 3
+                  onTap: _busy
+                      ? null
+                      : _accounts.length >= 3
                       ? () {
                           ScaffoldMessenger.of(context).showSnackBar(
                             SnackBar(

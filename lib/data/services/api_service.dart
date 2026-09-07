@@ -9,8 +9,13 @@ import 'storage_service.dart';
 class ApiService {
   static final ApiService _instance = ApiService._();
   factory ApiService() => _instance;
-  ApiService._();
+  ApiService._() : _useStoredToken = true;
 
+  /// Account-owned requests never pick up another account's token mid-flight.
+  /// A null token here means unauthenticated, not "fall back to storage".
+  ApiService.withToken(String? token) : _token = token, _useStoredToken = false;
+
+  final bool _useStoredToken;
   String? _token;
 
   void setToken(String? token) {
@@ -19,7 +24,8 @@ class ApiService {
 
   Map<String, String> get _headers {
     final h = {'Accept': 'application/json'};
-    final token = _token ?? StorageService.getToken();
+    final token =
+        _token ?? (_useStoredToken ? StorageService.getToken() : null);
     if (token != null) {
       h['Authorization'] = 'Bearer $token';
     }
@@ -36,11 +42,13 @@ class ApiService {
     String path,
     Map<String, dynamic> body,
   ) async {
-    final res = await http.post(
-      Uri.parse('${ApiConstants.baseUrl}$path'),
-      headers: _jsonHeaders,
-      body: jsonEncode(body),
-    );
+    final res = await http
+        .post(
+          Uri.parse('${ApiConstants.baseUrl}$path'),
+          headers: _jsonHeaders,
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 30));
     return _handle(res);
   }
 
@@ -51,7 +59,9 @@ class ApiService {
     final uri = Uri.parse(
       '${ApiConstants.baseUrl}$path',
     ).replace(queryParameters: query);
-    final res = await http.get(uri, headers: _headers);
+    final res = await http
+        .get(uri, headers: _headers)
+        .timeout(const Duration(seconds: 30));
     return _handle(res);
   }
 
@@ -80,11 +90,13 @@ class ApiService {
     String path,
     Map<String, dynamic> body,
   ) async {
-    final res = await http.put(
-      Uri.parse('${ApiConstants.baseUrl}$path'),
-      headers: _jsonHeaders,
-      body: jsonEncode(body),
-    );
+    final res = await http
+        .put(
+          Uri.parse('${ApiConstants.baseUrl}$path'),
+          headers: _jsonHeaders,
+          body: jsonEncode(body),
+        )
+        .timeout(const Duration(seconds: 30));
     return _handle(res);
   }
 

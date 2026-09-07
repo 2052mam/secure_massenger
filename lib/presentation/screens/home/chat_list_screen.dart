@@ -9,10 +9,10 @@ import '../../../data/services/storage_service.dart';
 
 import '../../providers/chat_list_provider.dart';
 import '../../providers/locale_provider.dart';
-import '../../providers/auth_provider.dart';
 import '../../../data/models/chat_model.dart';
 import '../../../data/services/api_service.dart';
 import '../chat/chat_screen.dart';
+import '../../widgets/chat/chat_avatar.dart';
 
 class ChatListScreen extends ConsumerStatefulWidget {
   const ChatListScreen({super.key});
@@ -22,24 +22,6 @@ class ChatListScreen extends ConsumerStatefulWidget {
 }
 
 class _ChatListScreenState extends ConsumerState<ChatListScreen> {
-  @override
-  void initState() {
-    super.initState();
-    _setOnline(true);
-  }
-
-  @override
-  void dispose() {
-    _setOnline(false);
-    super.dispose();
-  }
-
-  Future<void> _setOnline(bool status) async {
-    try {
-      await ApiService().post('/users/online-status', {'is_online': status});
-    } catch (_) {}
-  }
-
   @override
   Widget build(BuildContext context) {
     final chatsAsync = ref.watch(chatListProvider);
@@ -194,8 +176,9 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
       ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
@@ -370,6 +353,8 @@ class _ChatTile extends StatelessWidget {
                 chatId: chat.id,
                 title: chat.displayTitle,
                 chatType: chat.chatType,
+                otherUser: chat.otherUser,
+                avatarUrl: chat.avatarUrl,
               ),
             ),
           );
@@ -380,33 +365,11 @@ class _ChatTile extends StatelessWidget {
             children: [
               Stack(
                 children: [
-                  CircleAvatar(
+                  ChatAvatar(
+                    title: chat.displayTitle,
+                    url: avatarUrl,
+                    token: StorageService.getToken(),
                     radius: 28,
-                    backgroundColor: theme.colorScheme.primary.withValues(
-                      alpha: 0.12,
-                    ),
-                    backgroundImage: null,
-                    foregroundImage: avatarUrl != null && avatarUrl.isNotEmpty
-                        ? NetworkImage(
-                            avatarUrl,
-                            headers: {
-                              'Authorization':
-                                  'Bearer ${StorageService.getToken() ?? ""}',
-                            },
-                          )
-                        : null,
-                    child: avatarUrl == null || avatarUrl.isEmpty
-                        ? Text(
-                            chat.displayTitle.isNotEmpty
-                                ? chat.displayTitle[0].toUpperCase()
-                                : '?',
-                            style: TextStyle(
-                              color: theme.colorScheme.primary,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 20,
-                            ),
-                          )
-                        : null,
                   ),
                   if (chat.chatType == 'private' && isOnline)
                     Positioned(

@@ -1,18 +1,53 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../providers/locale_provider.dart';
+import '../../providers/auth_provider.dart';
+import '../../../data/services/presence_service.dart';
 import 'chat_list_screen.dart';
 import '../search/search_screen.dart';
 import '../settings/settings_screen.dart';
 
-// این provider رو اضافه کن تا از هر جا بشه تب رو عوض کرد
-final shellIndexProvider = StateProvider<int>((ref) => 0);
+final shellIndexProvider = StateProvider.autoDispose<int>((ref) {
+  ref.watch(authNotifierProvider.select((auth) => auth.valueOrNull?.id));
+  return 0;
+});
 
-class MainShell extends ConsumerWidget {
+class MainShell extends ConsumerStatefulWidget {
   const MainShell({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<MainShell> createState() => _MainShellState();
+}
+
+class _MainShellState extends ConsumerState<MainShell> {
+  late PresenceService _presence;
+  late final String? _sessionUserId;
+  String? _presenceToken;
+
+  @override
+  void initState() {
+    super.initState();
+    final session = ref.read(authenticatedSessionProvider);
+    _sessionUserId = session.userId;
+    _presenceToken = session.token;
+    _presence = PresenceService(session.api)..start();
+  }
+
+  @override
+  void dispose() {
+    _presence.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    ref.listen(authenticatedSessionProvider, (_, session) {
+      if (session.userId == _sessionUserId && session.token != _presenceToken) {
+        _presence.dispose(reportOffline: false);
+        _presenceToken = session.token;
+        _presence = PresenceService(session.api)..start();
+      }
+    });
     final isFa = ref.watch(localeProvider).languageCode == 'fa';
     final index = ref.watch(shellIndexProvider);
 

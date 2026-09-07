@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../data/models/user_model.dart';
 import '../../../data/services/api_service.dart';
+import '../../../data/services/storage_service.dart';
+import '../../widgets/chat/chat_avatar.dart';
 import '../../providers/locale_provider.dart';
 import '../chat/chat_screen.dart';
 
@@ -68,13 +70,15 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
             chatId: res['chat_id'] as String,
             title: user.displayName,
             chatType: 'private',
+            otherUser: user,
           ),
         ),
       );
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -82,14 +86,11 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
     try {
       final chatId = ch['id'] as String;
       final title = ch['title'] as String? ?? '';
-      // اول عضو بشو بعد برو تو
-      try {
-        await ApiService().post('/chats/$chatId/add-member', {
-          'user_id': (await ApiService().get('/users/me'))['id'],
-        });
-      } catch (_) {
-        // شاید قبلا عضو بودیم
-      }
+      // Only open after the server confirms membership; an access error is
+      // not evidence that we were already a member.
+      await ApiService().post('/chats/$chatId/add-member', {
+        'user_id': (await ApiService().get('/users/me'))['id'],
+      });
       if (!mounted) return;
       Navigator.of(context).push(
         MaterialPageRoute(
@@ -99,8 +100,9 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
       );
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -156,17 +158,10 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
                     ),
                     ..._users.map(
                       (u) => ListTile(
-                        leading: CircleAvatar(
-                          backgroundImage: u.avatarUrl != null
-                              ? NetworkImage(u.avatarUrl!)
-                              : null,
-                          child: u.avatarUrl == null
-                              ? Text(
-                                  u.displayName.isNotEmpty
-                                      ? u.displayName[0].toUpperCase()
-                                      : '?',
-                                )
-                              : null,
+                        leading: ChatAvatar(
+                          title: u.displayName,
+                          url: u.avatarUrl,
+                          token: StorageService.getToken(),
                         ),
                         title: Text(u.displayName),
                         subtitle: Text('@${u.username}'),

@@ -187,6 +187,52 @@ void main() {
     },
   );
 
+  testWidgets(
+    'Deleting a full-screen video closes the route before disposing its controller',
+    (tester) async {
+      final messenger =
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+      messenger.setMockMethodCallHandler(
+        SystemChannels.platform,
+        (_) async => null,
+      );
+      addTearDown(
+        () => messenger.setMockMethodCallHandler(SystemChannels.platform, null),
+      );
+      final controller = FakeVideoController();
+      final visible = ValueNotifier(true);
+      addTearDown(visible.dispose);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: ValueListenableBuilder<bool>(
+              valueListenable: visible,
+              builder: (_, show, __) => show
+                  ? SizedBox(
+                      width: 280,
+                      child: VideoMessagePlayer(
+                        url: 'https://example.invalid/video',
+                        controllerFactory: (_, __) => controller,
+                      ),
+                    )
+                  : const Text('Message removed'),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Full screen'));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Exit full screen'), findsOneWidget);
+      visible.value = false; // The same removal triggered by deletion polling.
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Exit full screen'), findsNothing);
+      expect(find.text('Message removed'), findsOneWidget);
+      expect(controller.disposed, isTrue);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
   testWidgets('Disposing during video initialization is safe', (tester) async {
     final gate = Completer<void>();
     final controller = FakeVideoController()..initializeGate = gate;

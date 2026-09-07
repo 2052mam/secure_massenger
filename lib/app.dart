@@ -19,6 +19,10 @@ class SecureMessengerApp extends ConsumerWidget {
     final authState = ref.watch(authNotifierProvider);
 
     return MaterialApp(
+      // An identity change discards every route from the previous session,
+      // including nested login/register/2FA and account-management routes.
+      // Theme, locale and profile refreshes for the SAME user retain routes.
+      key: ValueKey(authState.valueOrNull?.id ?? 'signed-out'),
       title: 'SecureMessenger',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.lightTheme,

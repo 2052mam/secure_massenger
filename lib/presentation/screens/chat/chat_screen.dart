@@ -2,12 +2,17 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:collection/collection.dart';
 
 import '../../../data/models/message_model.dart';
+import '../../../data/models/user_model.dart';
+import '../../../data/models/chat_invite_model.dart';
+import '../../../data/services/message_reconciler.dart';
+import '../../../core/utils/chat_invite_link.dart';
 import '../../../data/models/reply_preview_model.dart';
 import '../../../data/services/media_playback_coordinator.dart';
 import '../../../core/utils/media_utils.dart';
@@ -19,6 +24,10 @@ import '../../providers/auth_provider.dart';
 import '../../providers/chat_list_provider.dart';
 import '../profile/user_profile_screen.dart';
 import '../../widgets/chat/message_bubble.dart';
+import '../../widgets/chat/chat_header.dart';
+import '../../widgets/chat/chat_labels.dart';
+import '../../widgets/chat/chat_invite_dialog.dart';
+import '../../widgets/chat/message_actions_sheet.dart';
 import '../../widgets/chat/reply_preview.dart';
 import '../../widgets/media/media_labels.dart';
 import '../media/photo_viewer_screen.dart';
@@ -28,11 +37,15 @@ class ChatScreen extends ConsumerStatefulWidget {
   final String chatId;
   final String title;
   final String chatType;
+  final UserModel? otherUser;
+  final String? avatarUrl;
   const ChatScreen({
     super.key,
     required this.chatId,
     required this.title,
     this.chatType = 'private',
+    this.otherUser,
+    this.avatarUrl,
   });
 
   @override
@@ -41,6 +54,20 @@ class ChatScreen extends ConsumerStatefulWidget {
 
 class _ChatScreenState extends ConsumerState<ChatScreen>
     with WidgetsBindingObserver {
+  late ApiService _api;
+  late String? _authToken;
+  late final String? _sessionUserId;
+  final _reconciler = MessageReconciler();
+  UserModel? _otherUser;
+  String? _loadedChatType;
+  String? _chatTitle;
+  String? _chatAvatarUrl;
+  bool _hasChatInfo = false;
+  bool _refreshingChatInfo = false;
+  bool _chatUnavailable = false;
+  bool _openingInvite = false;
+  Route<void>? _photoRoute;
+  String? _photoMessageId;
   final _textCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
   final _searchCtrl = TextEditingController();
@@ -75,6 +102,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   String? _chatUsername;
   String? _chatDescription;
 
+  String get _chatType => _loadedChatType ?? widget.chatType;
+  String get _displayTitle =>
+      _otherUser?.displayName ?? _chatTitle ?? widget.title;
+  bool get _foreground {
+    final state = WidgetsBinding.instance.lifecycleState;
+    return state == null || state == AppLifecycleState.resumed;
+  }
+
   String _mediaFullUrl(String? mediaId, {String? existingUrl}) =>
       resolveMediaUrl(mediaId, existingUrl: existingUrl);
 
@@ -82,17 +117,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _currentUserId = StorageService.getUserId();
+    final session = ref.read(authenticatedSessionProvider);
+    _sessionUserId = session.userId;
+    _authToken = session.token;
+    _api = session.api;
+    _otherUser = widget.otherUser;
+    _chatAvatarUrl = widget.avatarUrl;
+    _currentUserId =
+        ref.read(authNotifierProvider).valueOrNull?.id ??
+        StorageService.getUserId();
     _loadMessages();
     _startPolling();
-    _markChatRead();
     _loadBackground();
     _loadChatInfo();
   }
 
   Future<void> _loadBackground() async {
     try {
-      final res = await ApiService().get('/chats/${widget.chatId}/background');
+      final res = await _api.get('/chats/${widget.chatId}/background');
       final bg = res['background'] as Map<String, dynamic>?;
       if (bg == null) return;
       final type = bg['type'] as String?;
@@ -111,18 +153,49 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _loadChatInfo() async {
+    if (!mounted || _refreshingChatInfo || _chatUnavailable) return;
+    _refreshingChatInfo = true;
     try {
-      final res = await ApiService().get('/chats/${widget.chatId}/info');
-      if (mounted) {
-        setState(() {
-          _myRole = res['my_role'] as String?;
-          _membersCount = res['members_count'] as int? ?? 0;
-          _isPublic = res['is_public'] as bool? ?? false;
-          _chatUsername = res['username'] as String?;
-          _chatDescription = res['description'] as String?;
-        });
-      }
-    } catch (_) {}
+      final res = await _api.get('/chats/${widget.chatId}/info');
+      if (!mounted) return;
+      setState(() {
+        _myRole = res['my_role'] as String?;
+        _membersCount = res['members_count'] as int? ?? 0;
+        _isPublic = res['is_public'] as bool? ?? false;
+        _chatUsername = res['username'] as String?;
+        _chatDescription = res['description'] as String?;
+        _loadedChatType = res['chat_type'] as String?;
+        _chatTitle = res['title'] as String?;
+        _chatAvatarUrl = res['avatar_url'] as String?;
+        _otherUser = res['other_user'] is Map<String, dynamic>
+            ? UserModel.fromJson(res['other_user'] as Map<String, dynamic>)
+            : null;
+        _hasChatInfo = true;
+      });
+    } on ApiException catch (error) {
+      if ([403, 404].contains(error.statusCode)) _showChatUnavailable();
+    } catch (_) {
+      // Keep the last known profile during a temporary network failure.
+    } finally {
+      _refreshingChatInfo = false;
+    }
+  }
+
+  void _showChatUnavailable() {
+    if (!mounted || _chatUnavailable) return;
+    _pollTimer?.cancel();
+    unawaited(_playback.pause());
+    final route = _photoRoute;
+    if (route != null && route.isActive) route.navigator?.removeRoute(route);
+    setState(() {
+      ++_loadGeneration;
+      _chatUnavailable = true;
+      _loading = false;
+      _error = ChatLabels.of(context).chatUnavailable;
+      _messages.clear();
+      _messageKeys.clear();
+      _replyTo = null;
+    });
   }
 
   @override
@@ -141,20 +214,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state != AppLifecycleState.resumed) unawaited(_playback.pause());
+    if (state != AppLifecycleState.resumed) {
+      unawaited(_playback.pause());
+    } else {
+      _pollNow();
+    }
   }
 
   Future<void> _markChatRead() async {
-    if (!mounted) return;
+    if (!mounted ||
+        !_foreground ||
+        _chatUnavailable ||
+        ModalRoute.of(context)?.isCurrent == false)
+      return;
     try {
-      await ApiService().post('/messages/chat/${widget.chatId}/read', {});
+      await _api.post('/messages/chat/${widget.chatId}/read', {});
       if (!mounted) return;
       ref.read(chatListProvider.notifier).refresh();
     } catch (_) {}
   }
 
   Future<void> _loadMessages({String? query}) async {
-    if (!mounted) return;
+    if (!mounted || _chatUnavailable) return;
     final generation = ++_loadGeneration;
     setState(() {
       _loading = true;
@@ -163,33 +244,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     try {
       final Map<String, dynamic> res;
       if (query != null && query.length >= 2) {
-        res = await ApiService().get(
+        res = await _api.get(
           '/messages/search/${widget.chatId}',
           query: {'q': query},
         );
       } else {
-        res = await ApiService().get('/messages/${widget.chatId}');
+        res = await _api.get('/messages/${widget.chatId}');
       }
       if (!mounted || generation != _loadGeneration) return;
-      final list = (res['messages'] as List? ?? [])
+      final rawMessages = (res['messages'] as List? ?? [])
           .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
           .toList();
+      final list = _reconciler.reconcile(rawMessages);
       setState(() {
         _messages
           ..clear()
           ..addAll(list);
         _messageKeys.removeWhere((id, _) => !list.any((m) => m.id == id));
-        if (query == null) _lastMessageId = list.isEmpty ? null : list.last.id;
+        if (query == null) {
+          _lastMessageId = rawMessages.isEmpty ? null : rawMessages.last.id;
+        }
         _hasEarlier = query == null && res['has_more'] == true;
         _historyMode = false;
         _loading = false;
       });
+      unawaited(_refreshMessageStatuses());
       if (query == null) {
         _scrollToBottom();
         _markChatRead();
       }
     } catch (e) {
       if (!mounted || generation != _loadGeneration) return;
+      if (e is ApiException && [403, 404].contains(e.statusCode)) {
+        _showChatUnavailable();
+        return;
+      }
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -198,22 +287,27 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   void _mergeMessages(Iterable<MessageModel> messages) {
-    for (final message in messages) {
+    for (final message in _reconciler.reconcile(messages)) {
       final index = _messages.indexWhere((m) => m.id == message.id);
       if (index == -1) {
         _messages.add(message);
       } else {
-        final viewedAt = _messages[index].viewedAt;
-        _messages[index] = viewedAt != null && message.viewedAt == null
-            ? message.copyWith(viewedAt: viewedAt)
-            : message;
+        final previous = _messages[index];
+        _messages[index] = message.copyWith(
+          status: MessageReconciler.newestStatus(
+            previous.status,
+            message.status,
+          ),
+          viewedAt: previous.viewedAt ?? message.viewedAt,
+        );
       }
     }
     _messages.sort((a, b) {
       final order = a.createdAt.compareTo(b.createdAt);
       return order == 0 ? a.id.compareTo(b.id) : order;
     });
-    _lastMessageId = _messages.isEmpty ? null : _messages.last.id;
+    // Only history/new-message polls advance the server cursor. A send or
+    // an older page must not skip remote messages still waiting to be polled.
   }
 
   Future<void> _loadEarlier() async {
@@ -225,7 +319,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         : 0.0;
     final oldOffset = _scrollCtrl.hasClients ? _scrollCtrl.offset : 0.0;
     try {
-      final res = await ApiService().get(
+      final res = await _api.get(
         '/messages/${widget.chatId}',
         query: {'before_id': _messages.first.id},
       );
@@ -267,7 +361,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _jumpToReply(String id) async {
-    if (_jumpingToReply) return;
+    if (_jumpingToReply || _reconciler.isUnavailable(id)) return;
     _jumpingToReply = true;
     try {
       var target = _messageKeys[id]?.currentContext;
@@ -275,7 +369,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         final generation = ++_loadGeneration;
         // Start the history window at the original, so it can be reached even
         // outside the lazy list's built items without an estimated pixel jump.
-        final res = await ApiService().get(
+        final res = await _api.get(
           '/messages/${widget.chatId}',
           query: {'from_id': id},
         );
@@ -290,7 +384,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         setState(() {
           _messages
             ..clear()
-            ..addAll(list);
+            ..addAll(_reconciler.reconcile(list));
           _historyMode = true;
           _searchMode = false;
           _hasEarlier = true;
@@ -329,47 +423,80 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   void _startPolling() {
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(
-      Duration(seconds: ApiConstants.pollingIntervalSeconds),
-      (_) {
-        if (!_searchMode && !_loading) {
-          if (!_historyMode) _pollNewMessages();
-          _refreshMessageStatuses();
-        }
-      },
+      const Duration(seconds: ApiConstants.pollingIntervalSeconds),
+      (_) => _pollNow(),
     );
   }
 
+  void _pollNow() {
+    if (!mounted || !_foreground || _chatUnavailable) return;
+    unawaited(_loadChatInfo());
+    if (_loading) return;
+    if (!_searchMode && !_historyMode) unawaited(_pollNewMessages());
+    // Reconcile all loaded pages, even in search/history and after read ticks.
+    unawaited(_refreshMessageStatuses());
+  }
+
+  void _applyMessageUpdate(MessageSyncResult update) {
+    if (!mounted) return;
+    final updated = _reconciler.reconcile(_messages, update: update);
+    final clearReply =
+        _replyTo != null && _reconciler.isUnavailable(_replyTo!.id);
+    if (const ListEquality<MessageModel>().equals(_messages, updated) &&
+        !clearReply)
+      return;
+    final removedMedia = _messages.any(
+      (m) => update.deletedIds.contains(m.id) && m.mediaId != null,
+    );
+    if (removedMedia) unawaited(_playback.pause());
+    setState(() {
+      _messages
+        ..clear()
+        ..addAll(updated);
+      _messageKeys.removeWhere((id, _) => _reconciler.isUnavailable(id));
+      if (clearReply) _replyTo = null;
+      if (_highlightedMessageId != null &&
+          _reconciler.isUnavailable(_highlightedMessageId!)) {
+        _highlightedMessageId = null;
+      }
+    });
+    // Close only the deleted photo's route, never an unrelated dialog/chat.
+    final photoRoute = _photoRoute;
+    if (photoRoute != null &&
+        photoRoute.isActive &&
+        _photoMessageId != null &&
+        update.deletedIds.contains(_photoMessageId)) {
+      photoRoute.navigator?.removeRoute(photoRoute);
+    }
+    if (update.deletedIds.isNotEmpty) {
+      unawaited(ref.read(chatListProvider.notifier).refresh());
+    }
+  }
+
   Future<void> _refreshMessageStatuses() async {
-    if (!mounted || _refreshingStatuses) return;
-    final pendingIds = _messages.reversed
-        .where(
-          (m) =>
-              (m.senderId == _currentUserId && m.status != 'read') ||
-              (m.isViewOnce && m.viewedAt == null),
-        )
-        .take(100)
-        .map((m) => m.id)
-        .toList();
-    if (pendingIds.isEmpty) return;
+    if (!mounted || _refreshingStatuses || _chatUnavailable || !_foreground)
+      return;
+    final generation = _loadGeneration;
+    final batches = _reconciler.batches(
+      _messages.reversed,
+      selectedReply: _replyTo,
+    );
+    if (batches.isEmpty) return;
     _refreshingStatuses = true;
     try {
-      final res = await ApiService().post('/messages/statuses', {
-        'message_ids': pendingIds,
-      });
-      final statuses = res['statuses'] as Map<String, dynamic>? ?? {};
-      final views = res['viewed_at'] as Map<String, dynamic>? ?? {};
-      if (!mounted) return;
-      setState(() {
-        for (var i = 0; i < _messages.length; i++) {
-          final message = _messages[i];
-          final viewed = views[message.id] as String?;
-          _messages[i] = message.copyWith(
-            status: statuses[message.id] as String?,
-            viewedAt: viewed == null ? null : DateTime.tryParse(viewed),
-          );
-        }
-      });
+      // Do not truncate at 100: users can have many earlier pages loaded.
+      for (final ids in batches) {
+        final res = await _api.post('/messages/statuses', {
+          'chat_id': widget.chatId,
+          'message_ids': ids,
+        });
+        if (!mounted || generation != _loadGeneration || !_foreground) return;
+        _applyMessageUpdate(MessageSyncResult.fromJson(res));
+      }
+    } on ApiException catch (error) {
+      if ([403, 404].contains(error.statusCode)) _showChatUnavailable();
     } catch (_) {
+      // Every batch is reconciled again next cycle; missed polls lose no state.
     } finally {
       _refreshingStatuses = false;
     }
@@ -382,10 +509,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     try {
       final query = <String, String>{};
       if (_lastMessageId != null) query['after_id'] = _lastMessageId!;
-      final res = await ApiService().get(
-        '/messages/${widget.chatId}',
-        query: query,
-      );
+      final res = await _api.get('/messages/${widget.chatId}', query: query);
       if (!mounted ||
           _searchMode ||
           _historyMode ||
@@ -395,6 +519,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
           .toList();
       if (list.isNotEmpty) {
+        _lastMessageId = list.last.id;
         final atBottom =
             !_scrollCtrl.hasClients ||
             _scrollCtrl.position.maxScrollExtent - _scrollCtrl.offset < 160;
@@ -432,7 +557,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         'message_type': 'text',
       };
       if (reply != null) body['reply_to_id'] = reply.id;
-      final res = await ApiService().post('/messages/', body);
+      final res = await _api.post('/messages/', body);
       if (!mounted) return;
       final msg = _sentMessage(res, reply);
       setState(() {
@@ -505,10 +630,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final reply = _replyTo;
     setState(() => _sending = true);
     try {
-      final upload = await ApiService().uploadFile(
-        '/media/upload',
-        File(picked.path),
-      );
+      final upload = await _api.uploadFile('/media/upload', File(picked.path));
       final mediaId = upload['id'] as String;
       final mediaType =
           upload['media_type'] as String? ?? (isVideo ? 'video' : 'image');
@@ -520,7 +642,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         'is_view_once': sendViewOnce,
       };
       if (reply != null) body['reply_to_id'] = reply.id;
-      final res = await ApiService().post('/messages/', body);
+      final res = await _api.post('/messages/', body);
       if (!mounted) return;
       final msg = _sentMessage({
         ...res,
@@ -558,7 +680,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final reply = _replyTo;
       setState(() => _sending = true);
       try {
-        final upload = await ApiService().uploadFile('/media/upload', file);
+        final upload = await _api.uploadFile('/media/upload', file);
         final mediaId = upload['id'] as String;
         final body = <String, dynamic>{
           'chat_id': widget.chatId,
@@ -567,7 +689,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           'content': '',
         };
         if (reply != null) body['reply_to_id'] = reply.id;
-        final res = await ApiService().post('/messages/', body);
+        final res = await _api.post('/messages/', body);
         if (!mounted) return;
         final msg = _sentMessage({
           ...res,
@@ -614,22 +736,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   Future<void> _deleteMessage(MessageModel msg, {required bool forAll}) async {
     try {
-      await ApiService().post('/messages/${msg.id}/delete', {
-        'for_all': forAll,
-      });
+      await _api.post('/messages/${msg.id}/delete', {'for_all': forAll});
       if (!mounted) return;
-      setState(() {
-        _messages.removeWhere((m) => m.id == msg.id);
-        _messageKeys.remove(msg.id);
-        if (_replyTo?.id == msg.id) _replyTo = null;
-        for (var i = 0; i < _messages.length; i++) {
-          if (_messages[i].replyToId == msg.id) {
-            _messages[i] = _messages[i].copyWith(
-              replyTo: ReplyPreviewModel.unavailable(msg.id),
-            );
-          }
-        }
-      });
+      _applyMessageUpdate(MessageSyncResult(deletedIds: {msg.id}));
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(
@@ -663,15 +772,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
     if (confirm != true) return;
     try {
-      await ApiService().post('/messages/chat/${widget.chatId}/clear', {
+      await _api.post('/messages/chat/${widget.chatId}/clear', {
         'for_all': forAll,
       });
       if (!mounted) return;
       setState(() {
         ++_loadGeneration;
+        _reconciler.remove(
+          _reconciler
+              .batches(_messages, selectedReply: _replyTo)
+              .expand((ids) => ids),
+        );
         _messages.clear();
         _messageKeys.clear();
-        _lastMessageId = null;
+        // Keep the soft-deleted cursor to fetch the next message reliably.
+        _loading = false;
         _replyTo = null;
         _hasEarlier = false;
         _historyMode = false;
@@ -688,10 +803,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   Future<void> _blockUser() async {
     _currentUserId ??= StorageService.getUserId();
-    final other = _messages
-        .where((m) => m.senderId != _currentUserId)
-        .map((m) => m.senderId)
-        .firstOrNull;
+    final other = _otherUser?.id;
     if (other == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -701,7 +813,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       return;
     }
     try {
-      await ApiService().post('/users/block/$other', {});
+      await _api.post('/users/block/$other', {});
       if (mounted) {
         ScaffoldMessenger.of(
           context,
@@ -718,22 +830,25 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _openPhoto(MessageModel message) async {
-    if (_openingMedia) return;
+    if (_openingMedia || _reconciler.isUnavailable(message.id)) return;
     _openingMedia = true;
     try {
       await _playback.pause();
       if (!mounted) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => PhotoViewerScreen(
-            url: _mediaFullUrl(message.mediaId, existingUrl: message.mediaUrl),
-            token: StorageService.getToken(),
-            caption: message.content,
-          ),
+      final route = MaterialPageRoute<void>(
+        builder: (_) => PhotoViewerScreen(
+          url: _mediaFullUrl(message.mediaId, existingUrl: message.mediaUrl),
+          token: _authToken,
+          caption: message.content,
         ),
       );
+      _photoRoute = route;
+      _photoMessageId = message.id;
+      await Navigator.of(context).push(route);
     } finally {
       _openingMedia = false;
+      _photoRoute = null;
+      _photoMessageId = null;
     }
   }
 
@@ -741,101 +856,123 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_openingMedia ||
         !message.isViewOnce ||
         message.viewedAt != null ||
-        message.senderId == _currentUserId)
+        message.senderId == _currentUserId ||
+        _reconciler.isUnavailable(message.id))
       return;
     _openingMedia = true;
     try {
       await _playback.pause();
       if (!mounted) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => ViewOncePhotoScreen(
-            loadPhoto: () => ApiService().getBytes(
-              '/messages/${message.id}/view-once/media',
-            ),
-            consumePhoto: () async {
-              final result = await ApiService()
-                  .post('/messages/${message.id}/view-once', {})
-                  .timeout(const Duration(seconds: 20));
-              return DateTime.parse(result['viewed_at'] as String);
-            },
-            onViewed: (viewedAt) {
-              if (!mounted) return;
-              setState(() {
-                final index = _messages.indexWhere((m) => m.id == message.id);
-                if (index != -1)
-                  _messages[index] = _messages[index].copyWith(
-                    viewedAt: viewedAt,
-                  );
-              });
-            },
-          ),
+      final route = MaterialPageRoute<void>(
+        builder: (_) => ViewOncePhotoScreen(
+          loadPhoto: () =>
+              _api.getBytes('/messages/${message.id}/view-once/media'),
+          consumePhoto: () async {
+            final result = await _api
+                .post('/messages/${message.id}/view-once', {})
+                .timeout(const Duration(seconds: 20));
+            return DateTime.parse(result['viewed_at'] as String);
+          },
+          onViewed: (viewedAt) {
+            if (!mounted) return;
+            setState(() {
+              final index = _messages.indexWhere((m) => m.id == message.id);
+              if (index != -1)
+                _messages[index] = _messages[index].copyWith(
+                  viewedAt: viewedAt,
+                );
+            });
+          },
         ),
       );
+      _photoRoute = route;
+      _photoMessageId = message.id;
+      await Navigator.of(context).push(route);
       if (mounted) _refreshMessageStatuses();
     } finally {
       _openingMedia = false;
+      _photoRoute = null;
+      _photoMessageId = null;
     }
   }
 
   void _showMessageActions(MessageModel msg) {
-    final isMine = msg.senderId == _currentUserId;
-    showModalBottomSheet(
+    if (_reconciler.isUnavailable(msg.id)) return;
+    showModalBottomSheet<void>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.reply),
-              title: const Text('پاسخ'),
-              onTap: () {
-                Navigator.pop(ctx);
-                setState(() => _replyTo = msg);
-              },
-            ),
-            if (!msg.isViewOnce)
-              ListTile(
-                leading: const Icon(Icons.forward),
-                title: const Text('فوروارد'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _forwardMessage(msg);
-                },
-              ),
-            if (isMine)
-              ListTile(
-                leading: const Icon(Icons.delete_outline),
-                title: const Text('حذف برای من'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _deleteMessage(msg, forAll: false);
-                },
-              ),
-            if (isMine)
-              ListTile(
-                leading: const Icon(Icons.delete_forever, color: Colors.red),
-                title: const Text(
-                  'حذف برای همه',
-                  style: TextStyle(color: Colors.red),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _deleteMessage(msg, forAll: true);
-                },
-              ),
-            if (!isMine)
-              ListTile(
-                leading: const Icon(Icons.delete_outline),
-                title: const Text('حذف برای من'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _deleteMessage(msg, forAll: false);
-                },
-              ),
-          ],
-        ),
+      builder: (_) => MessageActionsSheet(
+        message: msg,
+        canDeleteForAll:
+            msg.senderId == _currentUserId ||
+            _myRole == 'owner' ||
+            _myRole == 'admin',
+        onReply: () {
+          if (mounted && !_reconciler.isUnavailable(msg.id))
+            setState(() => _replyTo = msg);
+        },
+        onForward: () => _forwardMessage(msg),
+        onDelete: (forAll) => _deleteMessage(msg, forAll: forAll),
       ),
     );
+  }
+
+  Future<void> _openInvite(ChatInviteLink link) async {
+    if (_openingInvite || _chatUnavailable) return;
+    setState(() => _openingInvite = true);
+    final labels = ChatLabels.of(context);
+    try {
+      await _playback.pause();
+      if (!mounted) return;
+      final response = await _api.post('/chats/invite-preview', {
+        'invite_link': link.value,
+      });
+      if (!mounted) return;
+      var invite = ChatInviteModel.fromJson(response);
+      if (!invite.isMember) {
+        final confirm = await showDialog<bool>(
+          context: context,
+          builder: (_) => ChatInviteDialog(invite: invite, token: _authToken),
+        );
+        if (confirm != true || !mounted) return;
+        final joined = await _api.post('/chats/join', {
+          'invite_link': link.value,
+        });
+        if (!mounted) return;
+        invite = ChatInviteModel.fromJson(joined);
+      }
+      unawaited(ref.read(chatListProvider.notifier).refresh());
+      if (invite.id == widget.chatId) {
+        unawaited(_loadChatInfo());
+        return;
+      }
+      if (!mounted) return;
+      setState(() => _openingInvite = false);
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ChatScreen(
+            chatId: invite.id,
+            title: invite.title,
+            chatType: invite.chatType,
+            avatarUrl: invite.avatarUrl,
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted) {
+        final unavailable =
+            error is ApiException &&
+            [400, 403, 404, 410].contains(error.statusCode);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              unavailable ? labels.inviteUnavailable : labels.inviteFailed,
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _openingInvite = false);
+    }
   }
 
   void _showAttachMenu() {
@@ -883,13 +1020,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
     if (picked == null) return;
     try {
-      final upload = await ApiService().uploadFile(
-        '/media/upload',
-        File(picked.path),
-      );
+      final upload = await _api.uploadFile('/media/upload', File(picked.path));
       final mediaId = upload['id'] as String;
       final url = _mediaFullUrl(mediaId, existingUrl: null);
-      await ApiService().post('/chats/${widget.chatId}/background', {
+      await _api.post('/chats/${widget.chatId}/background', {
         'type': 'image',
         'value': url,
       });
@@ -912,7 +1046,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Future<void> _forwardMessage(MessageModel msg) async {
-    final chatsRes = await ApiService().get('/chats/');
+    final chatsRes = await _api.get('/chats/');
     final chats = (chatsRes['chats'] as List? ?? []);
     if (!mounted) return;
     showModalBottomSheet(
@@ -931,7 +1065,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             onTap: () async {
               Navigator.pop(ctx);
               try {
-                await ApiService().post('/messages/${msg.id}/forward', {
+                await _api.post('/messages/${msg.id}/forward', {
                   'target_chat_id': c['id'],
                 });
                 if (mounted) {
@@ -954,8 +1088,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   void _showMoreMenu() {
-    final isGroupOrChannel =
-        widget.chatType == 'group' || widget.chatType == 'channel';
+    final isGroupOrChannel = _chatType == 'group' || _chatType == 'channel';
     final isAdmin = _myRole == 'owner' || _myRole == 'admin';
     showModalBottomSheet(
       context: context,
@@ -1083,7 +1216,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
     if (confirm != true) return;
     try {
-      await ApiService().post('/chats/${widget.chatId}/leave', {});
+      await _api.post('/chats/${widget.chatId}/leave', {});
       if (mounted) Navigator.of(context).pop();
     } catch (e) {
       if (mounted)
@@ -1095,32 +1228,51 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   Future<void> _showInviteLink() async {
     try {
-      final res = await ApiService().get('/chats/${widget.chatId}/invite-link');
+      final res = await _api.get('/chats/${widget.chatId}/invite-link');
       final link = res['invite_link'] as String? ?? '';
       if (!mounted) return;
-      showDialog(
+      final labels = ChatLabels.of(context);
+      showDialog<void>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('لینک دعوت'),
+          title: Text(labels.invite),
           content: SelectableText(
             link,
+            textDirection: TextDirection.ltr,
             style: const TextStyle(fontFamily: 'monospace'),
           ),
           actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(ctx);
+            TextButton.icon(
+              icon: const Icon(Icons.copy_outlined),
+              label: Text(labels.copyLink),
+              onPressed: () async {
+                try {
+                  await Clipboard.setData(ClipboardData(text: link));
+                  if (!mounted || !ctx.mounted) return;
+                  Navigator.of(ctx).pop();
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(SnackBar(content: Text(labels.linkCopied)));
+                } catch (_) {
+                  if (mounted)
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(SnackBar(content: Text(labels.copyFailed)));
+                }
               },
-              child: const Text('بستن'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: Text(labels.close),
             ),
           ],
         ),
       );
-    } catch (e) {
+    } catch (error) {
       if (mounted)
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text(e.toString())));
+        ).showSnackBar(SnackBar(content: Text(error.toString())));
     }
   }
 
@@ -1136,7 +1288,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           padding: const EdgeInsets.all(24),
           children: [
             Text(
-              widget.title,
+              _displayTitle,
               style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 8),
@@ -1198,7 +1350,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       isScrollControlled: true,
       builder: (ctx) => _EditGroupSheet(
         chatId: widget.chatId,
-        currentTitle: widget.title,
+        currentTitle: _displayTitle,
         currentDescription: _chatDescription,
         currentUsername: _chatUsername,
         isPublic: _isPublic,
@@ -1225,8 +1377,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final auth = ref.watch(authNotifierProvider);
-    _currentUserId = auth.valueOrNull?.id ?? StorageService.getUserId();
+    final session = ref.watch(authenticatedSessionProvider);
+    if (session.userId == _sessionUserId) {
+      _api = session.api;
+      _authToken = session.token;
+    }
+    _currentUserId = _sessionUserId;
 
     return Scaffold(
       appBar: AppBar(
@@ -1243,39 +1399,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 ),
                 onSubmitted: (q) => _loadMessages(query: q),
               )
-            : InkWell(
-                onTap: () {
-                  final otherId = _messages
-                      .where((m) => m.senderId != _currentUserId)
-                      .map((m) => m.senderId)
-                      .firstOrNull;
-                  if (otherId != null) {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => UserProfileScreen(userId: otherId),
-                      ),
-                    );
-                  }
-                },
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      widget.title,
-                      style: const TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    Text(
-                      'برای مشاهده پروفایل بزنید',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.white.withValues(alpha: 0.8),
-                      ),
-                    ),
-                  ],
-                ),
+            : ChatHeader(
+                title: _displayTitle,
+                chatType: _chatType,
+                otherUser: _otherUser,
+                avatarUrl: _chatAvatarUrl,
+                membersCount: _hasChatInfo ? _membersCount : null,
+                token: _authToken,
+                onTap: _chatType == 'group' || _chatType == 'channel'
+                    ? _showGroupInfoSheet
+                    : _otherUser == null
+                    ? null
+                    : () async {
+                        await _playback.pause();
+                        if (!mounted || _otherUser == null) return;
+                        await Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (_) =>
+                                UserProfileScreen(userId: _otherUser!.id),
+                          ),
+                        );
+                        if (mounted) unawaited(_loadChatInfo());
+                      },
               ),
         actions: [
           if (_searchMode)
@@ -1302,11 +1447,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ? DecorationImage(
                   image: CachedNetworkImageProvider(
                     _bgImageUrl!,
-                    headers: StorageService.getToken() != null
-                        ? {
-                            'Authorization':
-                                'Bearer ${StorageService.getToken()}',
-                          }
+                    headers: _authToken != null
+                        ? {'Authorization': 'Bearer ${_authToken}'}
                         : null,
                   ),
                   fit: BoxFit.cover,
@@ -1316,6 +1458,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         child: SafeArea(
           child: Column(
             children: [
+              if (_openingInvite) const LinearProgressIndicator(minHeight: 2),
               Expanded(
                 child: _loading
                     ? const Center(child: CircularProgressIndicator())
@@ -1329,8 +1472,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               style: const TextStyle(color: Colors.red),
                             ),
                             ElevatedButton(
-                              onPressed: () => _loadMessages(),
-                              child: const Text('تلاش مجدد'),
+                              onPressed: _chatUnavailable
+                                  ? () => Navigator.of(context).maybePop()
+                                  : () => _loadMessages(),
+                              child: Text(
+                                _chatUnavailable
+                                    ? ChatLabels.of(context).close
+                                    : MediaLabels.of(context).retry,
+                              ),
                             ),
                           ],
                         ),
@@ -1406,16 +1555,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                   : () => _jumpToReply(msg.replyToId!),
                               onOpenPhoto: () => _openPhoto(msg),
                               onOpenViewOnce: () => _openViewOnce(msg),
+                              onInviteTap: _openInvite,
                               coordinator: _playback,
                               highlighted: _highlightedMessageId == msg.id,
                               showSender:
-                                  widget.chatType == 'group' ||
-                                  widget.chatType == 'channel',
+                                  _chatType == 'group' ||
+                                  _chatType == 'channel',
                               mediaUrl: _mediaFullUrl(
                                 msg.mediaId,
                                 existingUrl: msg.mediaUrl,
                               ),
-                              token: StorageService.getToken(),
+                              token: _authToken,
                             ),
                           );
                         },
@@ -1428,7 +1578,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   label: Text(MediaLabels.of(context).latest),
                 ),
               if (_replyTo != null && !_searchMode) _buildReplyComposer(theme),
-              if (!_searchMode) _buildInputBar(theme),
+              if (!_searchMode && !_chatUnavailable) _buildInputBar(theme),
             ],
           ),
         ),
@@ -1446,7 +1596,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             child: ReplyPreview(
               reply: _replyTo!.asReplyPreview,
               currentUserId: _currentUserId,
-              token: StorageService.getToken(),
+              token: _authToken,
             ),
           ),
           IconButton(

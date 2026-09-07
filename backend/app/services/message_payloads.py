@@ -12,6 +12,7 @@ def user_in_chat(user_id, chat_id):
         ChatMember.user_id == user_id,
         ChatMember.is_deleted.is_(False),
         Chat.is_deleted.is_(False),
+        Chat.is_deleted_for_all.is_(False),
     ).first() is not None
 
 

@@ -1,5 +1,5 @@
 from app import db
-from datetime import datetime
+from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 import pyotp
 import uuid
@@ -62,14 +62,18 @@ class User(db.Model):
         return totp.verify(code, valid_window=2)  # ±60s برای ناهمزمانی ساعت سرور/گوشی (تهران)
 
     def to_dict(self, include_private=False):
+        # A killed/offline app cannot send a final offline request. Expire its
+        # heartbeat instead of leaving the profile online indefinitely.
+        online = bool(self.is_online and self.last_seen and
+                      datetime.utcnow() - self.last_seen < timedelta(seconds=60))
         data = {
             'id': self.id,
             'username': self.username,
             'display_name': self.display_name,
             'bio': self.bio if self.show_bio else None,
             'avatar_url': self.avatar_url if self.show_profile_photo else None,
-            'is_online': self.is_online if self.show_last_seen else False,
-            'last_seen': self.last_seen.isoformat() if self.show_last_seen and self.last_seen else None,
+            'is_online': online if self.show_last_seen else False,
+            'last_seen': self.last_seen.isoformat() + 'Z' if self.show_last_seen and self.last_seen else None,
             'created_at': self.created_at.isoformat(),
         }
         if include_private:

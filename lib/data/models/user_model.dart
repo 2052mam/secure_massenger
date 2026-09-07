@@ -36,13 +36,21 @@ class UserModel extends Equatable {
       bio: json['bio'] as String?,
       avatarUrl: json['avatar_url'] as String?,
       isOnline: json['is_online'] as bool? ?? false,
-      lastSeen: json['last_seen'] != null
-          ? DateTime.tryParse(json['last_seen'] as String)
-          : null,
+      lastSeen: _parseLastSeen(json['last_seen'] as String?),
       showLastSeen: json['show_last_seen'] as bool? ?? true,
       showProfilePhoto: json['show_profile_photo'] as bool? ?? true,
       showBio: json['show_bio'] as bool? ?? true,
     );
+  }
+
+  static DateTime? _parseLastSeen(String? value) {
+    if (value == null || value.isEmpty) return null;
+    // Existing Flask rows were serialized as naive UTC; newer responses use Z.
+    final hasZone = RegExp(
+      r'(Z|[+-]\d{2}:?\d{2})$',
+      caseSensitive: false,
+    ).hasMatch(value);
+    return DateTime.tryParse(hasZone ? value : '${value}Z')?.toLocal();
   }
 
   Map<String, dynamic> toJson() {
@@ -62,5 +70,17 @@ class UserModel extends Equatable {
   }
 
   @override
-  List<Object?> get props => [id, email, username, displayName];
+  List<Object?> get props => [
+    id,
+    email,
+    username,
+    displayName,
+    bio,
+    avatarUrl,
+    isOnline,
+    lastSeen,
+    showLastSeen,
+    showProfilePhoto,
+    showBio,
+  ];
 }

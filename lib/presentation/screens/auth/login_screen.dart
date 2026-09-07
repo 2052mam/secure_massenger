@@ -4,7 +4,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/device_service.dart';
-import '../../../data/services/storage_service.dart';
 import '../../../data/models/user_model.dart';
 import '../../providers/auth_provider.dart';
 import 'register_screen.dart';
@@ -33,7 +32,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
   }
 
   Future<void> _submit() async {
-    if (!_formKey.currentState!.validate()) return;
+    if (_loading || !_formKey.currentState!.validate()) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -47,12 +46,14 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
         'device_info': await DeviceService.getDeviceInfo(),
       });
 
+      if (!mounted) return;
       // اگر مستقیم توکن داد (نباید اتفاق بیفتد چون 2FA اجباری است)
       if (res['access_token'] != null) {
         await _saveSession(res);
         return;
       }
     } on ApiException catch (e) {
+      if (!mounted) return;
       if (e.statusCode == 401 && e.message.contains('2FA')) {
         // برو صفحه 2FA
         if (!mounted) return;
@@ -69,18 +70,13 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
         setState(() => _error = e.message);
       }
     } catch (e) {
-      setState(() => _error = 'خطا در ارتباط با سرور');
+      if (mounted) setState(() => _error = 'خطا در ارتباط با سرور');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
   Future<void> _saveSession(Map<String, dynamic> res) async {
-    await StorageService.saveToken(res['access_token'] as String);
-    if (res['refresh_token'] != null) {
-      await StorageService.saveRefreshToken(res['refresh_token'] as String);
-    }
-    ApiService().setToken(res['access_token'] as String);
     final user = UserModel.fromJson(res['user'] as Map<String, dynamic>);
     await ref
         .read(authNotifierProvider.notifier)
@@ -89,7 +85,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
           res['access_token'] as String,
           res['refresh_token'] as String? ?? '',
         );
-    // app.dart خودش MainShell نشون می‌ده چون state عوض شد
+    // app.dart resets the auth route stack after the identity changes.
   }
 
   @override
@@ -112,14 +108,16 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                   const SizedBox(height: 16),
                   Text(
                     'ورود به SecureMessenger',
-                    style: Theme.of(context).textTheme.headlineSmall
-                        ?.copyWith(fontWeight: FontWeight.bold),
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                      fontWeight: FontWeight.bold,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   Text(
                     'ایمیل و رمز عبور خود را وارد کنید',
-                    style: Theme.of(context).textTheme.bodyMedium
-                        ?.copyWith(color: Colors.grey),
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodyMedium?.copyWith(color: Colors.grey),
                   ),
                   const SizedBox(height: 32),
                   TextFormField(
