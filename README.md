@@ -1,0 +1,167 @@
+# SecureMessenger – پیام‌رسان امن دوزبانه
+
+نسخه نهایی قابل اجرا طبق تمام قوانین سخت‌گیرانه پروژه.
+
+## هدف
+پیام‌رسان شبیه تلگرام با ایمیل + پسورد، **2FA اجباری Google Authenticator**، محدودیت حداکثر ۳ اکانت به ازای هر دستگاه، Soft Delete کامل، Polling (بدون WebSocket)، Backend Flask + MySQL سازگار با cPanel، و پنل ادمین وب مخفی.
+
+## نسخه‌های اجباری (دقیقاً رعایت شده)
+| مورد | نسخه |
+|------|------|
+| Flutter | 3.47.x (sdk constraint) |
+| Dart | 3.13.x |
+| AGP | **9.1.0** |
+| Kotlin | **2.4.0** |
+| Gradle Wrapper | **9.3.1** |
+| Java | 17 (target) / 21 LTS سازگار |
+| minifyEnabled (release) | **false** |
+
+## ساختار
+```
+secure_messenger/
+├── android/          # AGP 9.1.0 + Kotlin 2.4.0 + minify false
+├── backend/          # Flask + SQLAlchemy + MySQL + Admin Panel
+├── lib/
+│   ├── main.dart
+│   ├── app.dart
+│   ├── core/         # theme (فقط *ThemeData مدرن), constants
+│   ├── data/         # models, services (api, device, voice, storage)
+│   └── presentation/ # screens + providers (Riverpod)
+├── assets/
+├── pubspec.yaml
+├── analysis_options.yaml
+└── README.md
+```
+
+## ویژگی‌های پیاده‌سازی‌شده
+- ثبت‌نام / ورود با ایمیل + پسورد + **2FA اجباری** (کلید یک‌بار نمایش + QR)
+- محدودیت **حداکثر ۳ اکانت** روی هر دستگاه (Fingerprint پایدار)
+- چت خصوصی، گروه، کانال، پشتیبانی، **Saved Messages**
+- ارسال متن، عکس، ویدیو، **ویس‌مسیج (انتخاب فایل صوتی)**
+- ریپلای، فوروارد، پین، View Once
+- وضعیت خوانده‌شده / سین / آنلاین / گوست مود
+- حذف یک‌طرفه و دوطرفه پیام و تاریخچه و کل چت (Soft Delete + Audit)
+- جستجوی کاربر + جستجو داخل چت
+- تم روشن/تاریک/سیستم + زبان فارسی/انگلیسی
+- بک‌گراند سفارشی هر چت
+- پروفایل (عکس، نام، یوزرنیم، بایو)
+- پنل ادمین وب با مسیر مخفی (`/sm-admin-x9k2p7/`)
+- Polling هر ۳ ثانیه (هیچ WebSocket)
+- همه چیز در دیتابیس ثبت می‌شود و hard-delete نمی‌شود
+
+## راه‌اندازی Backend (cPanel / لوکال)
+```bash
+cd backend
+python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+# DATABASE_URL و SECRET_KEY و ADMIN_PASSWORD را پر کنید
+python run.py
+```
+- پیش‌فرض: `http://0.0.0.0:5000`
+- Health: `GET /health`
+- Admin: `http://localhost:5000/sm-admin-x9k2p7/login`
+
+## راه‌اندازی Flutter
+1. در `lib/core/constants/api_constants.dart` مقدار `baseUrl` را تنظیم کنید:
+   - امولاتور: `http://10.0.2.2:5000/api/v1`
+   - دستگاه واقعی: IP سرور خودتان
+2. آیکون: یک فایل PNG با کیفیت در `assets/icons/app_icon.png` قرار دهید و:
+   ```bash
+   dart run flutter_launcher_icons
+   ```
+3. فونت Vazirmatn (اختیاری): فایل‌های ttf را در `assets/fonts/` بگذارید یا از google_fonts استفاده می‌شود.
+4. اجرا:
+   ```bash
+   flutter pub get
+   flutter run
+   ```
+
+## تصمیمات مهم (ضد Amnesia)
+1. هیچ WebSocket / SocketIO استفاده نشده – فقط HTTP Polling.
+2. Soft Delete همه‌جا + جدول `audit_logs`.
+3. 2FA اجباری با `pyotp` – کلید قابل بازیابی نیست.
+4. محدودیت ۳ دستگاه با fingerprint پایدار (حتی بعد از uninstall).
+5. `minifyEnabled = false` در release.
+6. نام‌گذاری ضدتداخل.
+7. فقط `flutter_riverpod` (بدون generator).
+8. Theme فقط فرم‌های مدرن `*ThemeData`.
+9. پنل ادمین مسیر مخفی.
+10. بدون دسترسی مخاطبین.
+
+## پکیج‌های اصلی
+- flutter_riverpod, http, hive, shared_preferences
+- image_picker, permission_handler, file_picker (ویس), just_audio
+- device_info_plus, qr_flutter, flutter_animate, timeago
+- flutter_launcher_icons
+
+## هشدارها
+- بعد از نصب نسخه جدید، در صورت مشکل permission، اپ را uninstall کنید.
+- کلید 2FA فقط یک‌بار نمایش داده می‌شود – حتماً در Google Authenticator ذخیره کنید.
+- برای پروداکشن حتماً HTTPS و SECRET_KEY قوی استفاده کنید.
+- فونت و آیکون را قبل از انتشار نهایی جایگزین کنید.
+
+## چک‌لیست نهایی
+- [x] AGP 9.1.0 و Kotlin 2.4.0 دقیق
+- [x] minifyEnabled false
+- [x] SafeArea
+- [x] RefreshIndicator روی لیست چت
+- [x] Soft Delete + Audit
+- [x] Polling only
+- [x] 2FA اجباری
+- [x] محدودیت ۳ دستگاه
+- [x] پنل ادمین
+- [x] دوزبانه
+- [x] ویس + مدیا + View Once + ریپلای
+- [x] جستجو + Saved Messages + بک‌گراند
+
+پروژه آماده تست و گزارش ایراد است.
+
+## رفع خطای Build (سپتامبر ۲۰۲۶)
+- `compileSdk` و `targetSdk` به **۳۶** ارتقا یافت (نیاز پلاگین‌ها).
+- پکیج `record` به دلیل ناسازگاری `record_linux` / `record_platform_interface` حذف شد.
+- ویس‌مسیج فعلاً از طریق **انتخاب فایل صوتی** (file_picker) ارسال می‌شود تا build پایدار بماند.
+- بعداً می‌توان نسخه سازگار record را دوباره اضافه کرد.
+
+
+## ورود به پنل ادمین
+
+1. Backend را اجرا کنید: `python run.py`
+2. در مرورگر بروید به:
+   ```
+   http://localhost:5000/sm-admin-x9k2p7/login
+   ```
+   (مسیر مخفی از `.env` → `ADMIN_SECRET_PATH`)
+3. نام کاربری و رمز از `.env`:
+   - `ADMIN_USERNAME` (پیش‌فرض: superadmin)
+   - `ADMIN_PASSWORD` (پیش‌فرض: ChangeThisStrongPassword123!)
+
+## اصلاحات این نسخه
+- TOTP با valid_window=2 (هماهنگی ساعت تهران)
+- شمارش unread فقط پیام دیگران
+- سین شدن با ورود به چت + تیک‌های delivered/read
+- حذف یک‌طرفه واقعی (MessageHide)
+- حذف FAB مداد
+- نشانگر آنلاین
+- نمایش واقعی عکس در حباب چت
+- View Once قبل از ارسال
+- ریپلای با swipe
+- بلاک کاربر
+- پروفایل کاربر با ضربه روی هدر چت
+- ساخت گروه/کانال/پشتیبانی/Saved از منوی چت‌ها
+- انتخاب زبان با دیالوگ
+
+## ویژگی‌های اضافه‌شده (مرحله نهایی)
+- ضبط زنده ویس با پکیج record (میکروفون → توقف → ارسال)
+- پخش ویدیو داخل چت با video_player + chewie
+- بک‌گراند تصویری چت از گالری
+- مدیریت چنداکانت (حداکثر ۳) از تنظیمات
+- انیمیشن ورود آیتم‌های لیست چت
+- پنل ادمین UI بهبود یافته
+
+### توجه ویس
+اگر build با `record` خطا داد، dependency_overrides در pubspec را نگه دارید یا:
+```
+flutter pub get
+```

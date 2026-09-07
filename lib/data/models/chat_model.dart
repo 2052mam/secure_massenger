@@ -1,0 +1,93 @@
+import 'package:equatable/equatable.dart';
+
+import 'user_model.dart';
+
+class ChatModel extends Equatable {
+  final String id;
+  final String chatType; // private | group | channel | support
+  final String? title;
+  final String? username;
+  final String? avatarUrl;
+  final bool isPinned;
+  final bool isMuted;
+  final int unreadCount;
+  final LastMessageModel? lastMessage;
+  final DateTime updatedAt;
+  final UserModel? otherUser;
+
+  const ChatModel({
+    required this.id,
+    required this.chatType,
+    this.title,
+    this.username,
+    this.avatarUrl,
+    this.isPinned = false,
+    this.isMuted = false,
+    this.unreadCount = 0,
+    this.lastMessage,
+    required this.updatedAt,
+    this.otherUser,
+  });
+
+  factory ChatModel.fromJson(Map<String, dynamic> json) {
+    return ChatModel(
+      id: json['id'] as String,
+      chatType: json['chat_type'] as String? ?? 'private',
+      title: json['title'] as String?,
+      username: json['username'] as String?,
+      avatarUrl: json['avatar_url'] as String?,
+      isPinned: json['is_pinned'] as bool? ?? false,
+      isMuted: json['is_muted'] as bool? ?? false,
+      unreadCount: json['unread_count'] as int? ?? 0,
+      lastMessage: json['last_message'] != null
+          ? LastMessageModel.fromJson(
+              json['last_message'] as Map<String, dynamic>,
+            )
+          : null,
+      updatedAt:
+          DateTime.tryParse(json['updated_at'] as String? ?? '') ??
+          DateTime.now(),
+      otherUser: json['other_user'] != null
+          ? UserModel.fromJson(json['other_user'] as Map<String, dynamic>)
+          : null,
+    );
+  }
+
+  String get displayTitle {
+    if (chatType == 'private' && otherUser != null) {
+      return otherUser!.displayName;
+    }
+    return title ?? username ?? 'چت';
+  }
+
+  @override
+  List<Object?> get props => [id, chatType, title, unreadCount, updatedAt];
+}
+
+class LastMessageModel {
+  final String? id;
+  final String? content;
+  final String? messageType;
+  final String? senderId;
+  final DateTime? createdAt;
+
+  const LastMessageModel({
+    this.id,
+    this.content,
+    this.messageType,
+    this.senderId,
+    this.createdAt,
+  });
+
+  factory LastMessageModel.fromJson(Map<String, dynamic> json) {
+    return LastMessageModel(
+      id: json['id'] as String?,
+      content: json['content'] as String?,
+      messageType: json['message_type'] as String?,
+      senderId: json['sender_id'] as String?,
+      createdAt: json['created_at'] != null
+          ? DateTime.tryParse(json['created_at'] as String)?.toLocal()
+          : null,
+    );
+  }
+}
