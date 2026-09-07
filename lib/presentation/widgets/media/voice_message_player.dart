@@ -141,11 +141,13 @@ class _VoiceMessagePlayerState extends State<VoiceMessagePlayer>
       if (!mounted) return;
       if (_completed) await _player.seek(Duration.zero);
       final allowed = await widget.coordinator?.activate(this, _pause) ?? true;
-      if (!mounted || !allowed || ModalRoute.of(context)?.isCurrent == false)
+      if (!mounted || !allowed || ModalRoute.of(context)?.isCurrent == false) {
         return;
+      }
       if (WidgetsBinding.instance.lifecycleState != null &&
-          WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed)
+          WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
         return;
+      }
       // play() resolves at EOF/pause, not when playback starts.
       unawaited(_player.play().catchError((Object error) => _showError()));
     } catch (_) {

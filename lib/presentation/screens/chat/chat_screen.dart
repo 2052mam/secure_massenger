@@ -203,7 +203,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (index == -1) {
         _messages.add(message);
       } else {
-        _messages[index] = message;
+        final viewedAt = _messages[index].viewedAt;
+        _messages[index] = viewedAt != null && message.viewedAt == null
+            ? message.copyWith(viewedAt: viewedAt)
+            : message;
       }
     }
     _messages.sort((a, b) {
@@ -405,6 +408,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
+  MessageModel _sentMessage(Map<String, dynamic> payload, MessageModel? reply) {
+    final message = MessageModel.fromJson({
+      'reply_to_id': reply?.id,
+      ...payload,
+    });
+    // Trust the current server's privacy-filtered snapshot. Only older servers
+    // with abbreviated send responses need the locally selected quote fallback.
+    return message.replyTo != null || reply == null
+        ? message
+        : message.copyWith(replyTo: reply.asReplyPreview);
+  }
+
   Future<void> _sendText() async {
     final text = _textCtrl.text.trim();
     if (text.isEmpty || _sending) return;
@@ -419,10 +434,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (reply != null) body['reply_to_id'] = reply.id;
       final res = await ApiService().post('/messages/', body);
       if (!mounted) return;
-      final msg = MessageModel.fromJson({
-        'reply_to_id': reply?.id,
-        ...res,
-      }).copyWith(replyTo: reply?.asReplyPreview);
+      final msg = _sentMessage(res, reply);
       setState(() {
         _mergeMessages([msg]);
         _textCtrl.clear();
@@ -510,14 +522,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (reply != null) body['reply_to_id'] = reply.id;
       final res = await ApiService().post('/messages/', body);
       if (!mounted) return;
-      final msg = MessageModel.fromJson({
-        'reply_to_id': reply?.id,
+      final msg = _sentMessage({
         ...res,
         'media_id': mediaId,
         'media_url': sendViewOnce ? null : '/api/v1/media/$mediaId',
         'message_type': mediaType,
         'is_view_once': sendViewOnce,
-      }).copyWith(replyTo: reply?.asReplyPreview);
+      }, reply);
       setState(() {
         _mergeMessages([msg]);
         _replyTo = null;
@@ -558,13 +569,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         if (reply != null) body['reply_to_id'] = reply.id;
         final res = await ApiService().post('/messages/', body);
         if (!mounted) return;
-        final msg = MessageModel.fromJson({
-          'reply_to_id': reply?.id,
+        final msg = _sentMessage({
           ...res,
           'media_id': mediaId,
           'media_url': '/api/v1/media/$mediaId',
           'message_type': 'voice',
-        }).copyWith(replyTo: reply?.asReplyPreview);
+        }, reply);
         setState(() {
           _mergeMessages([msg]);
           _replyTo = null;

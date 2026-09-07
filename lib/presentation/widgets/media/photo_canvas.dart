@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 
 import 'media_labels.dart';
@@ -5,16 +7,18 @@ import 'media_labels.dart';
 /// The viewport is the whole route, NOT an inset Dialog or the chat bubble.
 /// Pinch/pan and focal-point double-tap all use this same coordinate system.
 class PhotoCanvas extends StatefulWidget {
-  final ImageProvider image;
+  final ImageProvider? image;
+  final ui.Image? decodedImage;
   final VoidCallback? onTap;
   final TransformationController? transformationController;
 
   const PhotoCanvas({
     super.key,
-    required this.image,
+    this.image,
+    this.decodedImage,
     this.onTap,
     this.transformationController,
-  });
+  }) : assert((image == null) != (decodedImage == null));
 
   @override
   State<PhotoCanvas> createState() => _PhotoCanvasState();
@@ -61,7 +65,7 @@ class _PhotoCanvasState extends State<PhotoCanvas>
   }
 
   Future<void> _retryImage() async {
-    await widget.image.evict();
+    await widget.image?.evict();
     if (mounted) setState(() => _retry++);
   }
 
@@ -87,41 +91,50 @@ class _PhotoCanvasState extends State<PhotoCanvas>
         maxScale: 6,
         onInteractionStart: (_) => _zoom.stop(),
         child: SizedBox.expand(
-          child: Image(
-            key: ValueKey(_retry),
-            image: widget.image,
-            fit: BoxFit.contain,
-            filterQuality: FilterQuality.high,
-            loadingBuilder: (_, child, progress) => progress == null
-                ? child
-                : Center(
-                    child: CircularProgressIndicator(
-                      color: Colors.white,
-                      value: progress.expectedTotalBytes == null
-                          ? null
-                          : progress.cumulativeBytesLoaded /
-                                progress.expectedTotalBytes!,
+          child: widget.decodedImage != null
+              ? RawImage(
+                  image: widget.decodedImage,
+                  fit: BoxFit.contain,
+                  filterQuality: FilterQuality.high,
+                )
+              : Image(
+                  key: ValueKey(_retry),
+                  image: widget.image!,
+                  fit: BoxFit.contain,
+                  filterQuality: FilterQuality.high,
+                  loadingBuilder: (_, child, progress) => progress == null
+                      ? child
+                      : Center(
+                          child: CircularProgressIndicator(
+                            color: Colors.white,
+                            value: progress.expectedTotalBytes == null
+                                ? null
+                                : progress.cumulativeBytesLoaded /
+                                      progress.expectedTotalBytes!,
+                          ),
+                        ),
+                  errorBuilder: (_, __, ___) => Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(
+                          Icons.broken_image_outlined,
+                          color: Colors.white70,
+                          size: 40,
+                        ),
+                        const SizedBox(height: 12),
+                        Text(
+                          labels.loadError,
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                        TextButton(
+                          onPressed: _retryImage,
+                          child: Text(labels.retry),
+                        ),
+                      ],
                     ),
                   ),
-            errorBuilder: (_, __, ___) => Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Icon(
-                    Icons.broken_image_outlined,
-                    color: Colors.white70,
-                    size: 40,
-                  ),
-                  const SizedBox(height: 12),
-                  Text(
-                    labels.loadError,
-                    style: const TextStyle(color: Colors.white),
-                  ),
-                  TextButton(onPressed: _retryImage, child: Text(labels.retry)),
-                ],
-              ),
-            ),
-          ),
+                ),
         ),
       ),
     );

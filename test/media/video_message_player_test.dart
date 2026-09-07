@@ -7,19 +7,26 @@ import 'package:video_player/video_player.dart';
 import 'package:secure_messenger/presentation/widgets/media/video_message_player.dart';
 import 'package:secure_messenger/presentation/widgets/media/video_playback_controls.dart';
 
-class FakeVideoController extends VideoPlayerController {
+class FakeVideoController extends ValueNotifier<VideoPlayerValue>
+    implements VideoPlayerController {
   int initializations = 0;
   bool disposed = false;
   Completer<void>? initializeGate;
 
   FakeVideoController()
-    : super.networkUrl(Uri.parse('https://example.invalid/video')) {
-    value = const VideoPlayerValue(
-      duration: Duration(minutes: 2),
-      size: Size(1920, 1080),
-      isInitialized: true,
-    );
-  }
+    : super(
+        const VideoPlayerValue(
+          duration: Duration(minutes: 2),
+          size: Size(1920, 1080),
+          isInitialized: true,
+        ),
+      );
+
+  @override
+  int get playerId => VideoPlayerController.kUninitializedPlayerId;
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
 
   @override
   Future<void> initialize() async {
@@ -29,7 +36,7 @@ class FakeVideoController extends VideoPlayerController {
 
   @override
   Future<void> play() async {
-    value = value.copyWith(isPlaying: true);
+    value = value.copyWith(isPlaying: true, isCompleted: false);
   }
 
   @override
@@ -39,7 +46,10 @@ class FakeVideoController extends VideoPlayerController {
 
   @override
   Future<void> seekTo(Duration position) async {
-    value = value.copyWith(position: position);
+    value = value.copyWith(
+      position: position,
+      isCompleted: position >= value.duration,
+    );
   }
 
   @override
@@ -55,6 +65,7 @@ class FakeVideoController extends VideoPlayerController {
   @override
   Future<void> dispose() async {
     disposed = true;
+    super.dispose();
   }
 }
 

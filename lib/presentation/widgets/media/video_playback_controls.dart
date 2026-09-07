@@ -61,7 +61,8 @@ class _VideoPlaybackControlsState extends State<VideoPlaybackControls> {
   }
 
   bool _atEnd(VideoPlayerValue value) =>
-      value.duration > Duration.zero && value.position >= value.duration;
+      value.isCompleted ||
+      (value.duration > Duration.zero && value.position >= value.duration);
 
   void _playbackChanged() {
     final playing =
@@ -105,8 +106,11 @@ class _VideoPlaybackControlsState extends State<VideoPlaybackControls> {
         final allowed =
             await widget.coordinator?.activate(widget.playbackOwner, _pause) ??
             true;
-        if (!mounted || !allowed || ModalRoute.of(context)?.isCurrent == false)
+        if (!mounted ||
+            !allowed ||
+            ModalRoute.of(context)?.isCurrent == false) {
           return;
+        }
         final lifecycle = WidgetsBinding.instance.lifecycleState;
         if (lifecycle != null && lifecycle != AppLifecycleState.resumed) return;
         await widget.controller.play();

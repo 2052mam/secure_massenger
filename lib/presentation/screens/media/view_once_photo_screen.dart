@@ -29,7 +29,7 @@ class ViewOncePhotoScreen extends StatefulWidget {
 
 class _ViewOncePhotoScreenState extends State<ViewOncePhotoScreen>
     with WidgetsBindingObserver {
-  MemoryImage? _photo;
+  ui.Image? _photo;
   bool _loading = true;
   bool _unavailable = false;
   bool _obscured = false;
@@ -45,6 +45,7 @@ class _ViewOncePhotoScreenState extends State<ViewOncePhotoScreen>
 
   Future<void> _prepare() async {
     final generation = ++_generation;
+    ui.Image? preparedImage;
     setState(() {
       _loading = true;
       _unavailable = false;
@@ -65,7 +66,7 @@ class _ViewOncePhotoScreenState extends State<ViewOncePhotoScreen>
       final codec = await ui.instantiateImageCodec(bytes);
       try {
         final frame = await codec.getNextFrame();
-        frame.image.dispose();
+        preparedImage = frame.image;
       } finally {
         codec.dispose();
       }
@@ -74,7 +75,10 @@ class _ViewOncePhotoScreenState extends State<ViewOncePhotoScreen>
       widget.onViewed(viewedAt);
       if (!mounted || _obscured || generation != _generation) return;
       setState(() {
-        _photo = MemoryImage(bytes);
+        // Use the already decoded frame: revealing cannot trigger a second
+        // decode/network request after the successful single-use claim.
+        _photo = preparedImage;
+        preparedImage = null;
         _loading = false;
       });
     } catch (error) {
@@ -84,6 +88,9 @@ class _ViewOncePhotoScreenState extends State<ViewOncePhotoScreen>
         _unavailable =
             error is ApiException && [403, 404, 410].contains(error.statusCode);
       });
+    } finally {
+      // Also free prepared pixels on a lost claim, close, or stale retry.
+      preparedImage?.dispose();
     }
   }
 
@@ -112,7 +119,7 @@ class _ViewOncePhotoScreenState extends State<ViewOncePhotoScreen>
     WidgetsBinding.instance.removeObserver(this);
     final photo = _photo;
     _photo = null;
-    if (photo != null) unawaited(photo.evict());
+    photo?.dispose();
     final release = _releasePrivacy;
     _releasePrivacy = null;
     if (release != null) unawaited(release().catchError((Object _) {}));
@@ -132,7 +139,7 @@ class _ViewOncePhotoScreenState extends State<ViewOncePhotoScreen>
           fit: StackFit.expand,
           children: [
             if (!_obscured && _photo != null)
-              PhotoCanvas(image: _photo!)
+              PhotoCanvas(decodedImage: _photo!)
             else if (!_obscured && _loading)
               const Center(
                 child: CircularProgressIndicator(color: Colors.white),

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:secure_messenger/data/services/api_service.dart';
@@ -14,6 +15,7 @@ void main() {
   const privacy = MethodChannel('secure_messenger/screen_privacy');
   final protection = <bool>[];
   setUp(() {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
     protection.clear();
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(privacy, (call) async {
@@ -22,6 +24,7 @@ void main() {
         });
   });
   tearDown(() {
+    debugDefaultTargetPlatformOverride = null;
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(privacy, null);
   });
@@ -94,6 +97,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(order, ['download', 'claim', 'viewed']);
     expect(find.byType(PhotoCanvas), findsOneWidget);
+    expect(find.byType(RawImage), findsOneWidget);
+    expect(find.byType(Image), findsNothing); // No second asynchronous decode.
     expect(protection.first, isTrue);
     await tester.pumpWidget(const SizedBox());
     await tester.pump();

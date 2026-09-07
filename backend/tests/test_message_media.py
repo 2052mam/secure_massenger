@@ -2,6 +2,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from app import db
 from app.models.audit import AuditLog
 from app.models.chat import ChatMember
@@ -63,26 +65,26 @@ def test_reply_to_old_message_is_independent_of_page(client, auth, make_message)
     assert jump.json['has_more'] is True
 
 
-def test_replies_never_expose_deleted_hidden_or_cross_chat_content(app, client, auth, make_message):
+@pytest.mark.parametrize('mode', ['hidden', 'deleted', 'cross-chat'])
+def test_replies_never_expose_deleted_hidden_or_cross_chat_content(
+        app, client, auth, make_message, mode):
     make_message()
     make_message('reply', reply_to_id='original', content='reply body')
-    for mode in ('hidden', 'deleted', 'cross-chat'):
-        with app.app_context():
-            original = db.session.get(Message, 'original')
-            if mode == 'hidden':
-                db.session.add(MessageHide(message_id='original', user_id='bob'))
-            elif mode == 'deleted':
-                original.is_deleted = True
-                original.is_deleted_for_all = True
-            else:
-                original.is_deleted = False
-                original.is_deleted_for_all = False
-                original.chat_id = 'other'
-            db.session.commit()
-        result = client.get('/api/v1/messages/chat', headers=auth('bob')).json
+    with app.app_context():
+        original = db.session.get(Message, 'original')
+        if mode == 'hidden':
+            db.session.add(MessageHide(message_id='original', user_id='bob'))
+        elif mode == 'deleted':
+            original.is_deleted = True
+            original.is_deleted_for_all = True
+        else:
+            original.chat_id = 'other'
+        db.session.commit()
+    for endpoint in ('/chat', '/search/chat?q=reply', '/poll'):
+        result = client.get('/api/v1/messages' + endpoint, headers=auth('bob')).json
         reply = next(m for m in result['messages'] if m['id'] == 'reply')
         assert reply['reply_to'] == {'id': 'original', 'is_unavailable': True}
-    # The privacy fix must keep soft-deleted records, not hard-delete them.
+    # The privacy fix must keep records, not hard-delete them.
     with app.app_context():
         assert db.session.get(Message, 'original') is not None
 
@@ -190,8 +192,9 @@ def test_concurrent_view_once_claims_have_exactly_one_winner(app, client, auth, 
     headers = auth('bob')
     url = f'/api/v1/messages/{mid}/view-once'
     # Two devices can prepare the image, but only one may reveal it.
-    assert client.get(url + '/media', headers=headers).status_code == 200
-    assert client.get(url + '/media', headers=headers).status_code == 200
+    for _ in range(2):
+        with client.get(url + '/media', headers=headers) as response:
+            assert response.status_code == 200
     def claim(_):
         with app.test_client() as device:
             return device.post(url, headers=headers, json={}).status_code
@@ -225,3 +228,35 @@ def test_view_once_validates_media_ownership_and_type(client, auth, upload):
     assert send(client, auth, media_id=foreign_id, message_type='image', is_view_once=True).status_code == 403
     audio_id, _ = upload(filename='audio.m4a', data=b'audio')
     assert send(client, auth, media_id=audio_id, message_type='image', is_view_once=True).status_code == 400
+
+
+def test_read_receipts_do_not_consume_view_once(client, auth, upload):
+    mid, _, _ = make_once(client, auth, upload)
+    assert client.post('/api/v1/messages/chat/chat/read', headers=auth('bob'), json={}).status_code == 200
+    result = client.post('/api/v1/messages/statuses', headers=auth(), json={'message_ids': [mid]}).json
+    assert result['statuses'][mid] == 'read'
+    assert result['viewed_at'][mid] is None
+    with client.get(f'/api/v1/messages/{mid}/view-once/media', headers=auth('bob')) as response:
+        assert response.status_code == 200
+    assert client.post(f'/api/v1/messages/{mid}/view-once', headers=auth('bob'), json={}).status_code == 200
+    result = client.post('/api/v1/messages/statuses', headers=auth(), json={'message_ids': [mid]}).json
+    assert result['statuses'][mid] == 'read'
+    assert result['viewed_at'][mid] is not None
+
+
+@pytest.mark.parametrize('cursor', ['before_id', 'after_id'])
+def test_cross_chat_cursors_are_rejected(client, auth, make_message, cursor):
+    make_message('other-message', chat_id='other')
+    result = client.get(f'/api/v1/messages/chat?{cursor}=other-message', headers=auth())
+    assert result.status_code == 404
+
+
+def test_equal_timestamp_pagination_is_stable(client, auth, make_message):
+    for i in range(10):
+        make_message(f'm-{i:03}', created_at=datetime(2026, 9, 7))
+    result = client.get('/api/v1/messages/chat?limit=3', headers=auth()).json
+    assert [m['id'] for m in result['messages']] == ['m-007', 'm-008', 'm-009']
+    result = client.get('/api/v1/messages/chat?before_id=m-007&limit=3', headers=auth()).json
+    assert [m['id'] for m in result['messages']] == ['m-004', 'm-005', 'm-006']
+    result = client.get('/api/v1/messages/chat?after_id=m-004&limit=3', headers=auth()).json
+    assert [m['id'] for m in result['messages']] == ['m-005', 'm-006', 'm-007']

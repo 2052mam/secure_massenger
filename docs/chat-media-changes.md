@@ -47,7 +47,9 @@ The new route performs:
 4. Claim the opening using the existing `POST /messages/<id>/view-once` endpoint.
    Its conditional database UPDATE allows only one claim to succeed.
 5. Reveal the photo full-screen. Closing or backgrounding covers the photo,
-   discards the in-memory image cache entry and releases screen protection.
+   disposes the decoded image and releases screen protection. The already-decoded
+   frame is reused for display; it never enters a shared/disk image cache or needs
+   a second decode after the successful claim.
 
 The sender cannot consume their own photo. Non-members, departed members, hidden
 messages and already-opened photos are rejected. The generic `/media/<id>` route
@@ -140,7 +142,7 @@ creation, so the template is deliberately not installed automatically.
 Non-fatal style warnings in unrelated legacy code are not
 turned into a repository-wide cleanup in this patch.
 
-Local verification completed: **14 backend tests**, Python compilation, and Dart
+Local verification completed: **20 backend tests**, Python compilation, and Dart
 syntax parsing. Changed Dart files were formatted using a WASM build of dart_style.
 The sandbox has no Flutter/Android SDK and its network cannot download Flutter or
 pub.dev packages. **Flutter analysis/tests have not been executed** in this
