@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import '../../core/constants/api_constants.dart';
@@ -17,9 +18,7 @@ class ApiService {
   }
 
   Map<String, String> get _headers {
-    final h = {
-      'Accept': 'application/json',
-    };
+    final h = {'Accept': 'application/json'};
     final token = _token ?? StorageService.getToken();
     if (token != null) {
       h['Authorization'] = 'Bearer $token';
@@ -33,7 +32,10 @@ class ApiService {
     return h;
   }
 
-  Future<Map<String, dynamic>> post(String path, Map<String, dynamic> body) async {
+  Future<Map<String, dynamic>> post(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
     final res = await http.post(
       Uri.parse('${ApiConstants.baseUrl}$path'),
       headers: _jsonHeaders,
@@ -42,13 +44,42 @@ class ApiService {
     return _handle(res);
   }
 
-  Future<Map<String, dynamic>> get(String path, {Map<String, String>? query}) async {
-    final uri = Uri.parse('${ApiConstants.baseUrl}$path').replace(queryParameters: query);
+  Future<Map<String, dynamic>> get(
+    String path, {
+    Map<String, String>? query,
+  }) async {
+    final uri = Uri.parse(
+      '${ApiConstants.baseUrl}$path',
+    ).replace(queryParameters: query);
     final res = await http.get(uri, headers: _headers);
     return _handle(res);
   }
 
-  Future<Map<String, dynamic>> put(String path, Map<String, dynamic> body) async {
+  /// Ephemeral media is kept in memory and never passed to an image disk cache.
+  Future<Uint8List> getBytes(String path) async {
+    final response = await http
+        .get(
+          Uri.parse('${ApiConstants.baseUrl}$path'),
+          headers: {..._headers, 'Cache-Control': 'no-store'},
+        )
+        .timeout(const Duration(seconds: 45));
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      String message = 'بارگذاری عکس ناموفق بود';
+      try {
+        final body = jsonDecode(response.body) as Map<String, dynamic>;
+        message = body['error'] as String? ?? message;
+      } catch (_) {
+        // A reverse proxy may return an HTML error instead of JSON.
+      }
+      throw ApiException(statusCode: response.statusCode, message: message);
+    }
+    return response.bodyBytes;
+  }
+
+  Future<Map<String, dynamic>> put(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
     final res = await http.put(
       Uri.parse('${ApiConstants.baseUrl}$path'),
       headers: _jsonHeaders,
@@ -57,26 +88,39 @@ class ApiService {
     return _handle(res);
   }
 
-  Future<Map<String, dynamic>> uploadFile(String path, File file, {String fieldName = 'file'}) async {
+  Future<Map<String, dynamic>> uploadFile(
+    String path,
+    File file, {
+    String fieldName = 'file',
+  }) async {
     final uri = Uri.parse('${ApiConstants.baseUrl}$path');
     final request = http.MultipartRequest('POST', uri);
     request.headers.addAll(_headers);
 
     final ext = file.path.split('.').last.toLowerCase();
     String mime = 'application/octet-stream';
-    if (['jpg', 'jpeg'].contains(ext)) mime = 'image/jpeg';
-    else if (ext == 'png') mime = 'image/png';
-    else if (ext == 'gif') mime = 'image/gif';
-    else if (ext == 'webp') mime = 'image/webp';
-    else if (ext == 'mp4') mime = 'video/mp4';
-    else if (ext == 'mp3') mime = 'audio/mpeg';
-    else if (ext == 'm4a') mime = 'audio/mp4';
+    if (['jpg', 'jpeg'].contains(ext))
+      mime = 'image/jpeg';
+    else if (ext == 'png')
+      mime = 'image/png';
+    else if (ext == 'gif')
+      mime = 'image/gif';
+    else if (ext == 'webp')
+      mime = 'image/webp';
+    else if (ext == 'mp4')
+      mime = 'video/mp4';
+    else if (ext == 'mp3')
+      mime = 'audio/mpeg';
+    else if (ext == 'm4a')
+      mime = 'audio/mp4';
 
-    request.files.add(await http.MultipartFile.fromPath(
-      fieldName,
-      file.path,
-      contentType: MediaType.parse(mime),
-    ));
+    request.files.add(
+      await http.MultipartFile.fromPath(
+        fieldName,
+        file.path,
+        contentType: MediaType.parse(mime),
+      ),
+    );
 
     final streamed = await request.send();
     final res = await http.Response.fromStream(streamed);

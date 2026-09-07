@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, current_app, send_from_directory
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
 from app.models.user import User, BlockList
@@ -7,6 +7,12 @@ from app.models.message import Message, MessageStatus, MessageReaction, PinnedMe
 from app.models.media import MediaFile
 from app.models.audit import AuditLog
 from datetime import datetime
+from sqlalchemy import and_, or_
+import os
+
+from app.services.message_payloads import (
+    serialize_messages, user_in_chat, visible_messages,
+)
 
 messages_bp = Blueprint('messages', __name__)
 
@@ -14,88 +20,59 @@ def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr)
 
 
-def user_in_chat(user_id, chat_id):
-    return ChatMember.query.filter_by(
-        chat_id=chat_id, user_id=user_id, is_deleted=False
-    ).first() is not None
-
-
 @messages_bp.route('/<chat_id>', methods=['GET'])
 @jwt_required()
 def get_messages(chat_id):
-    """دریافت پیام‌ها + پشتیبانی از Polling با after_id یا since"""
+    """Chronological history, incremental polling and direct reply navigation."""
     user_id = get_jwt_identity()
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
+    try:
+        limit = max(1, min(int(request.args.get('limit', 50)), 100))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'limit نامعتبر است'}), 400
+
     after_id = request.args.get('after_id')
     before_id = request.args.get('before_id')
-    limit = min(int(request.args.get('limit', 50)), 100)
-
-    hidden_ids = {h.message_id for h in MessageHide.query.filter_by(user_id=user_id).all()}
-    query = Message.query.filter(
-        Message.chat_id == chat_id,
-        Message.is_deleted_for_all == False,
-    )
-
-    if after_id:
-        after_msg = Message.query.get(after_id)
-        if after_msg:
-            query = query.filter(Message.created_at > after_msg.created_at)
-    elif before_id:
-        before_msg = Message.query.get(before_id)
-        if before_msg:
-            query = query.filter(Message.created_at < before_msg.created_at)
-
-    messages = query.order_by(Message.created_at.desc()).limit(limit * 2).all()
-    messages = [m for m in messages if m.id not in hidden_ids][:limit]
-    messages.reverse()  # قدیمی به جدید
-
-    result = []
-    for msg in messages:
-        # وضعیت خوانده شدن برای کاربر فعلی
-        sender = User.query.get(msg.sender_id)
-
-        # وضعیت تیک‌ها: برای پیام خودم، بالاترین وضعیت گیرندگان را نشان بده
-        if msg.sender_id == user_id:
-            statuses = MessageStatus.query.filter(
-                MessageStatus.message_id == msg.id,
-                MessageStatus.user_id != user_id,
-            ).all()
-            if any(s.status == 'read' for s in statuses):
-                msg_status = 'read'
-            elif any(s.status == 'delivered' for s in statuses):
-                msg_status = 'delivered'
-            else:
-                msg_status = 'sent'
+    from_id = request.args.get('from_id')
+    if sum(bool(v) for v in (after_id, before_id, from_id)) > 1:
+        return jsonify({'error': 'فقط یک نشانگر پیام مجاز است'}), 400
+    cursor_id = after_id or before_id or from_id
+    query = visible_messages(user_id).filter(Message.chat_id == chat_id)
+    if cursor_id:
+        # A cursor may have been deleted since the previous poll, but must
+        # always belong to this chat. A reply jump must still be visible.
+        cursor_query = query if from_id else Message.query.filter_by(chat_id=chat_id)
+        cursor = cursor_query.filter(Message.id == cursor_id).first()
+        if cursor is None:
+            return jsonify({'error': 'پیام یافت نشد'}), 404
+        if before_id:
+            query = query.filter(or_(
+                Message.created_at < cursor.created_at,
+                and_(Message.created_at == cursor.created_at, Message.id < cursor.id),
+            ))
         else:
-            st = MessageStatus.query.filter_by(message_id=msg.id, user_id=user_id).first()
-            msg_status = st.status if st else 'delivered'
+            query = query.filter(or_(
+                Message.created_at > cursor.created_at,
+                and_(Message.created_at == cursor.created_at,
+                     Message.id >= cursor.id if from_id else Message.id > cursor.id),
+            ))
 
-        media_url = None
-        if msg.media_id:
-            media_url = f'/api/v1/media/{msg.media_id}'
-
-        item = {
-            'id': msg.id,
-            'chat_id': msg.chat_id,
-            'sender_id': msg.sender_id,
-            'sender': sender.to_dict() if sender else None,
-            'message_type': msg.message_type,
-            'content': msg.content,
-            'media_id': msg.media_id,
-            'media_url': media_url,
-            'reply_to_id': msg.reply_to_id,
-            'forwarded_from_id': msg.forwarded_from_id,
-            'is_view_once': msg.is_view_once,
-            'viewed_at': msg.viewed_at.isoformat() if msg.viewed_at else None,
-            'is_edited': msg.is_edited,
-            'created_at': msg.created_at.isoformat(),
-            'status': msg_status,
-        }
-        result.append(item)
-
-    return jsonify({'messages': result, 'has_more': len(messages) == limit}), 200
+    # after_id must take the FIRST unseen page, not the last, or a busy chat
+    # silently loses messages. The UUID breaks equal-timestamp ties.
+    ascending = bool(after_id or from_id)
+    ordering = (Message.created_at.asc(), Message.id.asc()) if ascending else (
+        Message.created_at.desc(), Message.id.desc())
+    rows = query.order_by(*ordering).limit(limit + 1).all()
+    has_more = len(rows) > limit
+    messages = rows[:limit]
+    if not ascending:
+        messages.reverse()
+    return jsonify({
+        'messages': serialize_messages(messages, user_id),
+        'has_more': has_more,
+    }), 200
 
 
 @messages_bp.route('/', methods=['POST'])
@@ -139,6 +116,30 @@ def send_message():
             if is_blocked:
                 return jsonify({'error': 'امکان ارسال پیام وجود ندارد'}), 403
 
+    if reply_to_id:
+        original = visible_messages(user_id).filter_by(
+            id=reply_to_id, chat_id=chat_id
+        ).first()
+        if original is None:
+            return jsonify({'error': 'پیام مرجع در این چت در دسترس نیست'}), 400
+
+    if is_view_once and (message_type != 'image' or not media_id):
+        return jsonify({'error': 'مشاهده یک‌باره فقط برای عکس مجاز است'}), 400
+    if media_id:
+        media = MediaFile.query.filter_by(
+            id=media_id, uploader_id=user_id, is_deleted=False
+        ).first()
+        if media is None:
+            return jsonify({'error': 'فایل در دسترس نیست'}), 403
+        if is_view_once and media.media_type != 'image':
+            return jsonify({'error': 'فایل باید عکس باشد'}), 400
+        # Reusing an ephemeral upload as a normal message bypasses view-once.
+        references = Message.query.filter_by(media_id=media_id)
+        if references.filter_by(is_view_once=True).first() or (
+            is_view_once and references.first()
+        ):
+            return jsonify({'error': 'این فایل قبلاً در پیام استفاده شده است'}), 400
+
     msg = Message(
         chat_id=chat_id,
         sender_id=user_id,
@@ -170,15 +171,7 @@ def send_message():
     ))
     db.session.commit()
 
-    return jsonify({
-        'id': msg.id,
-        'chat_id': msg.chat_id,
-        'sender_id': msg.sender_id,
-        'message_type': msg.message_type,
-        'content': msg.content,
-        'created_at': msg.created_at.isoformat(),
-        'status': 'sent',
-    }), 201
+    return jsonify(serialize_messages([msg], user_id, status_override='sent')[0]), 201
 
 
 @messages_bp.route('/<message_id>/read', methods=['POST'])
@@ -254,6 +247,13 @@ def forward_message(message_id):
     if not original:
         return jsonify({'error': 'پیام یافت نشد'}), 404
 
+    if not user_in_chat(user_id, original.chat_id) or not visible_messages(user_id).filter_by(id=message_id).first():
+        return jsonify({'error': 'دسترسی به پیام ندارید'}), 403
+    if original.is_view_once or (original.media_id and Message.query.filter_by(
+        media_id=original.media_id, is_view_once=True
+    ).first()):
+        return jsonify({'error': 'عکس یک‌بارمصرف قابل فوروارد نیست'}), 403
+
     if not user_in_chat(user_id, target_chat_id):
         return jsonify({'error': 'دسترسی به چت مقصد ندارید'}), 403
 
@@ -310,15 +310,15 @@ def poll_updates():
     limit = min(int(request.args.get('limit', 50)), 100)
 
     # چت‌هایی که کاربر عضو است
-    chat_ids = [m.chat_id for m in ChatMember.query.filter_by(user_id=user_id, is_deleted=False).all()]
+    chat_ids = [m.chat_id for m in ChatMember.query.join(Chat).filter(
+        ChatMember.user_id == user_id, ChatMember.is_deleted.is_(False),
+        Chat.is_deleted.is_(False),
+    ).all()]
 
     if not chat_ids:
         return jsonify({'messages': [], 'chats_updated': []}), 200
 
-    query = Message.query.filter(
-        Message.chat_id.in_(chat_ids),
-        Message.is_deleted == False
-    )
+    query = visible_messages(user_id).filter(Message.chat_id.in_(chat_ids))
 
     if since:
         try:
@@ -329,21 +329,7 @@ def poll_updates():
 
     new_messages = query.order_by(Message.created_at.asc()).limit(limit).all()
 
-    result_msgs = []
-    for msg in new_messages:
-        sender = User.query.get(msg.sender_id)
-        result_msgs.append({
-            'id': msg.id,
-            'chat_id': msg.chat_id,
-            'sender_id': msg.sender_id,
-            'sender': sender.to_dict() if sender else None,
-            'message_type': msg.message_type,
-            'content': msg.content,
-            'media_id': msg.media_id,
-            'reply_to_id': msg.reply_to_id,
-            'is_view_once': msg.is_view_once,
-            'created_at': msg.created_at.isoformat(),
-        })
+    result_msgs = serialize_messages(new_messages, user_id)
 
     return jsonify({
         'messages': result_msgs,
@@ -363,25 +349,11 @@ def search_in_chat(chat_id):
     if len(q) < 2:
         return jsonify({'messages': []}), 200
 
-    messages = Message.query.filter(
-        Message.chat_id == chat_id,
-        Message.is_deleted == False,
-        Message.content.ilike(f'%{q}%')
+    messages = visible_messages(user_id).filter(
+        Message.chat_id == chat_id, Message.content.ilike(f'%{q}%')
     ).order_by(Message.created_at.desc()).limit(50).all()
 
-    result = []
-    for msg in messages:
-        sender = User.query.get(msg.sender_id)
-        result.append({
-            'id': msg.id,
-            'chat_id': msg.chat_id,
-            'sender_id': msg.sender_id,
-            'sender': sender.to_dict() if sender else None,
-            'message_type': msg.message_type,
-            'content': msg.content,
-            'created_at': msg.created_at.isoformat(),
-        })
-    return jsonify({'messages': result}), 200
+    return jsonify({'messages': serialize_messages(messages, user_id)}), 200
 
 
 @messages_bp.route('/chat/<chat_id>/clear', methods=['POST'])
@@ -483,18 +455,67 @@ def mark_chat_read(chat_id):
     db.session.commit()
     return jsonify({'ok': True}), 200
 
+def view_once_message(message_id, user_id):
+    msg = visible_messages(user_id).filter_by(id=message_id).first()
+    if msg is None:
+        return None, (jsonify({'error': 'پیام یافت نشد'}), 404)
+    if not user_in_chat(user_id, msg.chat_id) or msg.sender_id == user_id:
+        return None, (jsonify({'error': 'فقط گیرنده می‌تواند عکس را باز کند'}), 403)
+    if not msg.is_view_once or msg.message_type != 'image':
+        return None, (jsonify({'error': 'این پیام عکس یک‌بارمصرف نیست'}), 400)
+    if msg.viewed_at is not None:
+        return None, (jsonify({'error': 'عکس قبلاً مشاهده شده است'}), 410)
+    return msg, None
+
+
+@messages_bp.route('/<message_id>/view-once/media', methods=['GET'])
+@jwt_required()
+def get_view_once_media(message_id):
+    """Load into memory first; failed downloads/decodes do not consume the photo.
+
+    Clients may reveal these bytes only after winning the atomic POST below.
+    The ordinary media URL never serves a view-once upload.
+    """
+    msg, error = view_once_message(message_id, get_jwt_identity())
+    if error is not None:
+        return error
+    media = MediaFile.query.filter_by(id=msg.media_id, is_deleted=False).first()
+    if media is None:
+        return jsonify({'error': 'فایل یافت نشد'}), 404
+    response = send_from_directory(
+        os.path.abspath(current_app.config['UPLOAD_FOLDER']), media.stored_name,
+        conditional=False, etag=False, max_age=0,
+    )
+    response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
 @messages_bp.route('/<message_id>/view-once', methods=['POST'])
 @jwt_required()
 def mark_view_once(message_id):
     user_id = get_jwt_identity()
-    msg = Message.query.filter_by(id=message_id, is_deleted=False).first()
-    if not msg:
-        return jsonify({'error': 'پیام یافت نشد'}), 404
-    if not msg.is_view_once:
-        return jsonify({'error': 'این پیام view once نیست'}), 400
-    msg.viewed_at = datetime.utcnow()
+    msg, error = view_once_message(message_id, user_id)
+    if error is not None:
+        return error
+    viewed_at = datetime.utcnow()
+    # A conditional UPDATE works on both MySQL and SQLite. Two devices cannot
+    # both win the claim, even when their preceding downloads overlap.
+    updated = Message.query.filter_by(
+        id=message_id, is_deleted=False, is_deleted_for_all=False,
+        is_view_once=True, viewed_at=None,
+    ).update({'viewed_at': viewed_at}, synchronize_session=False)
+    if updated != 1:
+        db.session.rollback()
+        return jsonify({'error': 'عکس قبلاً مشاهده شده است'}), 410
+    db.session.add(AuditLog(
+        actor_id=user_id, action='view_once_opened', entity_type='message',
+        entity_id=message_id, ip_address=get_client_ip(),
+    ))
     db.session.commit()
-    return jsonify({'ok': True}), 200
+    return jsonify({'ok': True, 'viewed_at': viewed_at.isoformat()}), 200
+
 
 @messages_bp.route('/statuses', methods=['POST'])
 @jwt_required()
@@ -506,15 +527,21 @@ def get_message_statuses():
     if not message_ids:
         return jsonify({'statuses': {}}), 200
 
+    if not isinstance(message_ids, list) or len(message_ids) > 100:
+        return jsonify({'error': 'حداکثر ۱۰۰ پیام مجاز است'}), 400
+
     result = {}
+    viewed_at = {}
     for mid in message_ids:
-        msg = Message.query.get(mid)
+        msg = db.session.get(Message, mid)
         if not msg:
             continue
-        # فقط اجازه چک کردن وضعیت پیام‌های خودمون رو می‌دیم
-        if msg.sender_id != user_id:
-            continue
         if not user_in_chat(user_id, msg.chat_id):
+            continue
+        if msg.is_view_once:
+            viewed_at[mid] = msg.viewed_at.isoformat() if msg.viewed_at else None
+        # Read/delivery ticks still belong only to the sender.
+        if msg.sender_id != user_id:
             continue
 
         statuses = MessageStatus.query.filter(
@@ -528,4 +555,4 @@ def get_message_statuses():
         else:
             result[mid] = 'sent'
 
-    return jsonify({'statuses': result}), 200
+    return jsonify({'statuses': result, 'viewed_at': viewed_at}), 200

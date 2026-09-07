@@ -8,6 +8,9 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:collection/collection.dart';
 
 import '../../../data/models/message_model.dart';
+import '../../../data/models/reply_preview_model.dart';
+import '../../../data/services/media_playback_coordinator.dart';
+import '../../../core/utils/media_utils.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/storage_service.dart';
 import '../../../data/services/voice_service.dart';
@@ -15,9 +18,11 @@ import '../../../core/constants/api_constants.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/chat_list_provider.dart';
 import '../profile/user_profile_screen.dart';
-import '../../widgets/media/video_message_player.dart';
-
-import 'package:just_audio/just_audio.dart' as just_audio;
+import '../../widgets/chat/message_bubble.dart';
+import '../../widgets/chat/reply_preview.dart';
+import '../../widgets/media/media_labels.dart';
+import '../media/photo_viewer_screen.dart';
+import '../media/view_once_photo_screen.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String chatId;
@@ -34,12 +39,25 @@ class ChatScreen extends ConsumerStatefulWidget {
   ConsumerState<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends ConsumerState<ChatScreen> {
+class _ChatScreenState extends ConsumerState<ChatScreen>
+    with WidgetsBindingObserver {
   final _textCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
   final _searchCtrl = TextEditingController();
   final List<MessageModel> _messages = [];
   final VoiceService _voice = VoiceService();
+  final _playback = MediaPlaybackCoordinator();
+  final Map<String, GlobalKey> _messageKeys = {};
+  Timer? _highlightTimer;
+  String? _highlightedMessageId;
+  bool _openingMedia = false;
+  bool _jumpingToReply = false;
+  bool _historyMode = false;
+  bool _hasEarlier = false;
+  bool _loadingEarlier = false;
+  bool _polling = false;
+  bool _refreshingStatuses = false;
+  int _loadGeneration = 0;
   bool _loading = true;
   bool _sending = false;
   bool _searchMode = false;
@@ -57,25 +75,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   String? _chatUsername;
   String? _chatDescription;
 
-  String _mediaFullUrl(String? mediaId, {String? existingUrl}) {
-    if (existingUrl != null && existingUrl.isNotEmpty) {
-      if (existingUrl.startsWith('http')) return existingUrl;
-      final base = ApiConstants.baseUrl.replaceAll('/api/v1', '');
-      return '$base$existingUrl';
-    }
-    if (mediaId == null || mediaId.isEmpty) return '';
-    return '${ApiConstants.baseUrl}/media/$mediaId';
-  }
+  String _mediaFullUrl(String? mediaId, {String? existingUrl}) =>
+      resolveMediaUrl(mediaId, existingUrl: existingUrl);
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _currentUserId = StorageService.getUserId();
     _loadMessages();
     _startPolling();
     _markChatRead();
     _loadBackground();
-    _loadChatInfo(); // این رو اضافه کن
+    _loadChatInfo();
   }
 
   Future<void> _loadBackground() async {
@@ -115,7 +127,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   @override
   void dispose() {
+    ++_loadGeneration;
+    WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
+    _highlightTimer?.cancel();
+    unawaited(_playback.pause());
     _textCtrl.dispose();
     _scrollCtrl.dispose();
     _searchCtrl.dispose();
@@ -123,15 +139,23 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) unawaited(_playback.pause());
+  }
+
   Future<void> _markChatRead() async {
     if (!mounted) return;
     try {
       await ApiService().post('/messages/chat/${widget.chatId}/read', {});
+      if (!mounted) return;
       ref.read(chatListProvider.notifier).refresh();
     } catch (_) {}
   }
 
   Future<void> _loadMessages({String? query}) async {
+    if (!mounted) return;
+    final generation = ++_loadGeneration;
     setState(() {
       _loading = true;
       _error = null;
@@ -146,6 +170,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       } else {
         res = await ApiService().get('/messages/${widget.chatId}');
       }
+      if (!mounted || generation != _loadGeneration) return;
       final list = (res['messages'] as List? ?? [])
           .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
           .toList();
@@ -153,7 +178,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _messages
           ..clear()
           ..addAll(list);
-        if (list.isNotEmpty && query == null) _lastMessageId = list.last.id;
+        _messageKeys.removeWhere((id, _) => !list.any((m) => m.id == id));
+        if (query == null) _lastMessageId = list.isEmpty ? null : list.last.id;
+        _hasEarlier = query == null && res['has_more'] == true;
+        _historyMode = false;
         _loading = false;
       });
       if (query == null) {
@@ -161,10 +189,137 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _markChatRead();
       }
     } catch (e) {
+      if (!mounted || generation != _loadGeneration) return;
       setState(() {
         _error = e.toString();
         _loading = false;
       });
+    }
+  }
+
+  void _mergeMessages(Iterable<MessageModel> messages) {
+    for (final message in messages) {
+      final index = _messages.indexWhere((m) => m.id == message.id);
+      if (index == -1) {
+        _messages.add(message);
+      } else {
+        _messages[index] = message;
+      }
+    }
+    _messages.sort((a, b) {
+      final order = a.createdAt.compareTo(b.createdAt);
+      return order == 0 ? a.id.compareTo(b.id) : order;
+    });
+    _lastMessageId = _messages.isEmpty ? null : _messages.last.id;
+  }
+
+  Future<void> _loadEarlier() async {
+    if (_loadingEarlier || _messages.isEmpty || !_hasEarlier) return;
+    final generation = _loadGeneration;
+    setState(() => _loadingEarlier = true);
+    final oldExtent = _scrollCtrl.hasClients
+        ? _scrollCtrl.position.maxScrollExtent
+        : 0.0;
+    final oldOffset = _scrollCtrl.hasClients ? _scrollCtrl.offset : 0.0;
+    try {
+      final res = await ApiService().get(
+        '/messages/${widget.chatId}',
+        query: {'before_id': _messages.first.id},
+      );
+      if (!mounted || generation != _loadGeneration) return;
+      final list = (res['messages'] as List? ?? []).map(
+        (e) => MessageModel.fromJson(e as Map<String, dynamic>),
+      );
+      setState(() {
+        _mergeMessages(list);
+        _hasEarlier = res['has_more'] == true;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted ||
+            !_scrollCtrl.hasClients ||
+            generation != _loadGeneration)
+          return;
+        final offset =
+            oldOffset + _scrollCtrl.position.maxScrollExtent - oldExtent;
+        _scrollCtrl.jumpTo(
+          offset.clamp(0.0, _scrollCtrl.position.maxScrollExtent).toDouble(),
+        );
+      });
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
+    } finally {
+      if (mounted) setState(() => _loadingEarlier = false);
+    }
+  }
+
+  ReplyPreviewModel? _replyPreviewFor(MessageModel message) {
+    if (message.replyTo != null) return message.replyTo;
+    final id = message.replyToId;
+    if (id == null) return null;
+    return _messages.firstWhereOrNull((m) => m.id == id)?.asReplyPreview ??
+        ReplyPreviewModel.unavailable(id);
+  }
+
+  Future<void> _jumpToReply(String id) async {
+    if (_jumpingToReply) return;
+    _jumpingToReply = true;
+    try {
+      var target = _messageKeys[id]?.currentContext;
+      if (target == null) {
+        final generation = ++_loadGeneration;
+        // Start the history window at the original, so it can be reached even
+        // outside the lazy list's built items without an estimated pixel jump.
+        final res = await ApiService().get(
+          '/messages/${widget.chatId}',
+          query: {'from_id': id},
+        );
+        if (!mounted || generation != _loadGeneration) return;
+        final list = (res['messages'] as List? ?? [])
+            .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
+            .toList();
+        if (list.isEmpty || list.first.id != id)
+          throw StateError('Message unavailable');
+        await _playback.pause();
+        if (!mounted) return;
+        setState(() {
+          _messages
+            ..clear()
+            ..addAll(list);
+          _historyMode = true;
+          _searchMode = false;
+          _hasEarlier = true;
+          _loading = false;
+          _error = null;
+        });
+        if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+        await WidgetsBinding.instance.endOfFrame;
+        if (!mounted) return;
+        target = _messageKeys[id]?.currentContext;
+      }
+      if (target != null && target.mounted) {
+        await Scrollable.ensureVisible(
+          target,
+          alignment: 0.25,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeOutCubic,
+        );
+      }
+      if (!mounted) return;
+      _highlightTimer?.cancel();
+      setState(() => _highlightedMessageId = id);
+      _highlightTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted) setState(() => _highlightedMessageId = null);
+      });
+    } catch (_) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(MediaLabels.of(context).unavailable)),
+        );
+    } finally {
+      _jumpingToReply = false;
     }
   }
 
@@ -173,8 +328,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     _pollTimer = Timer.periodic(
       Duration(seconds: ApiConstants.pollingIntervalSeconds),
       (_) {
-        if (!_searchMode) {
-          _pollNewMessages();
+        if (!_searchMode && !_loading) {
+          if (!_historyMode) _pollNewMessages();
           _refreshMessageStatuses();
         }
       },
@@ -182,32 +337,45 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   Future<void> _refreshMessageStatuses() async {
-    if (!mounted) return;
-    final pendingIds = _messages
-        .where((m) => m.senderId == _currentUserId && m.status != 'read')
+    if (!mounted || _refreshingStatuses) return;
+    final pendingIds = _messages.reversed
+        .where(
+          (m) =>
+              (m.senderId == _currentUserId && m.status != 'read') ||
+              (m.isViewOnce && m.viewedAt == null),
+        )
+        .take(100)
         .map((m) => m.id)
         .toList();
     if (pendingIds.isEmpty) return;
+    _refreshingStatuses = true;
     try {
       final res = await ApiService().post('/messages/statuses', {
         'message_ids': pendingIds,
       });
-      final statuses = (res['statuses'] as Map<String, dynamic>? ?? {});
-      if (statuses.isEmpty || !mounted) return;
+      final statuses = res['statuses'] as Map<String, dynamic>? ?? {};
+      final views = res['viewed_at'] as Map<String, dynamic>? ?? {};
+      if (!mounted) return;
       setState(() {
         for (var i = 0; i < _messages.length; i++) {
-          final m = _messages[i];
-          final newStatus = statuses[m.id] as String?;
-          if (newStatus != null && newStatus != m.status) {
-            _messages[i] = m.copyWith(status: newStatus);
-          }
+          final message = _messages[i];
+          final viewed = views[message.id] as String?;
+          _messages[i] = message.copyWith(
+            status: statuses[message.id] as String?,
+            viewedAt: viewed == null ? null : DateTime.tryParse(viewed),
+          );
         }
       });
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _refreshingStatuses = false;
+    }
   }
 
   Future<void> _pollNewMessages() async {
-    if (!mounted) return;
+    if (!mounted || _polling || _loading || _historyMode) return;
+    _polling = true;
+    final generation = _loadGeneration;
     try {
       final query = <String, String>{};
       if (_lastMessageId != null) query['after_id'] = _lastMessageId!;
@@ -215,27 +383,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         '/messages/${widget.chatId}',
         query: query,
       );
+      if (!mounted ||
+          _searchMode ||
+          _historyMode ||
+          generation != _loadGeneration)
+        return;
       final list = (res['messages'] as List? ?? [])
           .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
           .toList();
-      if (list.isNotEmpty && mounted) {
-        setState(() {
-          for (final m in list) {
-            if (!_messages.any((x) => x.id == m.id)) {
-              _messages.add(m);
-            }
-          }
-          _lastMessageId = _messages.last.id;
-        });
-        _scrollToBottom();
+      if (list.isNotEmpty) {
+        final atBottom =
+            !_scrollCtrl.hasClients ||
+            _scrollCtrl.position.maxScrollExtent - _scrollCtrl.offset < 160;
+        setState(() => _mergeMessages(list));
+        if (atBottom) _scrollToBottom();
         _markChatRead();
       }
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _polling = false;
+    }
   }
 
   Future<void> _sendText() async {
     final text = _textCtrl.text.trim();
     if (text.isEmpty || _sending) return;
+    final reply = _replyTo;
     setState(() => _sending = true);
     try {
       final body = <String, dynamic>{
@@ -243,23 +416,30 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         'content': text,
         'message_type': 'text',
       };
-      if (_replyTo != null) body['reply_to_id'] = _replyTo!.id;
+      if (reply != null) body['reply_to_id'] = reply.id;
       final res = await ApiService().post('/messages/', body);
-      final msg = MessageModel.fromJson(res);
+      if (!mounted) return;
+      final msg = MessageModel.fromJson({
+        'reply_to_id': reply?.id,
+        ...res,
+      }).copyWith(replyTo: reply?.asReplyPreview);
       setState(() {
-        _messages.add(msg);
-        _lastMessageId = msg.id;
+        _mergeMessages([msg]);
         _textCtrl.clear();
         _replyTo = null;
         _sending = false;
       });
+      if (_historyMode) await _loadMessages();
+      if (!mounted) return;
       _scrollToBottom();
       ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
+      if (!mounted) return;
       setState(() => _sending = false);
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
@@ -274,10 +454,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         ? await picker.pickVideo(source: source)
         : await picker.pickImage(
             source: source,
-            maxWidth: 1600,
-            imageQuality: 85,
+            maxWidth: 4096,
+            imageQuality: 95,
           );
-    if (picked == null) return;
+    if (picked == null || !mounted) return;
 
     bool sendViewOnce = viewOnce;
     if (!isVideo) {
@@ -293,7 +473,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               ),
               ListTile(
                 leading: const Icon(Icons.timer, color: Colors.orange),
-                title: const Text('ارسال تایم‌دار (View Once)'),
+                title: Text(MediaLabels.of(ctx).viewOnce),
+                subtitle: Text(MediaLabels.of(ctx).disappears),
                 onTap: () => Navigator.pop(ctx, 'once'),
               ),
               ListTile(
@@ -305,10 +486,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           ),
         ),
       );
-      if (choice == null || choice == 'cancel') return;
+      if (choice == null || choice == 'cancel' || !mounted) return;
       sendViewOnce = choice == 'once';
     }
 
+    final reply = _replyTo;
     setState(() => _sending = true);
     try {
       final upload = await ApiService().uploadFile(
@@ -325,27 +507,32 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         'content': '',
         'is_view_once': sendViewOnce,
       };
-      if (_replyTo != null) body['reply_to_id'] = _replyTo!.id;
+      if (reply != null) body['reply_to_id'] = reply.id;
       final res = await ApiService().post('/messages/', body);
+      if (!mounted) return;
       final msg = MessageModel.fromJson({
+        'reply_to_id': reply?.id,
         ...res,
         'media_id': mediaId,
-        'media_url': '/api/v1/media/$mediaId',
+        'media_url': sendViewOnce ? null : '/api/v1/media/$mediaId',
         'message_type': mediaType,
         'is_view_once': sendViewOnce,
-      });
+      }).copyWith(replyTo: reply?.asReplyPreview);
       setState(() {
-        _messages.add(msg);
-        _lastMessageId = msg.id;
+        _mergeMessages([msg]);
         _replyTo = null;
         _sending = false;
       });
+      if (_historyMode) await _loadMessages();
       _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
+      if (!mounted) return;
       setState(() => _sending = false);
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
@@ -354,8 +541,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     if (_sending) return;
     if (_isRecording) {
       final file = await _voice.stopRecording();
+      if (!mounted) return;
       setState(() => _isRecording = false);
       if (file == null) return;
+      final reply = _replyTo;
       setState(() => _sending = true);
       try {
         final upload = await ApiService().uploadFile('/media/upload', file);
@@ -366,30 +555,37 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           'media_id': mediaId,
           'content': '',
         };
-        if (_replyTo != null) body['reply_to_id'] = _replyTo!.id;
+        if (reply != null) body['reply_to_id'] = reply.id;
         final res = await ApiService().post('/messages/', body);
+        if (!mounted) return;
         final msg = MessageModel.fromJson({
+          'reply_to_id': reply?.id,
           ...res,
           'media_id': mediaId,
           'media_url': '/api/v1/media/$mediaId',
           'message_type': 'voice',
-        });
+        }).copyWith(replyTo: reply?.asReplyPreview);
         setState(() {
-          _messages.add(msg);
-          _lastMessageId = msg.id;
+          _mergeMessages([msg]);
           _replyTo = null;
           _sending = false;
         });
+        if (_historyMode) await _loadMessages();
         _scrollToBottom();
+        if (mounted) ref.read(chatListProvider.notifier).refresh();
       } catch (e) {
+        if (!mounted) return;
         setState(() => _sending = false);
         if (mounted) {
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text(e.toString())));
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(e.toString())));
         }
       }
     } else {
+      await _playback.pause();
       final ok = await _voice.startRecording();
+      if (!mounted) return;
       if (ok) {
         setState(() => _isRecording = true);
       } else if (mounted) {
@@ -402,6 +598,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   Future<void> _cancelVoiceRecord() async {
     await _voice.cancelRecording();
+    if (!mounted) return;
     setState(() => _isRecording = false);
   }
 
@@ -410,11 +607,24 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       await ApiService().post('/messages/${msg.id}/delete', {
         'for_all': forAll,
       });
-      setState(() => _messages.removeWhere((m) => m.id == msg.id));
+      if (!mounted) return;
+      setState(() {
+        _messages.removeWhere((m) => m.id == msg.id);
+        _messageKeys.remove(msg.id);
+        if (_replyTo?.id == msg.id) _replyTo = null;
+        for (var i = 0; i < _messages.length; i++) {
+          if (_messages[i].replyToId == msg.id) {
+            _messages[i] = _messages[i].copyWith(
+              replyTo: ReplyPreviewModel.unavailable(msg.id),
+            );
+          }
+        }
+      });
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
@@ -446,12 +656,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       await ApiService().post('/messages/chat/${widget.chatId}/clear', {
         'for_all': forAll,
       });
-      setState(() => _messages.clear());
+      if (!mounted) return;
+      setState(() {
+        ++_loadGeneration;
+        _messages.clear();
+        _messageKeys.clear();
+        _lastMessageId = null;
+        _replyTo = null;
+        _hasEarlier = false;
+        _historyMode = false;
+      });
       ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
@@ -459,7 +679,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   Future<void> _blockUser() async {
     _currentUserId ??= StorageService.getUserId();
     final other = _messages
-        .where((m) => m.senderId != null && m.senderId != _currentUserId)
+        .where((m) => m.senderId != _currentUserId)
         .map((m) => m.senderId)
         .firstOrNull;
     if (other == null) {
@@ -473,29 +693,79 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     try {
       await ApiService().post('/users/block/$other', {});
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('کاربر بلاک شد')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('کاربر بلاک شد')));
         Navigator.pop(context);
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
 
-  Future<void> _markViewOnce(MessageModel msg) async {
-    if (!msg.isViewOnce || msg.viewedAt != null) return;
+  Future<void> _openPhoto(MessageModel message) async {
+    if (_openingMedia) return;
+    _openingMedia = true;
     try {
-      await ApiService().post('/messages/${msg.id}/view-once', {});
-      setState(() {
-        final idx = _messages.indexWhere((m) => m.id == msg.id);
-        if (idx != -1) {
-          _messages[idx] = msg.copyWith(viewedAt: DateTime.now());
-        }
-      });
-    } catch (_) {}
+      await _playback.pause();
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => PhotoViewerScreen(
+            url: _mediaFullUrl(message.mediaId, existingUrl: message.mediaUrl),
+            token: StorageService.getToken(),
+            caption: message.content,
+          ),
+        ),
+      );
+    } finally {
+      _openingMedia = false;
+    }
+  }
+
+  Future<void> _openViewOnce(MessageModel message) async {
+    if (_openingMedia ||
+        !message.isViewOnce ||
+        message.viewedAt != null ||
+        message.senderId == _currentUserId)
+      return;
+    _openingMedia = true;
+    try {
+      await _playback.pause();
+      if (!mounted) return;
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ViewOncePhotoScreen(
+            loadPhoto: () => ApiService().getBytes(
+              '/messages/${message.id}/view-once/media',
+            ),
+            consumePhoto: () async {
+              final result = await ApiService()
+                  .post('/messages/${message.id}/view-once', {})
+                  .timeout(const Duration(seconds: 20));
+              return DateTime.parse(result['viewed_at'] as String);
+            },
+            onViewed: (viewedAt) {
+              if (!mounted) return;
+              setState(() {
+                final index = _messages.indexWhere((m) => m.id == message.id);
+                if (index != -1)
+                  _messages[index] = _messages[index].copyWith(
+                    viewedAt: viewedAt,
+                  );
+              });
+            },
+          ),
+        ),
+      );
+      if (mounted) _refreshMessageStatuses();
+    } finally {
+      _openingMedia = false;
+    }
   }
 
   void _showMessageActions(MessageModel msg) {
@@ -513,14 +783,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 setState(() => _replyTo = msg);
               },
             ),
-            ListTile(
-              leading: const Icon(Icons.forward),
-              title: const Text('فوروارد'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _forwardMessage(msg);
-              },
-            ),
+            if (!msg.isViewOnce)
+              ListTile(
+                leading: const Icon(Icons.forward),
+                title: const Text('فوروارد'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _forwardMessage(msg);
+                },
+              ),
             if (isMine)
               ListTile(
                 leading: const Icon(Icons.delete_outline),
@@ -617,13 +888,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _bgColor = null;
       });
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('کب‌دنارگ میظنت دش')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('کب‌دنارگ میظنت دش')));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
@@ -658,8 +931,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 }
               } catch (e) {
                 if (mounted) {
-                  ScaffoldMessenger.of(context)
-                      .showSnackBar(SnackBar(content: Text(e.toString())));
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(SnackBar(content: Text(e.toString())));
                 }
               }
             },
@@ -803,8 +1077,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       if (mounted) Navigator.of(context).pop();
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -833,8 +1108,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       );
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -1030,32 +1306,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         child: SafeArea(
           child: Column(
             children: [
-              if (_replyTo != null)
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  color: theme.colorScheme.primary.withValues(alpha: 0.1),
-                  child: Row(
-                    children: [
-                      const Icon(Icons.reply, size: 18),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          _replyTo!.content ?? _replyTo!.messageType,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.close, size: 18),
-                        onPressed: () => setState(() => _replyTo = null),
-                      ),
-                    ],
-                  ),
-                ),
               Expanded(
                 child: _loading
                     ? const Center(child: CircularProgressIndicator())
@@ -1088,26 +1338,69 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                           horizontal: 10,
                           vertical: 8,
                         ),
-                        itemCount: _messages.length,
+                        itemCount: _messages.length + 1,
+                        findChildIndexCallback: (key) {
+                          if (key == const ValueKey('history-header')) return 0;
+                          final index = _messages.indexWhere(
+                            (m) => _messageKeys[m.id] == key,
+                          );
+                          return index == -1 ? null : index + 1;
+                        },
                         itemBuilder: (context, index) {
-                          final msg = _messages[index];
+                          if (index == 0) {
+                            return Center(
+                              key: const ValueKey('history-header'),
+                              child: _hasEarlier
+                                  ? TextButton.icon(
+                                      onPressed: _loadingEarlier
+                                          ? null
+                                          : _loadEarlier,
+                                      icon: _loadingEarlier
+                                          ? const SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(Icons.expand_less),
+                                      label: Text(
+                                        MediaLabels.of(context).earlier,
+                                      ),
+                                    )
+                                  : const SizedBox.shrink(),
+                            );
+                          }
+                          final msg = _messages[index - 1];
                           final isMine = msg.senderId == _currentUserId;
                           return GestureDetector(
+                            key: _messageKeys.putIfAbsent(
+                              msg.id,
+                              () => GlobalKey(),
+                            ),
                             onLongPress: () => _showMessageActions(msg),
-                            onTap: () {
-                              if (msg.isViewOnce && msg.viewedAt == null) {
-                                _markViewOnce(msg);
-                              }
-                            },
-                            onHorizontalDragEnd: (d) {
-                              if (d.primaryVelocity != null &&
-                                  d.primaryVelocity! > 200) {
+                            // Reply gestures do not own taps on media anymore.
+                            onHorizontalDragEnd: (details) {
+                              final velocity = details.primaryVelocity ?? 0;
+                              if (velocity.abs() > 200) {
                                 setState(() => _replyTo = msg);
                               }
                             },
-                            child: _MessageBubble(
+                            child: MessageBubble(
                               message: msg,
                               isMine: isMine,
+                              currentUserId: _currentUserId,
+                              reply: _replyPreviewFor(msg),
+                              onReplyTap: msg.replyToId == null
+                                  ? null
+                                  : () => _jumpToReply(msg.replyToId!),
+                              onOpenPhoto: () => _openPhoto(msg),
+                              onOpenViewOnce: () => _openViewOnce(msg),
+                              coordinator: _playback,
+                              highlighted: _highlightedMessageId == msg.id,
+                              showSender:
+                                  widget.chatType == 'group' ||
+                                  widget.chatType == 'channel',
                               mediaUrl: _mediaFullUrl(
                                 msg.mediaId,
                                 existingUrl: msg.mediaUrl,
@@ -1118,10 +1411,40 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                         },
                       ),
               ),
+              if (_historyMode)
+                TextButton.icon(
+                  onPressed: () => _loadMessages(),
+                  icon: const Icon(Icons.arrow_downward_rounded),
+                  label: Text(MediaLabels.of(context).latest),
+                ),
+              if (_replyTo != null && !_searchMode) _buildReplyComposer(theme),
               if (!_searchMode) _buildInputBar(theme),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildReplyComposer(ThemeData theme) {
+    return Container(
+      color: theme.cardColor,
+      padding: const EdgeInsetsDirectional.fromSTEB(12, 8, 4, 0),
+      child: Row(
+        children: [
+          Expanded(
+            child: ReplyPreview(
+              reply: _replyTo!.asReplyPreview,
+              currentUserId: _currentUserId,
+              token: StorageService.getToken(),
+            ),
+          ),
+          IconButton(
+            tooltip: MediaLabels.of(context).cancelReply,
+            onPressed: () => setState(() => _replyTo = null),
+            icon: const Icon(Icons.close, size: 20),
+          ),
+        ],
       ),
     );
   }
@@ -1193,279 +1516,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 }
 
-class _MessageBubble extends StatelessWidget {
-  final MessageModel message;
-  final bool isMine;
-  final String mediaUrl;
-  final String? token;
-
-  const _MessageBubble({
-    required this.message,
-    required this.isMine,
-    required this.mediaUrl,
-    this.token,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final bg = isMine ? theme.colorScheme.primary : theme.cardColor;
-    final fg = isMine ? Colors.white : theme.textTheme.bodyLarge?.color;
-
-    return Align(
-      alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 3),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.78,
-        ),
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(isMine ? 16 : 4),
-            bottomRight: Radius.circular(isMine ? 4 : 16),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.04),
-              blurRadius: 3,
-              offset: const Offset(0, 1),
-            ),
-          ],
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: [
-            if (message.replyToId != null)
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(6),
-                margin: const EdgeInsets.only(bottom: 6),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border(
-                    left: BorderSide(
-                      color: isMine ? Colors.white60 : Colors.blue,
-                      width: 3,
-                    ),
-                  ),
-                ),
-                child: Text(
-                  message.content != null ? 'ریپلای' : 'پیام',
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ),
-            if (message.isViewOnce && message.viewedAt != null)
-              Container(
-                width: 220,
-                height: 80,
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: const Center(
-                  child: Text(
-                    'مشاهده شد',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                ),
-              )
-            else if (message.isViewOnce && message.viewedAt == null)
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.orange.withValues(alpha: 0.2),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.orange),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      Icons.timer,
-                      size: 16,
-                      color: isMine ? Colors.white70 : Colors.orange,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      'View Once - برای مشاهده بزن',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: isMine ? Colors.white70 : Colors.orange,
-                      ),
-                    ),
-                  ],
-                ),
-              )
-            else if (message.messageType == 'image' && mediaUrl.isNotEmpty)
-              GestureDetector(
-                onTap: () {
-                  showDialog(
-                    context: context,
-                    builder: (_) => Dialog(
-                      backgroundColor: Colors.black,
-                      child: InteractiveViewer(
-                        child: CachedNetworkImage(
-                          imageUrl: mediaUrl,
-                          httpHeaders: token != null
-                              ? {'Authorization': 'Bearer $token'}
-                              : null,
-                          fit: BoxFit.contain,
-                        ),
-                      ),
-                    ),
-                  );
-                },
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(10),
-                  child: CachedNetworkImage(
-                    imageUrl: mediaUrl,
-                    httpHeaders: token != null
-                        ? {'Authorization': 'Bearer $token'}
-                        : null,
-                    width: 220,
-                    fit: BoxFit.cover,
-                    placeholder: (_, __) => Container(
-                      width: 220,
-                      height: 160,
-                      color: Colors.black12,
-                      child: const Center(
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      ),
-                    ),
-                    errorWidget: (_, __, ___) =>
-                        const Icon(Icons.broken_image, size: 48),
-                  ),
-                ),
-              )
-            else if (message.messageType == 'video' && mediaUrl.isNotEmpty)
-              VideoMessagePlayer(
-                url: mediaUrl,
-                authToken: token,
-                isMine: isMine,
-              )
-            else if (message.messageType == 'video')
-              const Text('ویدیو')
-            else if (message.messageType == 'voice' ||
-                message.messageType == 'audio')
-              _AudioPlayer(url: mediaUrl, token: token, fg: fg)
-            else
-              Text(
-                message.content ?? '',
-                style: TextStyle(color: fg, fontSize: 15, height: 1.35),
-              ),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '${message.createdAt.hour.toString().padLeft(2, '0')}:${message.createdAt.minute.toString().padLeft(2, '0')}',
-                  style: TextStyle(
-                    color: isMine ? Colors.white70 : Colors.grey,
-                    fontSize: 11,
-                  ),
-                ),
-                if (isMine) ...[
-                  const SizedBox(width: 4),
-                  Icon(
-                    message.status == 'read' ? Icons.done_all : Icons.done_all,
-                    size: 16,
-                    color: message.status == 'read'
-                        ? const Color(0xFF4FC3F7)
-                        : (message.status == 'delivered'
-                              ? Colors.white70
-                              : Colors.white54),
-                  ),
-                ],
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _AudioPlayer extends StatefulWidget {
-  final String url;
-  final String? token;
-  final Color? fg;
-  const _AudioPlayer({required this.url, this.token, this.fg});
-
-  @override
-  State<_AudioPlayer> createState() => _AudioPlayerState();
-}
-
-class _AudioPlayerState extends State<_AudioPlayer> {
-  late final just_audio.AudioPlayer _player;
-  bool _playing = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _player = just_audio.AudioPlayer();
-    _player.playerStateStream.listen((s) {
-      if (mounted) {
-        setState(() => _playing = s.playing);
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _player.dispose();
-    super.dispose();
-  }
-
-  Future<void> _toggle() async {
-    try {
-      if (_playing) {
-        await _player.pause();
-      } else {
-        if (_player.duration == null) {
-          if (widget.url.isEmpty) return;
-          await _player.setAudioSource(
-            just_audio.AudioSource.uri(
-              Uri.parse(widget.url),
-              headers: widget.token != null
-                  ? {'Authorization': 'Bearer ${widget.token}'}
-                  : {},
-            ),
-          );
-        }
-        await _player.play();
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('خطا در پخش صدا: $e')));
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: _toggle,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(_playing ? Icons.pause : Icons.play_arrow, color: widget.fg),
-          const SizedBox(width: 6),
-          Text('پیام صوتی', style: TextStyle(color: widget.fg)),
-        ],
-      ),
-    );
-  }
-}
-
 class _MembersSheet extends StatefulWidget {
   final String chatId;
   final String? myRole;
@@ -1510,8 +1560,9 @@ class _MembersSheetState extends State<_MembersSheet> {
       _load();
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -1523,8 +1574,9 @@ class _MembersSheetState extends State<_MembersSheet> {
       _load();
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -1670,13 +1722,15 @@ class _EditGroupSheetState extends State<_EditGroupSheet> {
       widget.onSaved();
       if (mounted) {
         Navigator.pop(context);
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('تغییرات ذخیره شد')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('تغییرات ذخیره شد')));
       }
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     } finally {
       if (mounted) setState(() => _saving = false);
     }

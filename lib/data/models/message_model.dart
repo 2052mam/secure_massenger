@@ -1,6 +1,7 @@
 import 'package:equatable/equatable.dart';
 
 import 'user_model.dart';
+import 'reply_preview_model.dart';
 
 class MessageModel extends Equatable {
   final String id;
@@ -12,6 +13,7 @@ class MessageModel extends Equatable {
   final String? mediaId;
   final String? mediaUrl;
   final String? replyToId;
+  final ReplyPreviewModel? replyTo;
   final String? forwardedFromId;
   final bool isViewOnce;
   final DateTime? viewedAt;
@@ -29,6 +31,7 @@ class MessageModel extends Equatable {
     this.mediaId,
     this.mediaUrl,
     this.replyToId,
+    this.replyTo,
     this.forwardedFromId,
     this.isViewOnce = false,
     this.viewedAt,
@@ -50,6 +53,9 @@ class MessageModel extends Equatable {
       mediaId: json['media_id'] as String?,
       mediaUrl: json['media_url'] as String?,
       replyToId: json['reply_to_id'] as String?,
+      replyTo: json['reply_to'] is Map<String, dynamic>
+          ? ReplyPreviewModel.fromJson(json['reply_to'] as Map<String, dynamic>)
+          : null,
       forwardedFromId: json['forwarded_from_id'] as String?,
       isViewOnce: json['is_view_once'] as bool? ?? false,
       viewedAt: json['viewed_at'] != null
@@ -67,6 +73,7 @@ class MessageModel extends Equatable {
     String? status,
     bool? isViewOnce,
     DateTime? viewedAt,
+    ReplyPreviewModel? replyTo,
   }) {
     return MessageModel(
       id: id,
@@ -78,6 +85,7 @@ class MessageModel extends Equatable {
       mediaId: mediaId,
       mediaUrl: mediaUrl,
       replyToId: replyToId,
+      replyTo: replyTo ?? this.replyTo,
       forwardedFromId: forwardedFromId,
       isViewOnce: isViewOnce ?? this.isViewOnce,
       viewedAt: viewedAt ?? this.viewedAt,
@@ -87,6 +95,35 @@ class MessageModel extends Equatable {
     );
   }
 
+  ReplyPreviewModel get asReplyPreview => ReplyPreviewModel(
+    id: id,
+    senderId: senderId,
+    senderName: sender?.displayName,
+    messageType: messageType,
+    content: isViewOnce ? null : content,
+    mediaUrl: isViewOnce || messageType != 'image'
+        ? null
+        : mediaUrl ?? (mediaId == null ? null : '/api/v1/media/$mediaId'),
+    isViewOnce: isViewOnce,
+  );
+
   @override
-  List<Object?> get props => [id, chatId, content, createdAt, status, mediaUrl];
+  List<Object?> get props => [
+    id,
+    chatId,
+    senderId,
+    sender,
+    messageType,
+    content,
+    createdAt,
+    status,
+    mediaId,
+    mediaUrl,
+    replyToId,
+    replyTo,
+    forwardedFromId,
+    isViewOnce,
+    viewedAt,
+    isEdited,
+  ];
 }

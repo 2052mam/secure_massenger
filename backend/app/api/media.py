@@ -3,6 +3,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from werkzeug.utils import secure_filename
 from app import db
 from app.models.media import MediaFile
+from app.models.message import Message
 from app.models.audit import AuditLog
 from datetime import datetime
 import os
@@ -82,5 +83,11 @@ def get_media(media_id):
     media = MediaFile.query.filter_by(id=media_id, is_deleted=False).first()
     if not media:
         return jsonify({'error': 'فایل یافت نشد'}), 404
+    # Include deleted references: soft-deleting the message must not make its
+    # ephemeral upload replayable through this generic, cacheable URL.
+    if Message.query.filter_by(media_id=media_id, is_view_once=True).first():
+        return jsonify({'error': 'عکس یک‌بارمصرف فقط از داخل پیام باز می‌شود'}), 403
     upload_folder = os.path.abspath(current_app.config['UPLOAD_FOLDER'])
-    return send_from_directory(upload_folder, media.stored_name)
+    # Conditional responses explicitly preserve Range / Content-Range support
+    # required by native voice/video players when seeking.
+    return send_from_directory(upload_folder, media.stored_name, conditional=True)
