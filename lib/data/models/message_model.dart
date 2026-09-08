@@ -17,6 +17,7 @@ class MessageModel extends Equatable {
   final ReplyPreviewModel? replyTo;
   final String? forwardedFromId;
   final bool isViewOnce;
+  final bool isPinned;
   final DateTime? viewedAt;
   final bool isEdited;
   final DateTime createdAt;
@@ -35,6 +36,7 @@ class MessageModel extends Equatable {
     this.replyTo,
     this.forwardedFromId,
     this.isViewOnce = false,
+    this.isPinned = false,
     this.viewedAt,
     this.isEdited = false,
     required this.createdAt,
@@ -59,6 +61,7 @@ class MessageModel extends Equatable {
           : null,
       forwardedFromId: json['forwarded_from_id'] as String?,
       isViewOnce: json['is_view_once'] as bool? ?? false,
+      isPinned: json['is_pinned'] as bool? ?? false,
       viewedAt: json['viewed_at'] != null
           ? parseApiDateTime(json['viewed_at'] as String?)
           : null,
@@ -73,6 +76,7 @@ class MessageModel extends Equatable {
   MessageModel copyWith({
     String? status,
     bool? isViewOnce,
+    bool? isPinned,
     DateTime? viewedAt,
     ReplyPreviewModel? replyTo,
   }) {
@@ -89,6 +93,7 @@ class MessageModel extends Equatable {
       replyTo: replyTo ?? this.replyTo,
       forwardedFromId: forwardedFromId,
       isViewOnce: isViewOnce ?? this.isViewOnce,
+      isPinned: isPinned ?? this.isPinned,
       viewedAt: viewedAt ?? this.viewedAt,
       isEdited: isEdited,
       createdAt: createdAt,
@@ -128,6 +133,7 @@ class MessageModel extends Equatable {
     replyTo,
     forwardedFromId,
     isViewOnce,
+    isPinned,
     viewedAt,
     isEdited,
   ];

@@ -40,12 +40,13 @@ class ApiService {
 
   Future<Map<String, dynamic>> post(
     String path,
-    Map<String, dynamic> body,
-  ) async {
+    Map<String, dynamic> body, {
+    Map<String, String>? headers,
+  }) async {
     final res = await http
         .post(
           Uri.parse('${ApiConstants.baseUrl}$path'),
-          headers: _jsonHeaders,
+          headers: {..._jsonHeaders, ...?headers},
           body: jsonEncode(body),
         )
         .timeout(const Duration(seconds: 30));
@@ -55,12 +56,13 @@ class ApiService {
   Future<Map<String, dynamic>> get(
     String path, {
     Map<String, String>? query,
+    Map<String, String>? headers,
   }) async {
     final uri = Uri.parse(
       '${ApiConstants.baseUrl}$path',
     ).replace(queryParameters: query);
     final res = await http
-        .get(uri, headers: _headers)
+        .get(uri, headers: {..._headers, ...?headers})
         .timeout(const Duration(seconds: 30));
     return _handle(res);
   }

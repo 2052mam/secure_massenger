@@ -102,7 +102,7 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
     if (state != AppLifecycleState.resumed) unawaited(_pause());
   }
 
-  Future<void> _openFullscreen() async {
+  Future<void> _openFullscreen({bool autoplay = false}) async {
     final controller = _controller;
     if (_fullscreen || !_ready || controller == null) return;
     setState(() => _fullscreen = true);
@@ -112,6 +112,7 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
           controller: controller,
           coordinator: widget.coordinator,
           playbackOwner: this,
+          autoplay: autoplay,
           onRetry: () {
             if (mounted) unawaited(_init());
           },
@@ -122,8 +123,15 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
       await route.completed;
     } finally {
       _fullscreenRoute = null;
-      // The SAME controller retains playback position, speed and volume.
-      if (mounted) setState(() => _fullscreen = false);
+      // Leaving the video stops it, exactly like closing a Telegram video.
+      // A disposed player already paused and released its controller.
+      if (mounted) {
+        try {
+          unawaited(controller.pause().catchError((Object _) {}));
+        } catch (_) {}
+        // The SAME controller retains playback position, speed and volume.
+        setState(() => _fullscreen = false);
+      }
     }
   }
 
@@ -229,7 +237,10 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
                           controller: controller,
                           coordinator: widget.coordinator,
                           playbackOwner: this,
+                          autoFullscreenOnPlay: true,
                           onFullscreen: _openFullscreen,
+                          onPlayFullscreen: () =>
+                              _openFullscreen(autoplay: true),
                           onRetry: _init,
                         ),
                       ],
@@ -247,12 +258,14 @@ class _FullscreenVideo extends StatefulWidget {
   final MediaPlaybackCoordinator? coordinator;
   final Object playbackOwner;
   final VoidCallback onRetry;
+  final bool autoplay;
 
   const _FullscreenVideo({
     required this.controller,
     required this.playbackOwner,
     required this.onRetry,
     this.coordinator,
+    this.autoplay = false,
   });
 
   @override
@@ -281,6 +294,11 @@ class _FullscreenVideoState extends State<_FullscreenVideo>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    // Exiting full screen stops the video instead of leaving it running
+    // behind the chat, the way Telegram closes a video.
+    try {
+      unawaited(widget.controller.pause().catchError((Object _) {}));
+    } catch (_) {}
     // Restore the app's portrait-only policy on every exit (including Back).
     unawaited(
       SystemChrome.setPreferredOrientations([
@@ -310,6 +328,7 @@ class _FullscreenVideoState extends State<_FullscreenVideo>
             coordinator: widget.coordinator,
             playbackOwner: widget.playbackOwner,
             fullscreen: true,
+            autoPlay: widget.autoplay,
             onFullscreen: () => Navigator.of(context).pop(),
             onRetry: () {
               Navigator.of(context).pop();

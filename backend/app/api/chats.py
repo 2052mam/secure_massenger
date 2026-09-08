@@ -795,7 +795,11 @@ def update_chat(chat_id):
     if 'description' in data:
         chat.description = data['description']
     if 'avatar_url' in data:
-        chat.avatar_url = data['avatar_url']
+        avatar = data['avatar_url']
+        if avatar is not None and not isinstance(avatar, str):
+            return jsonify({'error': 'آدرس عکس نامعتبر است'}), 400
+        # An empty string clears the picture instead of storing a blank URL.
+        chat.avatar_url = (avatar or '').strip() or None
     if 'is_public' in data and member.role == 'owner':
         chat.is_public = bool(data['is_public'])
     if 'username' in data and member.role == 'owner':

@@ -16,6 +16,18 @@ class VideoPlaybackControls extends StatefulWidget {
   final VoidCallback onFullscreen;
   final VoidCallback onRetry;
 
+  /// Telegram behaviour: pressing play on an inline video opens the player
+  /// full screen instead of starting a tiny preview inside the bubble.
+  final bool autoFullscreenOnPlay;
+
+  /// Start playing as soon as these controls appear (used by the full screen
+  /// route opened from an inline play press).
+  final bool autoPlay;
+
+  /// Called instead of [onFullscreen] when full screen was requested by
+  /// pressing play, so the opened route can start playback immediately.
+  final VoidCallback? onPlayFullscreen;
+
   const VideoPlaybackControls({
     super.key,
     required this.controller,
@@ -24,6 +36,9 @@ class VideoPlaybackControls extends StatefulWidget {
     required this.onRetry,
     this.coordinator,
     this.fullscreen = false,
+    this.autoFullscreenOnPlay = false,
+    this.autoPlay = false,
+    this.onPlayFullscreen,
   });
 
   @override
@@ -46,6 +61,11 @@ class _VideoPlaybackControlsState extends State<VideoPlaybackControls> {
     super.initState();
     widget.controller.addListener(_playbackChanged);
     _playbackChanged();
+    if (widget.autoPlay && !widget.controller.value.isPlaying) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_togglePlayback());
+      });
+    }
   }
 
   @override
@@ -101,6 +121,10 @@ class _VideoPlaybackControlsState extends State<VideoPlaybackControls> {
       final value = widget.controller.value;
       if (value.isPlaying && !_atEnd(value)) {
         await _pause();
+      } else if (widget.autoFullscreenOnPlay && !widget.fullscreen) {
+        // Playback itself starts in the full screen route.
+        (widget.onPlayFullscreen ?? widget.onFullscreen)();
+        return;
       } else {
         if (_atEnd(value)) await widget.controller.seekTo(Duration.zero);
         final allowed =

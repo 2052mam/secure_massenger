@@ -68,6 +68,9 @@ class ChatApiFixture {
     if (path == '/api/v1/messages/search/chat') {
       return jsonResponse({'messages': messages});
     }
+    if (path.endsWith('/pinned')) {
+      return jsonResponse({'messages': [], 'can_pin': false});
+    }
     if (path == '/api/v1/messages/chat') {
       if (request.url.queryParameters.containsKey('from_id')) {
         return jsonResponse({

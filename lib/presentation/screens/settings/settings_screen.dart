@@ -10,6 +10,9 @@ import '../../providers/theme_provider.dart';
 import '../chat/chat_screen.dart';
 import '../profile/profile_screen.dart';
 import 'account_switcher_screen.dart';
+import 'archive_lock_screen.dart';
+import '../home/archived_chats_screen.dart';
+import '../../widgets/chat/chat_labels.dart';
 
 class SettingsScreen extends ConsumerWidget {
   const SettingsScreen({super.key});
@@ -175,6 +178,21 @@ class SettingsScreen extends ConsumerWidget {
               ),
             ),
             const JoinPrivacyTile(),
+            ListTile(
+              key: const ValueKey('archive-lock-tile'),
+              leading: const Icon(Icons.lock_outline),
+              title: Text(ChatLabels.of(context).archiveLock),
+              subtitle: Text(ChatLabels.of(context).archiveLockHint),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const ArchiveLockScreen()),
+              ),
+            ),
+            ListTile(
+              key: const ValueKey('archived-chats-tile'),
+              leading: const Icon(Icons.archive_outlined),
+              title: Text(ChatLabels.of(context).archivedChats),
+              onTap: () => openArchivedChats(context, ref),
+            ),
             ListTile(
               leading: const Icon(Icons.photo_outlined),
               title: Text(isFa ? 'نمایش عکس پروفایل' : 'Show Profile Photo'),

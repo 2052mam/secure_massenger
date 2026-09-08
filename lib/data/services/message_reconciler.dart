@@ -9,16 +9,23 @@ class MessageSyncResult {
   final Map<String, String> statuses;
   final Map<String, DateTime> viewedAt;
 
+  /// Ids of the currently pinned messages of the chat, newest first. Null on
+  /// an older server that does not report pins at all.
+  final List<String>? pinnedIds;
+
   const MessageSyncResult({
     this.deletedIds = const {},
     this.statuses = const {},
     this.viewedAt = const {},
+    this.pinnedIds,
   });
 
   factory MessageSyncResult.fromJson(Map<String, dynamic> json) {
     final statuses = json['statuses'] as Map<String, dynamic>? ?? {};
     final views = json['viewed_at'] as Map<String, dynamic>? ?? {};
+    final pinned = json['pinned_ids'] as List?;
     return MessageSyncResult(
+      pinnedIds: pinned?.whereType<String>().toList(),
       deletedIds: (json['deleted_ids'] as List? ?? [])
           .whereType<String>()
           .toSet(),
@@ -57,12 +64,18 @@ class MessageReconciler {
     MessageSyncResult? update,
   }) {
     if (update != null) remove(update.deletedIds);
+    final pinned = update?.pinnedIds == null
+        ? null
+        : update!.pinnedIds!.toSet();
     return [
       for (final message in messages)
         if (!isUnavailable(message.id))
           message.copyWith(
             status: newestStatus(message.status, update?.statuses[message.id]),
             viewedAt: message.viewedAt ?? update?.viewedAt[message.id],
+            isPinned: pinned == null
+                ? message.isPinned
+                : pinned.contains(message.id),
             replyTo:
                 message.replyToId != null && isUnavailable(message.replyToId!)
                 ? ReplyPreviewModel.unavailable(message.replyToId!)

@@ -10,6 +10,8 @@ class ChatModel extends Equatable {
   final String? username;
   final String? avatarUrl;
   final bool isPinned;
+  final DateTime? pinnedAt;
+  final bool isArchived;
   final bool isMuted;
   final int unreadCount;
   final LastMessageModel? lastMessage;
@@ -23,6 +25,8 @@ class ChatModel extends Equatable {
     this.username,
     this.avatarUrl,
     this.isPinned = false,
+    this.pinnedAt,
+    this.isArchived = false,
     this.isMuted = false,
     this.unreadCount = 0,
     this.lastMessage,
@@ -38,6 +42,8 @@ class ChatModel extends Equatable {
       username: json['username'] as String?,
       avatarUrl: json['avatar_url'] as String?,
       isPinned: json['is_pinned'] as bool? ?? false,
+      pinnedAt: parseApiDateTime(json['pinned_at'] as String?),
+      isArchived: json['is_archived'] as bool? ?? false,
       isMuted: json['is_muted'] as bool? ?? false,
       unreadCount: json['unread_count'] as int? ?? 0,
       lastMessage: json['last_message'] != null
@@ -52,6 +58,10 @@ class ChatModel extends Equatable {
           : null,
     );
   }
+
+  /// Personal conversations for the default "Personal" folder (Telegram parity).
+  bool get isPersonal =>
+      chatType == 'private' || chatType == 'support' || chatType == 'saved';
 
   String get displayTitle {
     if (chatType == 'private' && otherUser != null) {
@@ -68,6 +78,8 @@ class ChatModel extends Equatable {
     username,
     avatarUrl,
     isPinned,
+    pinnedAt,
+    isArchived,
     isMuted,
     unreadCount,
     lastMessage,

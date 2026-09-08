@@ -29,6 +29,8 @@ import '../../widgets/chat/chat_header.dart';
 import '../../widgets/chat/chat_labels.dart';
 import '../../widgets/chat/chat_invite_dialog.dart';
 import '../../widgets/chat/message_actions_sheet.dart';
+import '../../widgets/chat/pinned_messages_bar.dart';
+import 'pinned_messages_screen.dart';
 import '../../widgets/chat/reply_preview.dart';
 import '../../widgets/media/media_labels.dart';
 import '../media/photo_viewer_screen.dart';
@@ -101,6 +103,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   Map<String, dynamic> _capabilities = {};
   bool _isMuted = false;
   bool _muting = false;
+  final List<MessageModel> _pinned = [];
+  int _pinnedIndex = 0;
+  bool _canPinMessages = false;
+  bool _loadingPinned = false;
 
   bool _can(String right) {
     if (_chatUnavailable) return false;
@@ -149,6 +155,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _startPolling();
     _loadBackground();
     _loadChatInfo();
+    _loadPinned();
   }
 
   Future<void> _loadBackground() async {
@@ -450,6 +457,103 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
+  /// The pinned bar is chat state, not message state: it must survive
+  /// scrolling, search and history mode, so it is loaded separately.
+  Future<void> _loadPinned() async {
+    if (!mounted || _loadingPinned || _chatUnavailable) return;
+    _loadingPinned = true;
+    try {
+      final res = await _api.get('/messages/chat/${widget.chatId}/pinned');
+      if (!mounted) return;
+      final list = (res['messages'] as List? ?? [])
+          .whereType<Map<String, dynamic>>()
+          .map(MessageModel.fromJson)
+          .where((m) => !_reconciler.isUnavailable(m.id))
+          .toList();
+      final canPin = res['can_pin'] == true;
+      if (const ListEquality<MessageModel>().equals(_pinned, list) &&
+          canPin == _canPinMessages) {
+        return;
+      }
+      setState(() {
+        _pinned
+          ..clear()
+          ..addAll(list);
+        _canPinMessages = canPin;
+        if (_pinnedIndex >= _pinned.length) _pinnedIndex = 0;
+      });
+    } catch (_) {
+      // The bar simply stays as it is; the next poll retries.
+    } finally {
+      _loadingPinned = false;
+    }
+  }
+
+  Future<void> _togglePin(MessageModel msg, bool pin) async {
+    try {
+      await _api.post('/messages/${msg.id}/${pin ? 'pin' : 'unpin'}', {});
+      if (!mounted) return;
+      setState(() {
+        final index = _messages.indexWhere((m) => m.id == msg.id);
+        if (index != -1) {
+          _messages[index] = _messages[index].copyWith(isPinned: pin);
+        }
+        if (!pin) {
+          _pinned.removeWhere((m) => m.id == msg.id);
+          if (_pinnedIndex >= _pinned.length) _pinnedIndex = 0;
+        }
+      });
+      await _loadPinned();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _unpinAll() async {
+    try {
+      await _api.post('/messages/chat/${widget.chatId}/unpin-all', {});
+      if (!mounted) return;
+      setState(() {
+        _pinned.clear();
+        _pinnedIndex = 0;
+      });
+      await _loadPinned();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _openPinnedMessages() async {
+    final id = await Navigator.of(context).push<String>(
+      MaterialPageRoute<String>(
+        builder: (_) => PinnedMessagesScreen(
+          pinned: List<MessageModel>.from(_pinned),
+          canPin: _canPinMessages,
+          onUnpin: (message) => unawaited(_togglePin(message, false)),
+          onUnpinAll: _unpinAll,
+        ),
+      ),
+    );
+    if (!mounted || id == null) return;
+    await _jumpToReply(id);
+  }
+
+  void _tapPinnedBar() {
+    if (_pinned.isEmpty) return;
+    final index = _pinnedIndex < _pinned.length ? _pinnedIndex : 0;
+    final message = _pinned[index];
+    setState(() => _pinnedIndex = (index + 1) % _pinned.length);
+    unawaited(_jumpToReply(message.id));
+  }
+
   void _startPolling() {
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(
@@ -463,6 +567,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     unawaited(_loadChatInfo());
     if (_loading) return;
     if (!_searchMode && !_historyMode) unawaited(_pollNewMessages());
+    unawaited(_loadPinned());
     // Reconcile all loaded pages, even in search/history and after read ticks.
     unawaited(_refreshMessageStatuses());
   }
@@ -500,6 +605,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
     if (update.deletedIds.isNotEmpty) {
       unawaited(ref.read(chatListProvider.notifier).refresh());
+    }
+    final pinnedIds = update.pinnedIds;
+    if (pinnedIds != null &&
+        !const SetEquality<String>().equals(
+          pinnedIds.toSet(),
+          _pinned.map((m) => m.id).toSet(),
+        )) {
+      unawaited(_loadPinned());
     }
   }
 
@@ -830,7 +943,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _replyTo = null;
         _hasEarlier = false;
         _historyMode = false;
+        _pinned.clear();
+        _pinnedIndex = 0;
       });
+      unawaited(_loadPinned());
       ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
       if (mounted) {
@@ -944,6 +1060,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         message: msg,
         canDeleteForAll: _canDelete(msg),
         canReply: _can('send_messages'),
+        canPin: _canPinMessages,
+        onTogglePin: (pin) => _togglePin(msg, pin),
         onReply: () {
           if (mounted &&
               _can('send_messages') &&
@@ -1178,8 +1296,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 _clearHistory(forAll: false);
               },
             ),
-            if (!isGroupOrChannel)
+            // Owners always keep "delete history for everyone", in private
+            // chats as well as in their own groups and channels.
+            if (!isGroupOrChannel ||
+                _myRole == 'owner' ||
+                _capabilities['clear_history_for_all'] == true)
               ListTile(
+                key: const ValueKey('clear-history-for-all'),
                 leading: const Icon(Icons.delete_forever, color: Colors.red),
                 title: const Text(
                   'پاک کردن برای همه',
@@ -1188,6 +1311,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 onTap: () {
                   Navigator.pop(ctx);
                   _clearHistory(forAll: true);
+                },
+              ),
+            if (_canPinMessages && _pinned.isNotEmpty)
+              ListTile(
+                key: const ValueKey('unpin-all'),
+                leading: const Icon(Icons.push_pin_outlined),
+                title: Text(ChatLabels.of(context).unpinAll),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _unpinAll();
                 },
               ),
             if (!isGroupOrChannel)
@@ -1347,6 +1480,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           child: Column(
             children: [
               if (_openingInvite) const LinearProgressIndicator(minHeight: 2),
+              if (_pinned.isNotEmpty && !_searchMode)
+                PinnedMessagesBar(
+                  pinned: _pinned,
+                  index: _pinnedIndex,
+                  onTap: _tapPinnedBar,
+                  onShowAll: _openPinnedMessages,
+                  onUnpin: _canPinMessages
+                      ? () => _togglePin(
+                          _pinned[_pinnedIndex < _pinned.length
+                              ? _pinnedIndex
+                              : 0],
+                          false,
+                        )
+                      : null,
+                ),
               Expanded(
                 child: _loading
                     ? const Center(child: CircularProgressIndicator())

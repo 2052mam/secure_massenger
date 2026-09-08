@@ -7,6 +7,7 @@ import '../../providers/locale_provider.dart';
 import '../../../data/services/storage_service.dart';
 import '../../widgets/chat/chat_avatar.dart';
 import '../../widgets/chat/chat_labels.dart';
+import 'profile_photos_screen.dart';
 
 class UserProfileScreen extends ConsumerStatefulWidget {
   final String userId;
@@ -92,6 +93,22 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
     } catch (_) {}
   }
 
+  /// Telegram opens the person's photos full screen; several photos can be
+  /// swiped through when the user published more than one.
+  void _openPhotos() {
+    final user = _user;
+    if (user == null || !user.showProfilePhoto) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ProfilePhotosScreen(
+          userId: widget.userId,
+          title: user.displayName,
+          initialUrl: user.avatarUrl,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isFa = ref.watch(localeProvider).languageCode == 'fa';
@@ -110,11 +127,18 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
               padding: const EdgeInsets.all(24),
               children: [
                 Center(
-                  child: ChatAvatar(
-                    title: _user!.displayName,
-                    url: _user!.showProfilePhoto ? _user!.avatarUrl : null,
-                    token: StorageService.getToken(),
-                    radius: 60,
+                  child: GestureDetector(
+                    key: const ValueKey('open-user-photos'),
+                    onTap: _user!.showProfilePhoto ? _openPhotos : null,
+                    child: Hero(
+                      tag: 'user-photo-${widget.userId}',
+                      child: ChatAvatar(
+                        title: _user!.displayName,
+                        url: _user!.showProfilePhoto ? _user!.avatarUrl : null,
+                        token: StorageService.getToken(),
+                        radius: 60,
+                      ),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 20),

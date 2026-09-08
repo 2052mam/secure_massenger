@@ -35,6 +35,7 @@ class ManagementApi extends ApiService {
   Future<Map<String, dynamic>> get(
     String path, {
     Map<String, String>? query,
+    Map<String, String>? headers,
   }) async {
     gets.add(path);
     if (path.endsWith('/info'))
@@ -78,8 +79,9 @@ class ManagementApi extends ApiService {
   @override
   Future<Map<String, dynamic>> post(
     String path,
-    Map<String, dynamic> body,
-  ) async {
+    Map<String, dynamic> body, {
+    Map<String, String>? headers,
+  }) async {
     calls.add((path, Map.of(body)));
     if (path.endsWith('/set-permissions') || path.endsWith('/promote')) {
       await permissionSave?.future;

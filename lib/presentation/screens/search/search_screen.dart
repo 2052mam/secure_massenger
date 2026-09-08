@@ -1,10 +1,14 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../data/models/search_history_model.dart';
 import '../../../data/models/user_model.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/storage_service.dart';
 import '../../widgets/chat/chat_avatar.dart';
+import '../../widgets/chat/chat_labels.dart';
 import '../../providers/locale_provider.dart';
 import '../chat/chat_screen.dart';
 
@@ -18,8 +22,60 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
   final _ctrl = TextEditingController();
   List<UserModel> _users = [];
   List<Map<String, dynamic>> _channels = [];
+  List<SearchHistoryItem> _history = [];
   bool _loading = false;
   String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadHistory();
+  }
+
+  bool get _hasQuery => _ctrl.text.trim().length >= 2;
+
+  /// Recent searches survive deleting a chat, so a person found once can
+  /// always be reached again — the way Telegram's search tab behaves.
+  Future<void> _loadHistory() async {
+    try {
+      final res = await ApiService().get('/users/search-history');
+      if (!mounted) return;
+      setState(() => _history = SearchHistoryItem.listFrom(res));
+    } catch (_) {
+      // History is a convenience; searching still works without it.
+    }
+  }
+
+  Future<void> _remember({
+    String? query,
+    String? userId,
+    String? chatId,
+  }) async {
+    try {
+      await ApiService().post('/users/search-history', {
+        if (query != null && query.isNotEmpty) 'query': query,
+        if (userId != null) 'user_id': userId,
+        if (chatId != null) 'chat_id': chatId,
+      });
+      await _loadHistory();
+    } catch (_) {}
+  }
+
+  Future<void> _removeHistory(SearchHistoryItem item) async {
+    setState(() => _history = [..._history]..remove(item));
+    try {
+      await ApiService().post('/users/search-history/${item.id}/delete', {});
+    } catch (_) {}
+    await _loadHistory();
+  }
+
+  Future<void> _clearHistory() async {
+    setState(() => _history = []);
+    try {
+      await ApiService().post('/users/search-history/clear', {});
+    } catch (_) {}
+    await _loadHistory();
+  }
 
   Future<void> _search(String q) async {
     if (q.trim().length < 2) {
@@ -45,12 +101,14 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
       final chans = (res['chats'] as List? ?? [])
           .map((e) => e as Map<String, dynamic>)
           .toList();
+      if (!mounted) return;
       setState(() {
         _users = list;
         _channels = chans;
         _loading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -58,11 +116,14 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
     }
   }
 
-  Future<void> _startChat(UserModel user) async {
+  Future<void> _startChat(UserModel user, {bool remember = true}) async {
     try {
       final res = await ApiService().post('/chats/private', {
         'user_id': user.id,
       });
+      if (remember) {
+        unawaited(_remember(query: _ctrl.text.trim(), userId: user.id));
+      }
       if (!mounted) return;
       Navigator.of(context).push(
         MaterialPageRoute(
@@ -75,10 +136,11 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
         ),
       );
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
     }
   }
 
@@ -91,6 +153,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
       await ApiService().post('/chats/$chatId/add-member', {
         'user_id': (await ApiService().get('/users/me'))['id'],
       });
+      await _remember(query: _ctrl.text.trim(), chatId: chatId);
       if (!mounted) return;
       Navigator.of(context).push(
         MaterialPageRoute(
@@ -99,10 +162,35 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
         ),
       );
     } catch (e) {
-      if (mounted)
+      if (mounted) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _openHistoryItem(SearchHistoryItem item) async {
+    final user = item.user;
+    if (user != null) {
+      await _startChat(user, remember: false);
+      unawaited(_remember(query: item.query, userId: user.id));
+      return;
+    }
+    final chat = item.chat;
+    if (chat != null) {
+      await _joinChannel({
+        'id': chat.id,
+        'title': chat.title,
+        'username': chat.username,
+      });
+      return;
+    }
+    final query = item.query;
+    if (query != null && query.isNotEmpty) {
+      _ctrl.text = query;
+      _ctrl.selection = TextSelection.collapsed(offset: query.length);
+      await _search(query);
     }
   }
 
@@ -115,6 +203,9 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
   @override
   Widget build(BuildContext context) {
     final isFa = ref.watch(localeProvider).languageCode == 'fa';
+    final labels = ChatLabels.of(context);
+    final showHistory = !_hasQuery && _history.isNotEmpty;
+
     return Scaffold(
       appBar: AppBar(title: Text(isFa ? 'جستجو' : 'Search')),
       body: SafeArea(
@@ -124,12 +215,28 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
               padding: const EdgeInsets.all(12),
               child: TextField(
                 controller: _ctrl,
-                onChanged: _search,
+                onChanged: (q) {
+                  setState(() {});
+                  _search(q);
+                },
+                onSubmitted: (q) {
+                  if (q.trim().length >= 2) _remember(query: q.trim());
+                },
                 decoration: InputDecoration(
                   hintText: isFa
                       ? 'جستجو کاربر یا کانال...'
                       : 'Search user or channel...',
                   prefixIcon: const Icon(Icons.search),
+                  suffixIcon: _ctrl.text.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.clear),
+                          onPressed: () {
+                            _ctrl.clear();
+                            _search('');
+                            setState(() {});
+                          },
+                        ),
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -145,6 +252,62 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
             Expanded(
               child: ListView(
                 children: [
+                  if (showHistory) ...[
+                    Padding(
+                      padding: const EdgeInsets.only(
+                        left: 16,
+                        right: 8,
+                        top: 8,
+                      ),
+                      child: Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              labels.recentSearches,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ),
+                          TextButton(
+                            key: const ValueKey('clear-search-history'),
+                            onPressed: _clearHistory,
+                            child: Text(labels.clearAll),
+                          ),
+                        ],
+                      ),
+                    ),
+                    ..._history.map(
+                      (item) => ListTile(
+                        key: ValueKey('history-${item.id}'),
+                        leading: item.user != null
+                            ? ChatAvatar(
+                                title: item.user!.displayName,
+                                url: item.user!.showProfilePhoto
+                                    ? item.user!.avatarUrl
+                                    : null,
+                                token: StorageService.getToken(),
+                              )
+                            : CircleAvatar(
+                                child: Icon(
+                                  item.chat != null
+                                      ? Icons.campaign
+                                      : Icons.history,
+                                ),
+                              ),
+                        title: Text(item.title),
+                        subtitle: item.subtitle == null
+                            ? null
+                            : Text(item.subtitle!),
+                        trailing: IconButton(
+                          icon: const Icon(Icons.close, size: 18),
+                          onPressed: () => _removeHistory(item),
+                        ),
+                        onTap: () => _openHistoryItem(item),
+                      ),
+                    ),
+                    const Divider(),
+                  ],
                   if (_users.isNotEmpty) ...[
                     Padding(
                       padding: const EdgeInsets.symmetric(
@@ -195,7 +358,10 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
                       ),
                     ),
                   ],
-                  if (_users.isEmpty && _channels.isEmpty && !_loading)
+                  if (_users.isEmpty &&
+                      _channels.isEmpty &&
+                      !_loading &&
+                      !showHistory)
                     Center(
                       child: Padding(
                         padding: const EdgeInsets.all(32),

@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import '../../../data/services/api_service.dart';
 import '../../widgets/chat/chat_avatar.dart';
 
@@ -182,9 +185,11 @@ class _ChatManagementState extends State<_ChatManagement> {
           initial: _info!,
           owner: _owner,
           channel: widget.channel,
+          token: widget.token,
         ),
       ),
     );
+    if (mounted) await _load();
   }
 
   Future<void> _permissions() async {
@@ -866,11 +871,13 @@ class _ChatInfoEditor extends StatefulWidget {
     required this.initial,
     required this.owner,
     required this.channel,
+    this.token,
   });
   final ApiService api;
   final String base;
   final Map<String, dynamic> initial;
   final bool owner, channel;
+  final String? token;
   @override
   State<_ChatInfoEditor> createState() => _ChatInfoEditorState();
 }
@@ -887,7 +894,59 @@ class _ChatInfoEditorState extends State<_ChatInfoEditor> {
     text: widget.initial['username'] as String? ?? '',
   );
   late bool _public = widget.initial['is_public'] == true;
+  late String? _avatarUrl = widget.initial['avatar_url'] as String?;
   bool _saving = false;
+  bool _uploading = false;
+
+  /// Group and channel pictures are uploaded like any other media and then
+  /// attached to the chat, so the same media permissions and URLs apply.
+  Future<void> _pickAvatar() async {
+    if (_saving || _uploading) return;
+    final picked = await ImagePicker().pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 1280,
+      imageQuality: 85,
+    );
+    if (picked == null || !mounted) return;
+    setState(() => _uploading = true);
+    try {
+      final upload = await widget.api.uploadFile(
+        '/media/upload',
+        File(picked.path),
+      );
+      final url = upload['url'] as String?;
+      if (url == null || url.isEmpty) throw StateError('upload failed');
+      await widget.api.post('${widget.base}/update', {'avatar_url': url});
+      if (!mounted) return;
+      setState(() => _avatarUrl = url);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+      }
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
+
+  Future<void> _removeAvatar() async {
+    if (_saving || _uploading) return;
+    setState(() => _uploading = true);
+    try {
+      await widget.api.post('${widget.base}/update', {'avatar_url': ''});
+      if (!mounted) return;
+      setState(() => _avatarUrl = null);
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+      }
+    } finally {
+      if (mounted) setState(() => _uploading = false);
+    }
+  }
   @override
   void dispose() {
     _title.dispose();
@@ -938,7 +997,48 @@ class _ChatInfoEditorState extends State<_ChatInfoEditor> {
         child: ListView(
           padding: const EdgeInsets.all(24),
           children: [
-            if (_saving) const LinearProgressIndicator(),
+            if (_saving || _uploading) const LinearProgressIndicator(),
+            Center(
+              child: Stack(
+                alignment: AlignmentDirectional.bottomEnd,
+                children: [
+                  ChatAvatar(
+                    title: _title.text.trim().isEmpty
+                        ? (widget.initial['title'] as String? ?? '')
+                        : _title.text.trim(),
+                    url: _avatarUrl,
+                    token: widget.token,
+                    radius: 44,
+                    fallbackIcon: widget.channel ? Icons.campaign : Icons.group,
+                  ),
+                  Material(
+                    color: Theme.of(context).colorScheme.primary,
+                    shape: const CircleBorder(),
+                    child: InkWell(
+                      key: const ValueKey('chat-avatar-picker'),
+                      customBorder: const CircleBorder(),
+                      onTap: _uploading || _saving ? null : _pickAvatar,
+                      child: const Padding(
+                        padding: EdgeInsets.all(6),
+                        child: Icon(
+                          Icons.photo_camera_rounded,
+                          size: 18,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            if (_avatarUrl != null && _avatarUrl!.isNotEmpty)
+              Center(
+                child: TextButton(
+                  onPressed: _uploading || _saving ? null : _removeAvatar,
+                  child: Text(_t(context, 'Remove photo', 'حذف عکس')),
+                ),
+              ),
+            const SizedBox(height: 8),
             TextFormField(
               controller: _title,
               enabled: !_saving,

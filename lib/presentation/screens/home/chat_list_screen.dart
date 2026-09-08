@@ -1,20 +1,22 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../../../core/utils/chat_list_time.dart';
 import '../chat/create_channel_screen.dart';
 
 import 'main_shell.dart';
-
-import '../../../data/services/storage_service.dart';
+import 'archived_chats_screen.dart';
+import 'folder_editor_screen.dart';
 
 import '../../providers/chat_list_provider.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/locale_provider.dart';
+import '../../../data/models/chat_folder_model.dart';
 import '../../../data/models/chat_model.dart';
 import '../../../data/services/api_service.dart';
 import '../chat/chat_screen.dart';
-import '../../widgets/chat/chat_avatar.dart';
+import '../../widgets/chat/chat_labels.dart';
+import '../../widgets/chat/chat_list_actions.dart';
+import '../../widgets/chat/chat_list_tile.dart';
 
 class ChatListScreen extends ConsumerStatefulWidget {
   const ChatListScreen({super.key});
@@ -24,12 +26,56 @@ class ChatListScreen extends ConsumerStatefulWidget {
 }
 
 class _ChatListScreenState extends ConsumerState<ChatListScreen> {
+  /// null = the "All" folder, [_personalFolderId] = the built in personal
+  /// folder, anything else is a custom folder id.
+  String? _selectedFolderId;
+
+  static const String _personalFolderId = '__personal__';
+
+  ChatFolderModel? _selectedFolder(List<ChatFolderModel> folders) {
+    final id = _selectedFolderId;
+    if (id == null || id == _personalFolderId) return null;
+    for (final folder in folders) {
+      if (folder.id == id) return folder;
+    }
+    return null;
+  }
+
+  List<ChatModel> _visibleChats(
+    List<ChatModel> chats,
+    List<ChatFolderModel> folders, {
+    List<ChatModel> archived = const [],
+  }) {
+    final id = _selectedFolderId;
+    if (id == null) return chats;
+    if (id == _personalFolderId) {
+      return chats.where((c) => c.isPersonal).toList();
+    }
+    final folder = _selectedFolder(folders);
+    if (folder == null) return chats;
+    // A folder that includes the archive shows those chats inline, so the
+    // archive row is not needed while such a folder is selected.
+    final pool = folder.includeArchived ? [...chats, ...archived] : chats;
+    return pool.where(folder.contains).toList();
+  }
+
   @override
   Widget build(BuildContext context) {
     final chatsAsync = ref.watch(chatListProvider);
+    final foldersAsync = ref.watch(chatFoldersProvider);
+    final folders = foldersAsync.valueOrNull ?? const <ChatFolderModel>[];
     final locale = ref.watch(localeProvider);
     final isFa = locale.languageCode == 'fa';
+    final labels = ChatLabels.of(context);
     final theme = Theme.of(context);
+
+    // A folder that was deleted elsewhere must not keep the list empty.
+    if (_selectedFolderId != null &&
+        _selectedFolderId != _personalFolderId &&
+        foldersAsync.hasValue &&
+        !folders.any((f) => f.id == _selectedFolderId)) {
+      _selectedFolderId = null;
+    }
 
     return Scaffold(
       backgroundColor: theme.scaffoldBackgroundColor,
@@ -63,6 +109,11 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
                 value: 'channel',
                 child: Text(isFa ? 'کانال جدید' : 'New Channel'),
               ),
+              PopupMenuItem(value: 'folder', child: Text(labels.newFolder)),
+              PopupMenuItem(
+                value: 'archive',
+                child: Text(labels.archivedChats),
+              ),
               PopupMenuItem(
                 value: 'support',
                 child: Text(isFa ? 'پشتیبانی' : 'Support'),
@@ -70,49 +121,68 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
             ],
           ),
         ],
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(46),
+          child: _FolderBar(
+            folders: folders,
+            selectedId: _selectedFolderId,
+            personalId: _personalFolderId,
+            onSelected: (id) => setState(() => _selectedFolderId = id),
+            onEdit: _openFolderEditor,
+            onCreate: () => _openFolderEditor(null),
+          ),
+        ),
       ),
       body: SafeArea(
         child: chatsAsync.when(
-          data: (chats) {
-            if (chats.isEmpty) {
-              return Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.chat_bubble_outline_rounded,
-                      size: 72,
-                      color: Colors.grey[400],
-                    ),
-                    const SizedBox(height: 16),
-                    Text(
-                      isFa ? 'هنوز گفتگویی ندارید' : 'No conversations yet',
-                      style: TextStyle(color: Colors.grey[600], fontSize: 16),
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      isFa
-                          ? 'از تب جستجو کاربر پیدا کنید'
-                          : 'Find users from the Search tab',
-                      style: TextStyle(color: Colors.grey[500], fontSize: 13),
-                    ),
-                  ],
-                ),
+          data: (data) {
+            final folder = _selectedFolder(folders);
+            final archived = folder?.includeArchived == true
+                ? (ref.watch(archivedChatListProvider).valueOrNull?.chats ??
+                      const <ChatModel>[])
+                : const <ChatModel>[];
+            final chats = _visibleChats(
+              data.chats,
+              folders,
+              archived: archived,
+            );
+            // The archive row lives on top of the "All" folder, like Telegram.
+            final showArchiveRow =
+                _selectedFolderId == null && data.hasArchive;
+            if (chats.isEmpty && !showArchiveRow) {
+              return _EmptyState(
+                isFa: isFa,
+                inFolder: _selectedFolderId != null,
               );
             }
+            final itemCount = chats.length + (showArchiveRow ? 1 : 0);
             return RefreshIndicator(
               onRefresh: () => ref.read(chatListProvider.notifier).refresh(),
               child: ListView.separated(
                 physics: const AlwaysScrollableScrollPhysics(),
-                itemCount: chats.length,
+                itemCount: itemCount,
                 separatorBuilder: (_, __) => Divider(
                   height: 1,
                   indent: 76,
                   color: Colors.grey.withValues(alpha: 0.15),
                 ),
                 itemBuilder: (context, index) {
-                  final chat = chats[index];
-                  return _ChatTile(chat: chat, isFa: isFa)
+                  if (showArchiveRow && index == 0) {
+                    return _ArchiveRow(
+                      state: data,
+                      labels: labels,
+                      onTap: _openArchive,
+                    );
+                  }
+                  final chat = chats[index - (showArchiveRow ? 1 : 0)];
+                  return ChatListTile(
+                        key: ValueKey(chat.id),
+                        chat: chat,
+                        isFa: isFa,
+                        onTap: () => _openChat(chat),
+                        onLongPress: () =>
+                            showChatContextMenu(context, ref, chat),
+                      )
                       .animate()
                       .fadeIn(duration: 280.ms, delay: (20 * (index % 12)).ms)
                       .slideX(begin: 0.05, curve: Curves.easeOut);
@@ -142,6 +212,36 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
       ),
       // بدون FloatingActionButton مداد
     );
+  }
+
+  void _openChat(ChatModel chat) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          chatId: chat.id,
+          title: chat.displayTitle,
+          chatType: chat.chatType,
+          otherUser: chat.otherUser,
+          avatarUrl: chat.avatarUrl,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openArchive() async {
+    await openArchivedChats(context, ref);
+    if (!mounted) return;
+    ref.read(chatListProvider.notifier).refresh();
+  }
+
+  Future<void> _openFolderEditor(ChatFolderModel? folder) async {
+    final saved = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(builder: (_) => FolderEditorScreen(folder: folder)),
+    );
+    if (!mounted) return;
+    if (saved == true) {
+      await ref.read(chatFoldersProvider.notifier).load();
+    }
   }
 
   Future<void> _onMenu(String value, bool isFa) async {
@@ -174,6 +274,12 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
         await _createGroupDialog(isFa);
       } else if (value == 'channel') {
         await _createChannelDialog(isFa);
+      } else if (value == 'folder') {
+        await _openFolderEditor(null);
+        return;
+      } else if (value == 'archive') {
+        await _openArchive();
+        return;
       }
       ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
@@ -256,176 +362,160 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
   }
 }
 
-class _ChatTile extends StatelessWidget {
-  final ChatModel chat;
-  final bool isFa;
+/// Horizontal folder strip: All | Personal | custom folders | +
+class _FolderBar extends StatelessWidget {
+  const _FolderBar({
+    required this.folders,
+    required this.selectedId,
+    required this.personalId,
+    required this.onSelected,
+    required this.onEdit,
+    required this.onCreate,
+  });
 
-  const _ChatTile({required this.chat, required this.isFa});
+  final List<ChatFolderModel> folders;
+  final String? selectedId;
+  final String personalId;
+  final ValueChanged<String?> onSelected;
+  final ValueChanged<ChatFolderModel> onEdit;
+  final VoidCallback onCreate;
+
+  @override
+  Widget build(BuildContext context) {
+    final labels = ChatLabels.of(context);
+    return SizedBox(
+      height: 46,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        children: [
+          _chip(context, labels.folderAll, null),
+          _chip(context, labels.folderPersonal, personalId),
+          for (final folder in folders)
+            _chip(context, folder.name, folder.id, folder: folder),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
+            child: IconButton(
+              key: const ValueKey('folder-add'),
+              iconSize: 20,
+              visualDensity: VisualDensity.compact,
+              tooltip: labels.newFolder,
+              icon: const Icon(Icons.add_rounded),
+              onPressed: onCreate,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _chip(
+    BuildContext context,
+    String label,
+    String? id, {
+    ChatFolderModel? folder,
+  }) {
+    final selected = selectedId == id;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+      child: GestureDetector(
+        onLongPress: folder == null ? null : () => onEdit(folder),
+        child: ChoiceChip(
+          label: Text(label),
+          selected: selected,
+          onSelected: (_) => onSelected(id),
+        ),
+      ),
+    );
+  }
+}
+
+class _ArchiveRow extends StatelessWidget {
+  const _ArchiveRow({
+    required this.state,
+    required this.labels,
+    required this.onTap,
+  });
+
+  final ChatListState state;
+  final ChatLabels labels;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final last = chat.lastMessage;
-    String subtitle = '';
-    if (last != null) {
-      if (last.messageType == 'image') {
-        subtitle = isFa ? '📷 عکس' : '📷 Photo';
-      } else if (last.messageType == 'video') {
-        subtitle = isFa ? '🎥 ویدیو' : '🎥 Video';
-      } else if (last.messageType == 'voice') {
-        subtitle = isFa ? '🎤 پیام صوتی' : '🎤 Voice message';
-      } else {
-        subtitle = last.content ?? '';
-      }
-    }
-
-    final timeStr = last?.createdAt == null
-        ? ''
-        : formatChatListTime(last!.createdAt!, locale: isFa ? 'fa' : 'en');
-
-    final isOnline =
-        chat.otherUser?.isOnline == true &&
-        (chat.otherUser?.showLastSeen ?? true);
-    final avatarUrl = chat.chatType == 'private'
-        ? (chat.otherUser?.showProfilePhoto == true
-              ? chat.otherUser?.avatarUrl
-              : null)
-        : chat.avatarUrl;
-
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        onTap: () {
-          Navigator.of(context).push(
-            MaterialPageRoute(
-              builder: (_) => ChatScreen(
-                chatId: chat.id,
-                title: chat.displayTitle,
-                chatType: chat.chatType,
-                otherUser: chat.otherUser,
-                avatarUrl: chat.avatarUrl,
+    return ListTile(
+      key: const ValueKey('archive-row'),
+      onTap: onTap,
+      leading: CircleAvatar(
+        radius: 24,
+        backgroundColor: Colors.blueGrey.withValues(alpha: 0.2),
+        child: Icon(
+          state.hasArchivePin ? Icons.lock_outline : Icons.archive_outlined,
+          color: Colors.blueGrey,
+        ),
+      ),
+      title: Text(
+        labels.archivedChats,
+        style: const TextStyle(fontWeight: FontWeight.w600),
+      ),
+      subtitle: Text('${state.archivedTotal}'),
+      trailing: state.archivedUnread > 0
+          ? Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.primary,
+                borderRadius: BorderRadius.circular(12),
               ),
-            ),
-          );
-        },
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: Row(
-            children: [
-              Stack(
-                children: [
-                  ChatAvatar(
-                    title: chat.displayTitle,
-                    url: avatarUrl,
-                    token: StorageService.getToken(),
-                    radius: 28,
-                  ),
-                  if (chat.chatType == 'private' && isOnline)
-                    Positioned(
-                      bottom: 2,
-                      right: 2,
-                      child: Container(
-                        width: 14,
-                        height: 14,
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF4CAF50),
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: theme.scaffoldBackgroundColor,
-                            width: 2,
-                          ),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      children: [
-                        if (chat.isPinned)
-                          Padding(
-                            padding: const EdgeInsets.only(left: 4),
-                            child: Icon(
-                              Icons.push_pin_rounded,
-                              size: 14,
-                              color: Colors.grey[500],
-                            ),
-                          ),
-                        Expanded(
-                          child: Text(
-                            chat.displayTitle,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontWeight: chat.unreadCount > 0
-                                  ? FontWeight.w700
-                                  : FontWeight.w600,
-                              fontSize: 16,
-                            ),
-                          ),
-                        ),
-                        Text(
-                          timeStr,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: chat.unreadCount > 0
-                                ? theme.colorScheme.primary
-                                : Colors.grey[600],
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            subtitle,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: Colors.grey[600],
-                              fontSize: 13,
-                              fontWeight: chat.unreadCount > 0
-                                  ? FontWeight.w500
-                                  : FontWeight.normal,
-                            ),
-                          ),
-                        ),
-                        if (chat.unreadCount > 0)
-                          Container(
-                            margin: const EdgeInsets.only(right: 2),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 3,
-                            ),
-                            decoration: BoxDecoration(
-                              color: theme.colorScheme.primary,
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Text(
-                              chat.unreadCount > 99
-                                  ? '99+'
-                                  : '${chat.unreadCount}',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ],
+              child: Text(
+                state.archivedUnread > 99 ? '99+' : '${state.archivedUnread}',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
                 ),
               ),
-            ],
+            )
+          : const Icon(Icons.chevron_right_rounded),
+    );
+  }
+}
+
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({required this.isFa, required this.inFolder});
+
+  final bool isFa;
+  final bool inFolder;
+
+  @override
+  Widget build(BuildContext context) {
+    final labels = ChatLabels.of(context);
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            inFolder
+                ? Icons.folder_open_rounded
+                : Icons.chat_bubble_outline_rounded,
+            size: 72,
+            color: Colors.grey[400],
           ),
-        ),
+          const SizedBox(height: 16),
+          Text(
+            inFolder
+                ? labels.folderEmpty
+                : (isFa ? 'هنوز گفتگویی ندارید' : 'No conversations yet'),
+            style: TextStyle(color: Colors.grey[600], fontSize: 16),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            isFa
+                ? 'از تب جستجو کاربر پیدا کنید'
+                : 'Find users from the Search tab',
+            style: TextStyle(color: Colors.grey[500], fontSize: 13),
+          ),
+        ],
       ),
     );
   }

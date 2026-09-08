@@ -199,7 +199,9 @@ void main() {
           );
           await Future<void>.delayed(Duration.zero);
           expect(
-            container.read(chatListProvider).valueOrNull!.map((c) => c.id),
+            container.read(chatListProvider).valueOrNull!.chats.map(
+              (c) => c.id,
+            ),
             ['bob-chat'],
           );
         } finally {
