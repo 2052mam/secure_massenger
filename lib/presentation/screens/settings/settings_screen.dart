@@ -1,3 +1,4 @@
+import '../../widgets/chat/join_privacy_tile.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../data/services/storage_service.dart';
@@ -173,6 +174,7 @@ class SettingsScreen extends ConsumerWidget {
                 },
               ),
             ),
+            const JoinPrivacyTile(),
             ListTile(
               leading: const Icon(Icons.photo_outlined),
               title: Text(isFa ? 'نمایش عکس پروفایل' : 'Show Profile Photo'),

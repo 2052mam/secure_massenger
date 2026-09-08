@@ -1,3 +1,4 @@
+from app.services.request_validation import validate_object_body
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
@@ -7,6 +8,8 @@ from datetime import datetime
 import re
 
 users_bp = Blueprint('users', __name__)
+
+users_bp.before_request(validate_object_body)
 
 def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -30,6 +33,10 @@ def update_me():
         return jsonify({'error': 'کاربر یافت نشد'}), 404
 
     data = request.get_json() or {}
+    if 'allow_group_adds' in data:
+        if type(data['allow_group_adds']) is not bool:
+            return jsonify({'error': 'allow_group_adds must be boolean'}), 400
+        user.allow_group_adds = data['allow_group_adds']
     if 'display_name' in data:
         user.display_name = data['display_name'].strip()[:100]
     if 'bio' in data:
@@ -73,7 +80,7 @@ def search_users():
         User.is_deleted == False,
         User.is_active == True,
         User.id != current_id,
-        (User.username.ilike(f'%{q}%') | User.display_name.ilike(f'%{q}%'))
+        (User.id == q) | User.username.ilike(f'%{q.lstrip("@")}%') | User.display_name.ilike(f'%{q}%')
     ).limit(30).all()
 
     result_users = []

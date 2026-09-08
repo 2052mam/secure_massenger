@@ -51,6 +51,12 @@ def create_app():
     app.register_blueprint(admin_api_bp, url_prefix='/api/v1/admin')
     app.register_blueprint(admin_web_bp)
 
+    @app.cli.command('upgrade-chat-schema')
+    def upgrade_chat_schema():
+        from app.services.schema_upgrade import upgrade_schema
+        upgrade_schema()
+        print('Chat/privacy schema is up to date.')
+
     @app.route('/health')
     def health():
         return {'status': 'ok', 'polling': True}, 200

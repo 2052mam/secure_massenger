@@ -1,13 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_animate/flutter_animate.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:timeago/timeago.dart' as timeago;
+import '../../../core/utils/chat_list_time.dart';
+import '../chat/create_channel_screen.dart';
 
 import 'main_shell.dart';
 
 import '../../../data/services/storage_service.dart';
 
 import '../../providers/chat_list_provider.dart';
+import '../../providers/auth_provider.dart';
 import '../../providers/locale_provider.dart';
 import '../../../data/models/chat_model.dart';
 import '../../../data/services/api_service.dart';
@@ -236,71 +238,21 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
   }
 
   Future<void> _createChannelDialog(bool isFa) async {
-    final titleCtrl = TextEditingController();
-    final userCtrl = TextEditingController();
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(isFa ? 'کانال جدید' : 'New Channel'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: titleCtrl,
-              decoration: InputDecoration(
-                labelText: isFa ? 'عنوان کانال' : 'Channel title',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: userCtrl,
-              decoration: InputDecoration(
-                labelText: isFa
-                    ? 'نام کاربری کانال (اختیاری)'
-                    : 'Username (optional)',
-                prefixText: '@',
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
-                ),
-              ),
-            ),
-          ],
+    final session = ref.read(authenticatedSessionProvider);
+    final created = await Navigator.of(context).push<Map<String, dynamic>>(
+      MaterialPageRoute(builder: (_) => CreateChannelScreen(api: session.api)),
+    );
+    if (!mounted || created == null) return;
+    ref.read(chatListProvider.notifier).refresh();
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          chatId: created['chat_id'] as String,
+          title: created['title'] as String,
+          chatType: 'channel',
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(isFa ? 'لغو' : 'Cancel'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(isFa ? 'ایجاد' : 'Create'),
-          ),
-        ],
       ),
     );
-    if (ok == true && titleCtrl.text.trim().isNotEmpty) {
-      final body = <String, dynamic>{
-        'title': titleCtrl.text.trim(),
-        'is_public': true,
-      };
-      if (userCtrl.text.trim().isNotEmpty) {
-        body['username'] = userCtrl.text.trim().toLowerCase();
-      }
-      final res = await ApiService().post('/chats/channel', body);
-      if (!mounted) return;
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => ChatScreen(
-            chatId: res['chat_id'] as String,
-            title: titleCtrl.text.trim(),
-            chatType: 'channel',
-          ),
-        ),
-      );
-    }
   }
 }
 
@@ -327,12 +279,9 @@ class _ChatTile extends StatelessWidget {
       }
     }
 
-    String timeStr = '';
-    if (last?.createdAt != null) {
-      timeago.setLocaleMessages('fa', timeago.FaMessages());
-      final localTime = last!.createdAt!.toLocal();
-      timeStr = timeago.format(localTime, locale: isFa ? 'fa' : 'en');
-    }
+    final timeStr = last?.createdAt == null
+        ? ''
+        : formatChatListTime(last!.createdAt!, locale: isFa ? 'fa' : 'en');
 
     final isOnline =
         chat.otherUser?.isOnline == true &&

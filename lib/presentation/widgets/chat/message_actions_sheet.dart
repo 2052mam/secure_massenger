@@ -9,6 +9,7 @@ class MessageActionsSheet extends StatelessWidget {
     super.key,
     required this.message,
     required this.canDeleteForAll,
+    this.canReply = true,
     required this.onReply,
     required this.onForward,
     required this.onDelete,
@@ -16,6 +17,7 @@ class MessageActionsSheet extends StatelessWidget {
 
   final MessageModel message;
   final bool canDeleteForAll;
+  final bool canReply;
   final VoidCallback onReply;
   final VoidCallback onForward;
   final ValueChanged<bool> onDelete;
@@ -51,11 +53,12 @@ class MessageActionsSheet extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            ListTile(
-              leading: const Icon(Icons.reply),
-              title: Text(labels.reply),
-              onTap: () => closeAndRun(onReply),
-            ),
+            if (canReply)
+              ListTile(
+                leading: const Icon(Icons.reply),
+                title: Text(labels.reply),
+                onTap: () => closeAndRun(onReply),
+              ),
             if (message.copyableText != null)
               ListTile(
                 key: const ValueKey('copy-message'),

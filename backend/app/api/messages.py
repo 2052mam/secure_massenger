@@ -1,3 +1,5 @@
+from app.services.request_validation import validate_object_body
+from app.services.timestamps import utc_iso
 from flask import Blueprint, request, jsonify, current_app, send_from_directory
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
@@ -8,6 +10,7 @@ from app.models.media import MediaFile
 from app.models.audit import AuditLog
 from datetime import datetime
 from sqlalchemy import and_, or_
+from app.services.chat_permissions import can, can_send, can_delete
 import os
 
 from app.services.message_payloads import (
@@ -15,6 +18,8 @@ from app.services.message_payloads import (
 )
 
 messages_bp = Blueprint('messages', __name__)
+
+messages_bp.before_request(validate_object_body)
 
 def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -94,12 +99,22 @@ def send_message():
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
+    if message_type not in ('text', 'image', 'video', 'voice', 'file'):
+        return jsonify({'error': 'Invalid message type'}), 400
+    if message_type != 'text' and not media_id:
+        return jsonify({'error': 'Media is required'}), 400
+    if message_type == 'text' and media_id:
+        return jsonify({'error': 'Text messages cannot contain media'}), 400
+
     if message_type == 'text' and not content:
         return jsonify({'error': 'متن پیام خالی است'}), 400
 
     chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
     if not chat:
         return jsonify({'error': 'دشن تفای تچ'}), 404
+
+    if not can_send(chat, user_id, message_type, is_view_once):
+        return jsonify({'error': 'Sending this type of message is not permitted'}), 403
 
     if chat.chat_type == 'private':
         other_member = ChatMember.query.filter(
@@ -131,6 +146,9 @@ def send_message():
         ).first()
         if media is None:
             return jsonify({'error': 'فایل در دسترس نیست'}), 403
+        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'file': 'document'}
+        if media.media_type != expected.get(message_type):
+            return jsonify({'error': 'Media type does not match the message type'}), 400
         if is_view_once and media.media_type != 'image':
             return jsonify({'error': 'فایل باید عکس باشد'}), 400
         # Reusing an ephemeral upload as a normal message bypasses view-once.
@@ -211,10 +229,9 @@ def delete_message(message_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
     if for_all:
-        if msg.sender_id != user_id:
-            member = ChatMember.query.filter_by(chat_id=msg.chat_id, user_id=user_id).first()
-            if not member or member.role not in ('owner', 'admin'):
-                return jsonify({'error': 'مجوز حذف برای همه را ندارید'}), 403
+        chat = db.session.get(Chat, msg.chat_id)
+        if not can_delete(chat, user_id, msg):
+            return jsonify({'error': 'Deleting for everyone is not permitted'}), 403
         msg.is_deleted_for_all = True
         msg.is_deleted = True
         msg.deleted_at = datetime.utcnow()
@@ -257,6 +274,21 @@ def forward_message(message_id):
     if not user_in_chat(user_id, target_chat_id):
         return jsonify({'error': 'دسترسی به چت مقصد ندارید'}), 403
 
+    target_chat = db.session.get(Chat, target_chat_id)
+    if not can_send(target_chat, user_id, original.message_type):
+        return jsonify({'error': 'Forwarding this message type is not permitted'}), 403
+    if original.media_id:
+        media = db.session.get(MediaFile, original.media_id)
+        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'file': 'document'}
+        if not media or media.is_deleted or media.media_type != expected.get(original.message_type):
+            return jsonify({'error': 'Media is unavailable or has an invalid type'}), 400
+    if target_chat.chat_type == 'private':
+        peers = [m.user_id for m in ChatMember.query.filter_by(chat_id=target_chat_id, is_deleted=False).all() if m.user_id != user_id]
+        if BlockList.query.filter(BlockList.is_deleted.is_(False),
+            ((BlockList.blocker_id == user_id) & BlockList.blocked_id.in_(peers)) |
+            ((BlockList.blocked_id == user_id) & BlockList.blocker_id.in_(peers))).first():
+            return jsonify({'error': 'Cannot forward to a blocked user'}), 403
+
     new_msg = Message(
         chat_id=target_chat_id,
         sender_id=user_id,
@@ -288,6 +320,9 @@ def pin_message(message_id):
     msg = Message.query.filter_by(id=message_id, is_deleted=False).first()
     if not msg or not user_in_chat(user_id, msg.chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
+
+    if not can(db.session.get(Chat, msg.chat_id), user_id, 'pin_messages'):
+        return jsonify({'error': 'Pinning messages is not permitted'}), 403
 
     existing = PinnedMessage.query.filter_by(chat_id=msg.chat_id, message_id=message_id, is_deleted=False).first()
     if existing:
@@ -368,6 +403,9 @@ def clear_chat_history(chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
     if for_all:
+        chat = db.session.get(Chat, chat_id)
+        if chat.chat_type in ('group', 'channel'):
+            return jsonify({'error': 'Shared group/channel history cannot be cleared'}), 403
         member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
         chat = db.session.get(Chat, chat_id)
         if chat and chat.chat_type == 'private':
@@ -514,7 +552,7 @@ def mark_view_once(message_id):
         entity_id=message_id, ip_address=get_client_ip(),
     ))
     db.session.commit()
-    return jsonify({'ok': True, 'viewed_at': viewed_at.isoformat()}), 200
+    return jsonify({'ok': True, 'viewed_at': utc_iso(viewed_at)}), 200
 
 
 @messages_bp.route('/statuses', methods=['POST'])
@@ -579,7 +617,7 @@ def get_message_statuses():
 
     return jsonify({
         'statuses': statuses,
-        'viewed_at': {msg.id: msg.viewed_at.isoformat() if msg.viewed_at else None
+        'viewed_at': {msg.id: utc_iso(msg.viewed_at) if msg.viewed_at else None
                       for msg in visible if msg.is_view_once},
         'deleted_ids': sorted(deleted_ids),
     }), 200

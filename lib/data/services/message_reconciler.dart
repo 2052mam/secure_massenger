@@ -1,3 +1,4 @@
+import '../../core/utils/api_datetime.dart';
 import '../models/message_model.dart';
 import '../models/reply_preview_model.dart';
 
@@ -28,8 +29,8 @@ class MessageSyncResult {
       viewedAt: {
         for (final entry in views.entries)
           if (entry.value is String &&
-              DateTime.tryParse(entry.value as String) != null)
-            entry.key: DateTime.parse(entry.value as String),
+              parseApiDateTime(entry.value as String) != null)
+            entry.key: parseApiDateTime(entry.value as String)!,
       },
     );
   }

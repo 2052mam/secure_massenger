@@ -39,6 +39,8 @@ class ChatApiFixture {
   final batches = <List<String>>[];
   int fullLoads = 0;
   bool online = true;
+  String chatType = 'private';
+  Map<String, bool> capabilities = {};
   Completer<http.Response>? nextPoll;
   bool joined = false;
   bool invalidInvite = false;
@@ -54,10 +56,11 @@ class ChatApiFixture {
     final path = request.url.path;
     if (path == '/api/v1/chats/chat/info')
       return jsonResponse({
-        'chat_type': 'private',
+        'chat_type': chatType,
+        'capabilities': capabilities,
         'members_count': 2,
         'my_role': 'member',
-        'other_user': peer,
+        'other_user': chatType == 'private' ? peer : null,
       });
     if (path == '/api/v1/users/bob') return jsonResponse(peer);
     if (path == '/api/v1/users/blocked') return jsonResponse({'users': []});
@@ -378,4 +381,36 @@ void main() {
       }, () => MockClient(api.respond));
     },
   );
+  for (final type in ['group', 'channel']) {
+    testWidgets('$type composer follows live server permissions', (
+      tester,
+    ) async {
+      final api = ChatApiFixture()..chatType = type;
+      await http.runWithClient(() async {
+        await openChat(tester);
+        expect(find.byType(TextField), findsNothing);
+        if (type == 'channel') expect(find.text('Mute'), findsOneWidget);
+        api.capabilities = {
+          'send_messages': true,
+          'send_photos': false,
+          'send_videos': false,
+          'send_voice': false,
+        };
+        await tester.pump(const Duration(seconds: 3));
+        await tester.pumpAndSettle();
+        expect(find.byType(TextField), findsOneWidget);
+        final attach = find.ancestor(
+          of: find.byIcon(Icons.attach_file_rounded),
+          matching: find.byType(IconButton),
+        );
+        expect(tester.widget<IconButton>(attach).onPressed, isNull);
+        api.capabilities = {'send_messages': false};
+        await tester.pump(const Duration(seconds: 3));
+        await tester.pumpAndSettle();
+        expect(find.byType(TextField), findsNothing);
+        await tester.pumpWidget(const SizedBox());
+        await tester.pumpAndSettle();
+      }, () => MockClient(api.respond));
+    });
+  }
 }

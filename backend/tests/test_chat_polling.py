@@ -79,7 +79,7 @@ def test_sync_keeps_view_once_and_read_receipts_but_not_deleted_media(app, clien
         db.session.commit()
     result = sync(client, auth, [mid], user='alice').json
     assert result['statuses'] == {mid: 'read'}
-    assert result['viewed_at'] == {mid: '2026-09-07T12:00:00'}
+    assert result['viewed_at'] == {mid: '2026-09-07T12:00:00Z'}
     assert sync(client, auth, [mid]).json['statuses'] == {}
     client.post(f'/api/v1/messages/{mid}/delete', headers=auth(), json={'for_all': True})
     assert sync(client, auth, [mid]).json == {'deleted_ids': [mid], 'statuses': {}, 'viewed_at': {}}

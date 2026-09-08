@@ -1,3 +1,4 @@
+import '../../core/utils/api_datetime.dart';
 import 'package:equatable/equatable.dart';
 
 import 'user_model.dart';
@@ -45,8 +46,7 @@ class ChatModel extends Equatable {
             )
           : null,
       updatedAt:
-          DateTime.tryParse(json['updated_at'] as String? ?? '') ??
-          DateTime.now(),
+          parseApiDateTime(json['updated_at'] as String?) ?? DateTime.now(),
       otherUser: json['other_user'] != null
           ? UserModel.fromJson(json['other_user'] as Map<String, dynamic>)
           : null,
@@ -98,7 +98,7 @@ class LastMessageModel {
       messageType: json['message_type'] as String?,
       senderId: json['sender_id'] as String?,
       createdAt: json['created_at'] != null
-          ? DateTime.tryParse(json['created_at'] as String)?.toLocal()
+          ? parseApiDateTime(json['created_at'] as String?)
           : null,
     );
   }

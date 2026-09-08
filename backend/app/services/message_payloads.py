@@ -1,5 +1,7 @@
 """Shared, non-recursive message payloads for send, history, search and polling."""
 
+from app.services.timestamps import utc_iso
+
 from app import db
 from app.models.chat import Chat, ChatMember
 from app.models.message import Message, MessageHide, MessageStatus
@@ -50,9 +52,15 @@ def serialize_messages(messages, user_id, status_override=None):
         ).all():
             statuses.setdefault(status.message_id, []).append(status)
 
+    chats = {c.id: c for c in Chat.query.filter(Chat.id.in_({m.chat_id for m in messages})).all()}
     result = []
     for msg in messages:
         sender = senders.get(msg.sender_id)
+        chat = chats[msg.chat_id]
+        broadcast = chat.chat_type == 'channel'
+        channel_sender = {'id': chat.id, 'username': chat.username or '',
+                          'display_name': chat.title or 'Channel', 'avatar_url': chat.avatar_url,
+                          'is_online': False} if broadcast else None
         reply = None
         if msg.reply_to_id:
             original = originals.get(msg.reply_to_id)
@@ -63,8 +71,8 @@ def serialize_messages(messages, user_id, status_override=None):
                 author = senders.get(original.sender_id)
                 reply = {
                     'id': original.id,
-                    'sender_id': original.sender_id,
-                    'sender_name': author.display_name if author else None,
+                    'sender_id': chat.id if broadcast else original.sender_id,
+                    'sender_name': chat.title if broadcast else author.display_name if author else None,
                     'message_type': original.message_type,
                     'content': (original.content or '')[:240]
                     if not original.is_view_once else None,
@@ -91,8 +99,8 @@ def serialize_messages(messages, user_id, status_override=None):
         result.append({
             'id': msg.id,
             'chat_id': msg.chat_id,
-            'sender_id': msg.sender_id,
-            'sender': sender.to_dict() if sender else None,
+            'sender_id': chat.id if broadcast else msg.sender_id,
+            'sender': channel_sender if broadcast else sender.to_dict() if sender else None,
             'message_type': msg.message_type,
             'content': msg.content,
             'media_id': msg.media_id,
@@ -102,9 +110,9 @@ def serialize_messages(messages, user_id, status_override=None):
             'reply_to': reply,
             'forwarded_from_id': msg.forwarded_from_id,
             'is_view_once': msg.is_view_once,
-            'viewed_at': msg.viewed_at.isoformat() if msg.viewed_at else None,
+            'viewed_at': utc_iso(msg.viewed_at) if msg.viewed_at else None,
             'is_edited': msg.is_edited,
-            'created_at': msg.created_at.isoformat(),
+            'created_at': utc_iso(msg.created_at),
             'status': status,
         })
     return result

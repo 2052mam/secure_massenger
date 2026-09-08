@@ -15,6 +15,8 @@ class Chat(db.Model):
     description = db.Column(db.Text, nullable=True)
     avatar_url = db.Column(db.String(500), nullable=True)
     
+    permissions = db.Column(db.JSON, nullable=True)
+
     created_by = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
     is_public = db.Column(db.Boolean, default=False)
     
@@ -41,6 +43,8 @@ class ChatMember(db.Model):
     # owner | admin | member | subscriber
     role = db.Column(db.String(20), default='member')
     
+    permissions = db.Column(db.JSON, nullable=True)
+
     # Notification & settings
     is_muted = db.Column(db.Boolean, default=False)
     is_pinned = db.Column(db.Boolean, default=False)

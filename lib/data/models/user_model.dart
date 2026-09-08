@@ -1,3 +1,4 @@
+import '../../core/utils/api_datetime.dart';
 import 'package:equatable/equatable.dart';
 
 class UserModel extends Equatable {
@@ -12,6 +13,7 @@ class UserModel extends Equatable {
   final bool showLastSeen;
   final bool showProfilePhoto;
   final bool showBio;
+  final bool allowGroupAdds;
 
   const UserModel({
     required this.id,
@@ -25,6 +27,7 @@ class UserModel extends Equatable {
     this.showLastSeen = true,
     this.showProfilePhoto = true,
     this.showBio = true,
+    this.allowGroupAdds = true,
   });
 
   factory UserModel.fromJson(Map<String, dynamic> json) {
@@ -36,21 +39,12 @@ class UserModel extends Equatable {
       bio: json['bio'] as String?,
       avatarUrl: json['avatar_url'] as String?,
       isOnline: json['is_online'] as bool? ?? false,
-      lastSeen: _parseLastSeen(json['last_seen'] as String?),
+      lastSeen: parseApiDateTime(json['last_seen'] as String?),
       showLastSeen: json['show_last_seen'] as bool? ?? true,
       showProfilePhoto: json['show_profile_photo'] as bool? ?? true,
       showBio: json['show_bio'] as bool? ?? true,
+      allowGroupAdds: json['allow_group_adds'] as bool? ?? true,
     );
-  }
-
-  static DateTime? _parseLastSeen(String? value) {
-    if (value == null || value.isEmpty) return null;
-    // Existing Flask rows were serialized as naive UTC; newer responses use Z.
-    final hasZone = RegExp(
-      r'(Z|[+-]\d{2}:?\d{2})$',
-      caseSensitive: false,
-    ).hasMatch(value);
-    return DateTime.tryParse(hasZone ? value : '${value}Z')?.toLocal();
   }
 
   Map<String, dynamic> toJson() {
@@ -62,10 +56,11 @@ class UserModel extends Equatable {
       'bio': bio,
       'avatar_url': avatarUrl,
       'is_online': isOnline,
-      'last_seen': lastSeen?.toIso8601String(),
+      'last_seen': lastSeen?.toUtc().toIso8601String(),
       'show_last_seen': showLastSeen,
       'show_profile_photo': showProfilePhoto,
       'show_bio': showBio,
+      'allow_group_adds': allowGroupAdds,
     };
   }
 
@@ -82,5 +77,6 @@ class UserModel extends Equatable {
     showLastSeen,
     showProfilePhoto,
     showBio,
+    allowGroupAdds,
   ];
 }

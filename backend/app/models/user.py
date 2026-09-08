@@ -1,3 +1,4 @@
+from app.services.timestamps import utc_iso
 from app import db
 from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -26,6 +27,8 @@ class User(db.Model):
     show_profile_photo = db.Column(db.Boolean, default=True)
     show_bio = db.Column(db.Boolean, default=True)
     
+    allow_group_adds = db.Column(db.Boolean, nullable=False, default=True, server_default=db.true())
+
     # Status
     is_active = db.Column(db.Boolean, default=True)
     is_admin = db.Column(db.Boolean, default=False)
@@ -65,7 +68,7 @@ class User(db.Model):
         # A killed/offline app cannot send a final offline request. Expire its
         # heartbeat instead of leaving the profile online indefinitely.
         online = bool(self.is_online and self.last_seen and
-                      datetime.utcnow() - self.last_seen < timedelta(seconds=60))
+                      timedelta(0) <= datetime.utcnow() - self.last_seen < timedelta(seconds=60))
         data = {
             'id': self.id,
             'username': self.username,
@@ -73,12 +76,15 @@ class User(db.Model):
             'bio': self.bio if self.show_bio else None,
             'avatar_url': self.avatar_url if self.show_profile_photo else None,
             'is_online': online if self.show_last_seen else False,
-            'last_seen': self.last_seen.isoformat() + 'Z' if self.show_last_seen and self.last_seen else None,
-            'created_at': self.created_at.isoformat(),
+            'last_seen': utc_iso(self.last_seen) if self.show_last_seen and self.last_seen else None,
+            'created_at': utc_iso(self.created_at),
         }
         if include_private:
             data.update({
                 'email': self.email,
+                'avatar_url': self.avatar_url,
+                'bio': self.bio,
+                'allow_group_adds': self.allow_group_adds,
                 'show_last_seen': self.show_last_seen,
                 'show_profile_photo': self.show_profile_photo,
                 'show_bio': self.show_bio,

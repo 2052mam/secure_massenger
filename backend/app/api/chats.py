@@ -1,3 +1,5 @@
+from app.services.request_validation import validate_object_body
+from app.services.timestamps import utc_iso
 import re
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -9,8 +11,14 @@ from app.models.audit import AuditLog
 from app.services.message_payloads import visible_messages
 from datetime import datetime
 import uuid
+from werkzeug.exceptions import HTTPException
+from app.services.chat_permissions import (can, capabilities, group_permissions,
+    admin_permissions, validate_permissions, GROUP_DEFAULTS, ADMIN_DEFAULTS)
+from app.services.member_invitations import add_or_invite
 
 chats_bp = Blueprint('chats', __name__)
+
+chats_bp.before_request(validate_object_body)
 
 def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -67,15 +75,15 @@ def list_chats():
                 'id': last_msg.id if last_msg else None,
                 'content': last_msg.content if last_msg else None,
                 'message_type': last_msg.message_type if last_msg else None,
-                'sender_id': last_msg.sender_id if last_msg else None,
-                'created_at': last_msg.created_at.isoformat() if last_msg else None,
+                'sender_id': (chat.id if chat.chat_type == 'channel' else last_msg.sender_id) if last_msg else None,
+                'created_at': utc_iso(last_msg.created_at) if last_msg else None,
             } if last_msg else None,
-            'updated_at': chat.updated_at.isoformat(),
+            'updated_at': utc_iso(chat.updated_at),
             'other_user': other_user.to_dict() if other_user else None,
         })
 
     # مرتب‌سازی: پین‌شده‌ها اول، بعد بر اساس updated_at
-    result.sort(key=lambda x: (not x['is_pinned'], x['updated_at']), reverse=True)
+    result.sort(key=lambda x: (x['is_pinned'], x['last_message']['created_at'] if x['last_message'] else x['updated_at']), reverse=True)
     return jsonify({'chats': result}), 200
 
 
@@ -154,15 +162,23 @@ def create_group():
     db.session.flush()
 
     db.session.add(ChatMember(chat_id=chat.id, user_id=user_id, role='owner'))
-    for mid in member_ids:
-        if mid != user_id:
-            u = User.query.filter_by(id=mid, is_deleted=False).first()
-            if u:
-                db.session.add(ChatMember(chat_id=chat.id, user_id=mid, role='member'))
+    if not isinstance(member_ids, list) or len(member_ids) > 100 or any(
+        not isinstance(mid, str) for mid in member_ids
+    ):
+        db.session.rollback()
+        return jsonify({'error': 'Invalid member_ids (maximum 100)'}), 400
+    results = {}
+    try:
+        for mid in dict.fromkeys(member_ids):
+            if mid != user_id:
+                results[mid] = add_or_invite(chat, user_id, mid, can_restore=True)
+    except HTTPException as error:
+        db.session.rollback()
+        return jsonify({'error': error.description}), error.code
 
     db.session.add(AuditLog(actor_id=user_id, action='create_group', entity_type='chat', entity_id=chat.id))
     db.session.commit()
-    return jsonify({'chat_id': chat.id, 'title': title}), 201
+    return jsonify({'chat_id': chat.id, 'title': title, 'members': results}), 201
 
 
 @chats_bp.route('/channel', methods=['POST'])
@@ -173,10 +189,12 @@ def create_channel():
     title = (data.get('title') or '').strip()
     username = (data.get('username') or '').strip().lower()
     description = data.get('description')
-    is_public = bool(data.get('is_public', True))
+    is_public = data.get('is_public', bool(username))
 
     if not title:
         return jsonify({'error': 'عنوان کانال الزامی است'}), 400
+    if is_public and not username:
+        return jsonify({'error': 'A public channel requires a username'}), 400
 
     if username:
         if not re.match(r'^[a-z0-9_]{3,30}$', username):
@@ -208,6 +226,11 @@ def get_members(chat_id):
     if not member:
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
+    chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
+    if not chat:
+        return jsonify({'error': 'Chat not found'}), 404
+    if chat.chat_type == 'channel' and member.role not in ('owner', 'admin'):
+        return jsonify({'error': 'Subscriber list is private'}), 403
     members = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).all()
     result = []
     for m in members:
@@ -215,7 +238,9 @@ def get_members(chat_id):
         if u and not u.is_deleted:
             d = u.to_dict()
             d['role'] = m.role
-            d['joined_at'] = m.joined_at.isoformat()
+            if member.role in ('owner', 'admin') and m.role == 'admin':
+                d['permissions'] = admin_permissions(m)
+            d['joined_at'] = utc_iso(m.joined_at)
             result.append(d)
     return jsonify({'members': result}), 200
 
@@ -323,10 +348,10 @@ def delete_chat(chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
     if for_all:
-        chat = Chat.query.get(chat_id)
+        chat = db.session.get(Chat, chat_id)
         if not chat:
             return jsonify({'error': 'چت یافت نشد'}), 404
-        if chat.chat_type in ('group', 'channel') and member.role not in ('owner', 'admin'):
+        if chat.chat_type in ('group', 'channel') and member.role != 'owner':
             return jsonify({'error': 'فقط ادمین/مالک می‌تواند برای همه حذف کند'}), 403
         chat.is_deleted = True
         chat.is_deleted_for_all = True
@@ -394,54 +419,54 @@ def add_member(chat_id):
     chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
     if not chat:
         return jsonify({'error': 'چت یافت نشد'}), 404
-    if not member or member.role not in ('owner', 'admin'):
-        # برای کانال/گروه public اجازه عضویت آزاد
-        if not (chat.is_public and chat.chat_type in ('channel', 'group')):
-            return jsonify({'error': 'دسترسی ندارید'}), 403
-        # اگه خودش داره عضو میشه اجازه بده
-        if target_id != user_id:
-            return jsonify({'error': 'دسترسی ندارید'}), 403
-    target_user = User.query.filter_by(id=target_id, is_deleted=False, is_active=True).first()
-    if target_user is None:
-        return jsonify({'error': 'کاربر یافت نشد'}), 404
-    existing = ChatMember.query.filter_by(chat_id=chat_id, user_id=target_id).first()
-    if existing and not existing.is_deleted:
-        return jsonify({'message': 'قبلاً عضو است'}), 200
-    is_admin = member and member.role in ('owner', 'admin')
-    if (existing and existing.deleted_by and existing.deleted_by != target_id
-            and not is_admin):
-        return jsonify({'error': 'امکان عضویت وجود ندارد'}), 403
-    role = ('owner' if chat.created_by == target_id else
-            'subscriber' if chat.chat_type == 'channel' else 'member')
-    if existing:
-        existing.is_deleted = False
-        existing.deleted_at = None
-        existing.deleted_by = None
-        existing.joined_at = datetime.utcnow()
-        existing.role = role
-    else:
-        db.session.add(ChatMember(chat_id=chat_id, user_id=target_id, role=role))
-    db.session.commit()
-    return jsonify({'ok': True}), 201
+    if chat.chat_type not in ('group', 'channel'):
+        return jsonify({'error': 'This chat does not support invitations'}), 400
+    if not isinstance(target_id, str):
+        return jsonify({'error': 'user_id is required'}), 400
+    if target_id == user_id:
+        if member:
+            return jsonify({'ok': True, 'action': 'already_member'}), 200
+        if not chat.is_public:
+            return jsonify({'error': 'Use an invitation to join a private chat'}), 403
+        return _legacy_join(chat, user_id)
+    if not member or not can(chat, user_id, 'invite_users'):
+        return jsonify({'error': 'Inviting members is not permitted'}), 403
+    source = data.get('source', 'chat_list')
+    if source not in ('chat_list', 'search'):
+        return jsonify({'error': 'Invalid invitation source'}), 400
+    try:
+        action = add_or_invite(chat, user_id, target_id,
+                               invite_only=source == 'search',
+                               can_restore=can(chat, user_id, 'restrict_members'))
+        db.session.commit()
+    except HTTPException as error:
+        db.session.rollback()
+        return jsonify({'error': error.description}), error.code
+    return jsonify({'ok': True, 'action': action}), 200 if action == 'already_member' else 201
+
 
 @chats_bp.route('/<chat_id>/remove-member', methods=['POST'])
 @jwt_required()
 def remove_member(chat_id):
     user_id = get_jwt_identity()
-    data = request.get_json() or {}
-    target_id = data.get('user_id')
-    member = ChatMember.query.filter_by(
-        chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-    if not member or member.role not in ('owner', 'admin'):
-        return jsonify({'error': 'دسترسی ندارید'}), 403
-    target = ChatMember.query.filter_by(
-        chat_id=chat_id, user_id=target_id, is_deleted=False).first()
-    if target:
-        target.is_deleted = True
-        target.deleted_at = datetime.utcnow()
-        target.deleted_by = user_id
-        db.session.commit()
+    target_id = (request.get_json() or {}).get('user_id')
+    chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
+    if not chat or chat.chat_type not in ('group', 'channel') or not can(chat, user_id, 'restrict_members'):
+        return jsonify({'error': 'Removing members is not permitted'}), 403
+    member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+    target = ChatMember.query.filter_by(chat_id=chat_id, user_id=target_id, is_deleted=False).first()
+    if not target:
+        return jsonify({'error': 'Member not found'}), 404
+    if target.role == 'owner' or target_id == user_id or (target.role == 'admin' and member.role != 'owner'):
+        return jsonify({'error': 'Cannot remove this administrator or owner'}), 403
+    target.is_deleted = True
+    target.deleted_at = datetime.utcnow()
+    target.deleted_by = user_id
+    target.permissions = None
+    db.session.add(AuditLog(actor_id=user_id, action='remove_member', entity_type='chat', entity_id=chat_id))
+    db.session.commit()
     return jsonify({'ok': True}), 200
+
 
 @chats_bp.route('/<chat_id>/leave', methods=['POST'])
 @jwt_required()
@@ -464,17 +489,37 @@ def promote_member(chat_id):
     data = request.get_json() or {}
     target_id = data.get('user_id')
     new_role = data.get('role', 'admin')
-    member = ChatMember.query.filter_by(
-        chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-    if not member or member.role != 'owner':
-        return jsonify({'error': 'فقط مالک می‌تواند نقش بدهد'}), 403
-    target = ChatMember.query.filter_by(
-        chat_id=chat_id, user_id=target_id, is_deleted=False).first()
+    chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
+    if not chat or chat.chat_type not in ('group', 'channel'):
+        return jsonify({'error': 'Group or channel not found'}), 404
+    if new_role not in ('admin', 'member', 'subscriber'):
+        return jsonify({'error': 'Invalid role'}), 400
+    member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+    if not member or not can(chat, user_id, 'promote_members'):
+        return jsonify({'error': 'Promoting administrators is not permitted'}), 403
+    target = ChatMember.query.filter_by(chat_id=chat_id, user_id=target_id, is_deleted=False).first()
     if not target:
-        return jsonify({'error': 'عضو یافت نشد'}), 404
-    target.role = new_role
+        return jsonify({'error': 'Member not found'}), 404
+    if target.role == 'owner' or target_id == user_id or (target.role == 'admin' and member.role != 'owner'):
+        return jsonify({'error': 'Cannot change this administrator or owner'}), 403
+    if new_role == 'admin':
+        try:
+            patch = validate_permissions(data['permissions'], ADMIN_DEFAULTS) if 'permissions' in data else {}
+        except ValueError as error:
+            return jsonify({'error': str(error)}), 400
+        # New admins receive explicit rights, never implicit future privileges.
+        rights = {**(admin_permissions(target) if target.role == 'admin' else ADMIN_DEFAULTS), **patch}
+        own = capabilities(chat, member)
+        if member.role != 'owner' and any(flag and not own.get(key, False) for key, flag in rights.items()):
+            return jsonify({'error': 'Cannot grant rights you do not have'}), 403
+        target.permissions = rights
+        target.role = 'admin'
+    else:
+        target.role = 'subscriber' if chat.chat_type == 'channel' else 'member'
+        target.permissions = None
+    db.session.add(AuditLog(actor_id=user_id, action='change_admin_rights', entity_type='chat', entity_id=chat_id))
     db.session.commit()
-    return jsonify({'ok': True}), 200
+    return jsonify({'ok': True, 'role': target.role, 'permissions': target.permissions}), 200
 
 @chats_bp.route('/<chat_id>/info', methods=['GET'])
 @jwt_required()
@@ -509,8 +554,11 @@ def get_chat_info(chat_id):
         'created_by': chat.created_by,
         'members_count': members_count,
         'my_role': my_role,
+        'is_muted': member.is_muted if member else False,
+        'permissions': group_permissions(chat) if chat.chat_type == 'group' else None,
+        'capabilities': capabilities(chat, member),
         'other_user': other_user.to_dict() if other_user else None,
-        'created_at': chat.created_at.isoformat(),
+        'created_at': utc_iso(chat.created_at),
     }), 200
 
 
@@ -523,8 +571,12 @@ def update_chat(chat_id):
     if not chat:
         return jsonify({'error': 'چت یافت نشد'}), 404
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-    if not member or member.role not in ('owner', 'admin'):
+    if chat.chat_type not in ('group', 'channel') or not can(chat, user_id, 'change_info'):
         return jsonify({'error': 'دسترسی ندارید'}), 403
+    public = data.get('is_public', chat.is_public) if member.role == 'owner' else chat.is_public
+    username = (data.get('username', chat.username) or '').strip() if member.role == 'owner' else chat.username
+    if public and not username:
+        return jsonify({'error': 'Public chats require a username'}), 400
     if 'title' in data and data['title']:
         chat.title = data['title'].strip()[:200]
     if 'description' in data:
@@ -561,7 +613,7 @@ def get_invite_link(chat_id):
     if not chat:
         return jsonify({'error': 'چت یافت نشد'}), 404
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-    if not member or member.role not in ('owner', 'admin'):
+    if not can(chat, user_id, 'invite_users'):
         return jsonify({'error': 'دسترسی ندارید'}), 403
     if chat.chat_type not in ('group', 'channel'):
         return jsonify({'error': 'این چت لینک دعوت ندارد'}), 400
@@ -573,49 +625,39 @@ def get_invite_link(chat_id):
 @chats_bp.route('/join/<chat_id>', methods=['POST'])
 @jwt_required()
 def join_by_link(chat_id):
-    user_id = get_jwt_identity()
     chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
     if not chat:
-        return jsonify({'error': 'چت یافت نشد'}), 404
-    if not chat.is_public:
-        return jsonify({'error': 'این گروه/کانال خصوصی است'}), 403
-    existing = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-    if existing:
-        return jsonify({'chat_id': chat_id, 'message': 'قبلاً عضو هستید'}), 200
-    db.session.add(ChatMember(chat_id=chat_id, user_id=user_id, role='member'))
-    db.session.commit()
-    return jsonify({'chat_id': chat_id, 'ok': True}), 201
+        return jsonify({'error': 'Chat not found'}), 404
+    if not chat.is_public or chat.chat_type not in ('group', 'channel'):
+        return jsonify({'error': 'Use a valid invitation'}), 403
+    return _legacy_join(chat, get_jwt_identity())
 
 
 @chats_bp.route('/<chat_id>/set-permissions', methods=['POST'])
 @jwt_required()
 def set_permissions(chat_id):
-    """تنظیم دسترسی‌های گروه - فقط owner"""
     user_id = get_jwt_identity()
-    data = request.get_json() or {}
     chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
     if not chat:
-        return jsonify({'error': 'چت یافت نشد'}), 404
-    member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-    if not member or member.role != 'owner':
-        return jsonify({'error': 'فقط مالک می‌تواند دسترسی‌ها را تغییر دهد'}), 403
-    # ذخیره در description به صورت JSON ساده
-    import json
-    perms = {}
-    if 'members_can_send' in data:
-        perms['members_can_send'] = bool(data['members_can_send'])
-    if 'members_can_add_members' in data:
-        perms['members_can_add_members'] = bool(data['members_can_add_members'])
-    # ذخیره در extra_data چت
+        return jsonify({'error': 'Chat not found'}), 404
+    if chat.chat_type != 'group':
+        return jsonify({'error': 'Channels use administrator publishing rights, not group permissions'}), 400
+    if not can(chat, user_id, 'manage_permissions'):
+        return jsonify({'error': 'Changing permissions is not permitted'}), 403
+    data = request.get_json() or {}
+    # Keep old clients compatible, but strictly validate booleans.
+    aliases = {'members_can_send': 'send_messages', 'members_can_add_members': 'invite_users'}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Invalid permissions'}), 400
+    data = {aliases.get(key, key): value for key, value in data.items()}
     try:
-        existing = json.loads(chat.description or '{}')
-        if isinstance(existing, dict) and '__perms' in existing:
-            existing['__perms'] = perms
-            chat.description = json.dumps(existing, ensure_ascii=False)
-    except Exception:
-        pass
+        patch = validate_permissions(data, GROUP_DEFAULTS)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    chat.permissions = {**group_permissions(chat), **patch}
+    db.session.add(AuditLog(actor_id=user_id, action='set_group_permissions', entity_type='chat', entity_id=chat_id))
     db.session.commit()
-    return jsonify({'ok': True, 'permissions': perms}), 200
+    return jsonify({'ok': True, 'permissions': chat.permissions}), 200
 
 
 def _invite_chat_for_request():
@@ -666,14 +708,18 @@ def preview_invite():
 @chats_bp.route('/join', methods=['POST'])
 @jwt_required()
 def join_by_invite():
-    from sqlalchemy.exc import IntegrityError
-
     chat, error = _invite_chat_for_request()
     if error is not None:
         return error
-    user_id = get_jwt_identity()
+    return _join_chat(chat, get_jwt_identity())
+
+
+def _join_chat(chat, user_id, created_status=200):
+    from sqlalchemy.exc import IntegrityError
     chat_id = chat.id
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id).with_for_update().first()
+    if member and member.is_deleted and member.deleted_by not in (None, user_id):
+        return jsonify({'error': 'Cannot rejoin after removal'}), 403
     if member and not member.is_deleted:
         return jsonify(_invite_preview(chat, user_id)), 200
 
@@ -687,6 +733,7 @@ def join_by_invite():
         member.deleted_by = None
         member.joined_at = datetime.utcnow()
         member.role = role
+        member.permissions = None
     else:
         db.session.add(ChatMember(chat_id=chat_id, user_id=user_id, role=role))
     db.session.add(AuditLog(
@@ -703,4 +750,27 @@ def join_by_invite():
                                            is_deleted=False).first()
         if member is None:
             raise
-    return jsonify(_invite_preview(chat, user_id)), 200
+    return jsonify(_invite_preview(chat, user_id)), created_status
+
+
+@chats_bp.route('/<chat_id>/mute', methods=['POST'])
+@jwt_required()
+def mute_chat(chat_id):
+    member = ChatMember.query.join(Chat).filter(
+        ChatMember.chat_id == chat_id, ChatMember.user_id == get_jwt_identity(),
+        ChatMember.is_deleted.is_(False), Chat.is_deleted.is_(False)).first()
+    if not member:
+        return jsonify({'error': 'Access denied'}), 403
+    value = (request.get_json() or {}).get('is_muted')
+    if type(value) is not bool:
+        return jsonify({'error': 'is_muted must be boolean'}), 400
+    member.is_muted = value
+    db.session.commit()
+    return jsonify({'is_muted': member.is_muted}), 200
+
+
+def _legacy_join(chat, user_id):
+    response, status = _join_chat(chat, user_id, created_status=201)
+    if status < 300:
+        return jsonify({**response.get_json(), 'chat_id': chat.id, 'ok': True}), status
+    return response, status

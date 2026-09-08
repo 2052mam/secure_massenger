@@ -1,3 +1,4 @@
+import '../../core/utils/api_datetime.dart';
 import 'package:equatable/equatable.dart';
 
 import 'user_model.dart';
@@ -59,11 +60,11 @@ class MessageModel extends Equatable {
       forwardedFromId: json['forwarded_from_id'] as String?,
       isViewOnce: json['is_view_once'] as bool? ?? false,
       viewedAt: json['viewed_at'] != null
-          ? DateTime.tryParse(json['viewed_at'] as String)
+          ? parseApiDateTime(json['viewed_at'] as String?)
           : null,
       isEdited: json['is_edited'] as bool? ?? false,
       createdAt: json['created_at'] != null
-          ? DateTime.parse(json['created_at'] as String).toLocal()
+          ? parseApiDateTime(json['created_at'] as String?) ?? DateTime.now()
           : DateTime.now(),
       status: json['status'] as String? ?? 'sent',
     );

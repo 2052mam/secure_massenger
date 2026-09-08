@@ -3,10 +3,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../../core/constants/api_constants.dart';
-import '../../../data/services/storage_service.dart';
+import '../../widgets/chat/chat_avatar.dart';
 import 'dart:io';
 
-import '../../../data/services/api_service.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/locale_provider.dart';
 
@@ -44,24 +43,26 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
   }
 
   Future<void> _pickAvatar() async {
+    if (_loading || _saving) return;
+    final api = ref.read(authenticatedSessionProvider).api;
     final picker = ImagePicker();
     final picked = await picker.pickImage(
       source: ImageSource.gallery,
       maxWidth: 800,
       imageQuality: 85,
     );
-    if (picked == null) return;
+    if (picked == null || !mounted) return;
 
     setState(() => _loading = true);
     try {
-      final uploadRes = await ApiService().uploadFile(
+      final uploadRes = await api.uploadFile(
         '/media/upload',
         File(picked.path),
       );
       final mediaId = uploadRes['id'] as String;
-      final mediaId2 = uploadRes['id'] as String;
-      final fullUrl = '${ApiConstants.baseUrl}/media/$mediaId2';
-      await ApiService().put('/users/me', {'avatar_url': fullUrl});
+      final fullUrl = '${ApiConstants.baseUrl}/media/$mediaId';
+      await api.put('/users/me', {'avatar_url': fullUrl});
+      if (!mounted) return;
       await ref.read(authNotifierProvider.notifier).checkSession();
       if (mounted) {
         ScaffoldMessenger.of(
@@ -70,32 +71,78 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
+  Future<void> _removeAvatar() async {
+    if (_loading || _saving) return;
+    final isFa = ref.read(localeProvider).languageCode == 'fa';
+    final api = ref.read(authenticatedSessionProvider).api;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(isFa ? 'حذف عکس پروفایل؟' : 'Remove profile photo?'),
+        content: Text(
+          isFa
+              ? 'پروفایل شما بدون عکس نمایش داده می‌شود.'
+              : 'Your profile will be shown without a photo.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(isFa ? 'لغو' : 'Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(isFa ? 'حذف' : 'Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _loading = true);
+    try {
+      await api.put('/users/me', {'avatar_url': null});
+      if (!mounted) return;
+      await ref.read(authNotifierProvider.notifier).checkSession();
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
   Future<void> _save() async {
+    if (_loading || _saving) return;
     setState(() => _saving = true);
     try {
-      await ApiService().put('/users/me', {
+      await ref.read(authenticatedSessionProvider).api.put('/users/me', {
         'display_name': _nameCtrl.text.trim(),
         'username': _usernameCtrl.text.trim().toLowerCase(),
         'bio': _bioCtrl.text.trim(),
       });
+      if (!mounted) return;
       await ref.read(authNotifierProvider.notifier).checkSession();
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('پروفایل ذخیره شد')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('پروفایل ذخیره شد')));
         Navigator.pop(context);
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     } finally {
       if (mounted) setState(() => _saving = false);
@@ -132,26 +179,11 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                 onTap: _loading ? null : _pickAvatar,
                 child: Stack(
                   children: [
-                    CircleAvatar(
+                    ChatAvatar(
                       radius: 56,
-                      backgroundImage: null,
-                      foregroundImage: user?.avatarUrl != null
-                          ? NetworkImage(
-                              user!.avatarUrl!,
-                              headers: {
-                                'Authorization':
-                                    'Bearer ${StorageService.getToken() ?? ""}',
-                              },
-                            )
-                          : null,
-                      child: user?.avatarUrl == null
-                          ? Text(
-                              user?.displayName.isNotEmpty == true
-                                  ? user!.displayName[0].toUpperCase()
-                                  : '?',
-                              style: const TextStyle(fontSize: 36),
-                            )
-                          : null,
+                      title: user?.displayName ?? '?',
+                      url: user?.avatarUrl,
+                      token: ref.watch(authenticatedSessionProvider).token,
                     ),
                     if (_loading)
                       const Positioned.fill(child: CircularProgressIndicator())
@@ -161,9 +193,9 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                         right: 0,
                         child: CircleAvatar(
                           radius: 18,
-                          backgroundColor: Theme.of(context)
-                              .colorScheme
-                              .primary,
+                          backgroundColor: Theme.of(
+                            context,
+                          ).colorScheme.primary,
                           child: const Icon(
                             Icons.camera_alt,
                             size: 18,
@@ -174,6 +206,15 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
                   ],
                 ),
               ),
+              if (user?.avatarUrl?.isNotEmpty == true)
+                TextButton.icon(
+                  key: const ValueKey('remove-profile-photo'),
+                  onPressed: _loading || _saving ? null : _removeAvatar,
+                  icon: const Icon(Icons.delete_outline),
+                  label: Text(
+                    isFa ? 'حذف عکس پروفایل' : 'Remove profile photo',
+                  ),
+                ),
               const SizedBox(height: 32),
               TextField(
                 controller: _nameCtrl,
