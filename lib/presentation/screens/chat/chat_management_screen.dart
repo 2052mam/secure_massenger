@@ -558,69 +558,105 @@ class _PermissionEditor extends StatefulWidget {
 class _PermissionEditorState extends State<_PermissionEditor> {
   late final Map<String, bool> _values = Map.of(widget.initial);
   bool _saving = false;
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(
-      title: Text(widget.title),
-      actions: [
-        TextButton(
-          onPressed: _saving
-              ? null
-              : () async {
-                  setState(() => _saving = true);
-                  try {
-                    await widget.onSave(_values);
-                    if (mounted) Navigator.pop(context);
-                  } catch (error) {
-                    if (mounted)
-                      ScaffoldMessenger.of(
-                        context,
-                      ).showSnackBar(SnackBar(content: Text('$error')));
-                  } finally {
-                    if (mounted) setState(() => _saving = false);
-                  }
-                },
-          child: Text(_t(context, 'Save', 'ذخیره')),
+  bool _allowPop = false;
+
+  bool get _hasChanges =>
+      _values.entries.any((entry) => widget.initial[entry.key] != entry.value);
+
+  Future<void> _saveAndClose() async {
+    if (_saving || _allowPop) return;
+    setState(() => _saving = true);
+    try {
+      // Take a snapshot: the request must not depend on later UI mutations.
+      await widget.onSave(Map<String, bool>.of(_values));
+      if (!mounted) return;
+      setState(() {
+        _saving = false;
+        _allowPop = true;
+      });
+      // PopScope must rebuild with canPop=true before the intentional pop.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && ModalRoute.of(context)?.isCurrent == true) {
+          Navigator.of(context).pop();
+        }
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => _saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            '${_t(context, 'Could not save permissions. Your changes are still here. Try again.', 'ذخیره دسترسی‌ها انجام نشد. تغییرات شما حفظ شده است؛ دوباره تلاش کنید.')}\n$error',
+          ),
         ),
-      ],
-    ),
-    body: SafeArea(
-      child: ListView(
-        children: [
-          if (_saving) const LinearProgressIndicator(),
-          for (final key in _values.keys)
-            SwitchListTile(
-              key: ValueKey('permission-$key'),
-              title: Text(
-                key == 'restrict_members' && widget.channel
-                    ? _t(context, 'Remove subscribers', 'حذف مشترکان')
-                    : (_permissionLabels[key] ?? [key, key])[_fa(context)
-                          ? 1
-                          : 0],
-              ),
-              value: _values[key]!,
-              onChanged: _saving || widget.locked.contains(key)
-                  ? null
-                  : (v) => setState(() => _values[key] = v),
-            ),
-          ListTile(
-            leading: const Icon(Icons.lock_outline),
-            title: Text(
-              _t(
-                context,
-                'Clear history for everyone: not allowed',
-                'پاک کردن تاریخچه برای همه: غیرمجاز',
-              ),
-            ),
-            subtitle: Text(
-              _t(
-                context,
-                'This right cannot be granted. Only the owner can delete the entire group or channel.',
-                'این دسترسی قابل واگذاری نیست. فقط مالک می‌تواند کل گروه یا کانال را حذف کند.',
-              ),
-            ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => PopScope<void>(
+    canPop: !_saving && (!_hasChanges || _allowPop),
+    onPopInvokedWithResult: (didPop, result) {
+      if (!didPop) _saveAndClose();
+    },
+    child: Scaffold(
+      appBar: AppBar(
+        title: Text(widget.title),
+        actions: [
+          TextButton(
+            onPressed: _saving || _allowPop ? null : _saveAndClose,
+            child: Text(_t(context, 'Save', 'ذخیره')),
           ),
         ],
+      ),
+      body: SafeArea(
+        child: ListView(
+          children: [
+            if (_saving) const LinearProgressIndicator(),
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                _t(
+                  context,
+                  'Changes are saved when you go back or tap Save.',
+                  'تغییرات هنگام بازگشت یا لمس ذخیره، ثبت می‌شوند.',
+                ),
+              ),
+            ),
+            for (final key in _values.keys)
+              SwitchListTile(
+                key: ValueKey('permission-$key'),
+                title: Text(
+                  key == 'restrict_members' && widget.channel
+                      ? _t(context, 'Remove subscribers', 'حذف مشترکان')
+                      : (_permissionLabels[key] ?? [key, key])[_fa(context)
+                            ? 1
+                            : 0],
+                ),
+                value: _values[key]!,
+                onChanged: _saving || _allowPop || widget.locked.contains(key)
+                    ? null
+                    : (v) => setState(() => _values[key] = v),
+              ),
+            ListTile(
+              leading: const Icon(Icons.lock_outline),
+              title: Text(
+                _t(
+                  context,
+                  'Clear history for everyone: not allowed',
+                  'پاک کردن تاریخچه برای همه: غیرمجاز',
+                ),
+              ),
+              subtitle: Text(
+                _t(
+                  context,
+                  'This right cannot be granted. Only the owner can delete the entire group or channel.',
+                  'این دسترسی قابل واگذاری نیست. فقط مالک می‌تواند کل گروه یا کانال را حذف کند.',
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     ),
   );

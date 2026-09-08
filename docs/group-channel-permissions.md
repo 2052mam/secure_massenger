@@ -261,3 +261,31 @@ an active workflow. A repository administrator can enable the templates separate
    time and exact last seen; test midnight and older messages in English/Persian.
 7. Recheck 2FA, switching accounts, private/support/saved chats, signed invitations,
    reply navigation and native view-once/photo/video/voice playback.
+
+## Follow-up: preserve permission changes on Back
+
+The permission editor previously persisted only through its explicit **Save**
+button; toolbar/system Back discarded the local toggle values. The editor now
+saves pending changes before allowing Back navigation, for both group defaults
+and individual administrator rights. It waits for the server response, blocks
+duplicate submissions while saving, and keeps the editor and selected values
+open with an error if saving fails. The existing Save button still works.
+Unchanged/reverted settings leave without a write; merely opening and backing out
+of the administrator promotion editor does not promote the member.
+
+This is a **Flutter-client-only fix**. Rebuild/deploy the client; no additional
+backend change or schema upgrade is required beyond the original release above.
+It handles navigation away from the editor, not forced app/process termination.
+
+Validation: all **126 backend tests still pass**, and all **80 Dart files parse**.
+Eight additional widget regression cases cover toolbar/system Back and reopening,
+a pending save with repeated exits, failure/retry, unchanged/reverted values,
+explicit default-rights promotion, and group/channel administrator persistence.
+The test API now stores permission changes rather than always returning defaults.
+Flutter widget tests remain unexecuted in this workspace because the SDK is not
+installed.
+
+Manual check: disable **Send messages**, use Back **without tapping Save**, reopen
+Permissions and confirm it remains disabled. Check that a normal member cannot
+send messages. Repeat offline: Back should retain the editor and changes with an
+error; reconnect and retry Save or Back, then reopen to verify persistence.
