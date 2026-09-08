@@ -29,7 +29,8 @@ def test_delete_for_all_arrives_on_next_poll_even_after_read(
     for user in ('alice', 'bob'):
         result = sync(client, auth, [mid], user=user)
         assert result.status_code == 200
-        assert result.json == {'deleted_ids': [mid], 'statuses': {}, 'viewed_at': {}}
+        assert result.json == {'deleted_ids': [mid], 'statuses': {}, 'viewed_at': {},
+                               'pinned_ids': []}
         # Missing a poll cannot lose the deletion event.
         assert sync(client, auth, [mid], user=user).json == result.json
     with app.app_context():
@@ -82,7 +83,8 @@ def test_sync_keeps_view_once_and_read_receipts_but_not_deleted_media(app, clien
     assert result['viewed_at'] == {mid: '2026-09-07T12:00:00Z'}
     assert sync(client, auth, [mid]).json['statuses'] == {}
     client.post(f'/api/v1/messages/{mid}/delete', headers=auth(), json={'for_all': True})
-    assert sync(client, auth, [mid]).json == {'deleted_ids': [mid], 'statuses': {}, 'viewed_at': {}}
+    assert sync(client, auth, [mid]).json == {'deleted_ids': [mid], 'statuses': {},
+                                              'viewed_at': {}, 'pinned_ids': []}
 
 
 @pytest.mark.parametrize('ids', [None, 'original', {}, [None], [12], [['id']], [''], ['x' * 37], ['id'] * 101])
@@ -97,7 +99,7 @@ def test_sync_never_leaks_unrelated_or_left_chat_ids(app, client, auth, make_mes
     assert sync(client, auth, [mid], user='carol').status_code == 403
     # The legacy, unscoped endpoint must enforce membership too.
     result = client.post('/api/v1/messages/statuses', headers=auth('carol'), json={'message_ids': [mid]}).json
-    assert result == {'deleted_ids': [], 'statuses': {}, 'viewed_at': {}}
+    assert result == {'deleted_ids': [], 'statuses': {}, 'viewed_at': {}, 'pinned_ids': []}
     with app.app_context():
         ChatMember.query.filter_by(chat_id='chat', user_id='bob').first().is_deleted = True
         db.session.commit()

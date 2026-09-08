@@ -3,7 +3,7 @@ from flask import request, jsonify
 
 BOOLEAN_FIELDS = {'for_all', 'is_view_once', 'is_public', 'is_muted',
                   'show_last_seen', 'show_profile_photo', 'show_bio',
-                  'allow_group_adds', 'is_online'}
+                  'allow_group_adds', 'is_online', 'is_pinned', 'is_archived'}
 
 
 def validate_object_body():

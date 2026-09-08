@@ -48,6 +48,12 @@ class ChatMember(db.Model):
     # Notification & settings
     is_muted = db.Column(db.Boolean, default=False)
     is_pinned = db.Column(db.Boolean, default=False)
+    # Newest pin first, exactly like Telegram's pinned block.
+    pinned_at = db.Column(db.DateTime, nullable=True)
+    # Archived chats leave the main list and live behind the optional PIN.
+    is_archived = db.Column(db.Boolean, nullable=False, default=False,
+                            server_default=db.false())
+    archived_at = db.Column(db.DateTime, nullable=True)
     custom_background = db.Column(db.String(500), nullable=True)
     
     joined_at = db.Column(db.DateTime, default=datetime.utcnow)

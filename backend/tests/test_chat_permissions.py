@@ -91,13 +91,17 @@ def test_group_delete_own_and_admin_moderation_are_distinct(client, auth, group)
 
 @pytest.mark.parametrize('kind', ['group', 'channel'])
 @pytest.mark.parametrize('user', ['alice', 'bob'])
-def test_shared_history_clear_never_delegated(app, client, auth, group, kind, user):
+def test_shared_history_clear_is_owner_only(app, client, auth, group, kind, user):
+    """The owner has full control and may wipe both sides; admins never inherit it."""
     with app.app_context():
         db.session.get(Chat, group).chat_type = kind
         ChatMember.query.filter_by(chat_id=group, user_id='bob').one().role = 'admin'
         db.session.commit()
-    assert post(client, auth, 'messages/chat/group/clear', {'for_all': True}, user).status_code == 403
+    owner = user == 'alice'
+    assert post(client, auth, 'messages/chat/group/clear', {'for_all': True}, user).status_code == (200 if owner else 403)
     assert post(client, auth, 'messages/chat/group/clear', {'for_all': False}, user).status_code == 200
+    assert client.get(f'/api/v1/chats/group/info', headers=auth(user)).json[
+        'capabilities']['clear_history_for_all'] is owner
     if user == 'bob':
         assert post(client, auth, 'chats/group/delete', {'for_all': True}, user).status_code == 403
 
@@ -268,19 +272,30 @@ def test_mute_is_per_member(client, auth, group):
 def test_additive_schema_upgrade_preserves_old_rows_and_is_repeatable(app):
     with app.app_context():
         db.session.remove()
-        # Simulate an installation before these columns existed.
+        # Simulate an installation before these columns/tables existed.
         with db.engine.begin() as conn:
             conn.execute(text('ALTER TABLE users DROP COLUMN allow_group_adds'))
+            conn.execute(text('ALTER TABLE users DROP COLUMN archive_pin_hash'))
             conn.execute(text('ALTER TABLE chats DROP COLUMN permissions'))
             conn.execute(text('ALTER TABLE chat_members DROP COLUMN permissions'))
+            conn.execute(text('ALTER TABLE chat_members DROP COLUMN is_archived'))
+            conn.execute(text('ALTER TABLE chat_members DROP COLUMN pinned_at'))
+            conn.execute(text('DROP TABLE chat_folder_items'))
+            conn.execute(text('DROP TABLE chat_folders'))
+            conn.execute(text('DROP TABLE user_photos'))
+            conn.execute(text('DROP TABLE search_history'))
         upgrade_schema()
         result = app.test_cli_runner().invoke(args=['upgrade-chat-schema'])
         assert result.exit_code == 0, result.output
         assert 'up to date' in result.output
         assert db.session.get(User, 'alice').allow_group_adds is True
+        assert db.session.get(User, 'alice').has_archive_pin is False
         assert Chat.query.count() == 2
         assert ChatMember.query.count() == 4
+        assert ChatMember.query.filter_by(is_archived=False).count() == 4
         assert 'permissions' in {c['name'] for c in inspect(db.engine).get_columns('chats')}
+        for table in ('chat_folders', 'chat_folder_items', 'user_photos', 'search_history'):
+            assert inspect(db.engine).has_table(table)
 
 
 def test_public_channel_requires_username_and_private_creation_works(client, auth):

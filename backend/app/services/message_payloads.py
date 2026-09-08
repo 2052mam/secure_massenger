@@ -4,7 +4,7 @@ from app.services.timestamps import utc_iso
 
 from app import db
 from app.models.chat import Chat, ChatMember
-from app.models.message import Message, MessageHide, MessageStatus
+from app.models.message import Message, MessageHide, MessageStatus, PinnedMessage
 from app.models.user import User
 
 
@@ -53,6 +53,11 @@ def serialize_messages(messages, user_id, status_override=None):
             statuses.setdefault(status.message_id, []).append(status)
 
     chats = {c.id: c for c in Chat.query.filter(Chat.id.in_({m.chat_id for m in messages})).all()}
+    # One batched lookup keeps the pinned flag free of N+1 queries.
+    pinned_ids = {row.message_id for row in PinnedMessage.query.filter(
+        PinnedMessage.message_id.in_([m.id for m in messages]),
+        PinnedMessage.is_deleted.is_(False),
+    ).all()}
     result = []
     for msg in messages:
         sender = senders.get(msg.sender_id)
@@ -110,6 +115,7 @@ def serialize_messages(messages, user_id, status_override=None):
             'reply_to': reply,
             'forwarded_from_id': msg.forwarded_from_id,
             'is_view_once': msg.is_view_once,
+            'is_pinned': msg.id in pinned_ids,
             'viewed_at': utc_iso(msg.viewed_at) if msg.viewed_at else None,
             'is_edited': msg.is_edited,
             'created_at': utc_iso(msg.created_at),

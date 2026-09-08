@@ -6,8 +6,10 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
 from app.models.user import User, BlockList
 from app.models.chat import Chat, ChatMember, ChatBackground
+from app.models.folder import ChatFolder, ChatFolderItem
 from app.models.message import Message, MessageStatus, PinnedMessage
 from app.models.audit import AuditLog
+from app.services.archive_lock import archive_unlocked
 from app.services.message_payloads import visible_messages
 from datetime import datetime
 import uuid
@@ -20,18 +22,42 @@ chats_bp = Blueprint('chats', __name__)
 
 chats_bp.before_request(validate_object_body)
 
+MAX_FOLDERS = 20
+MAX_FOLDER_CHATS = 200
+
+
 def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr)
+
+
+def _truthy(value):
+    return (value or '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 @chats_bp.route('/', methods=['GET'])
 @jwt_required()
 def list_chats():
-    """لیست چت‌های کاربر با آخرین پیام (برای Polling)"""
+    """لیست چت‌های کاربر با آخرین پیام (برای Polling)
+
+    ``?archived=1`` returns the archived folder instead of the main list. When
+    an archive PIN is configured the caller must also send a valid
+    ``X-Archive-Token`` obtained from ``/users/me/archive-pin/verify``.
+    """
     user_id = get_jwt_identity()
+    user = User.query.filter_by(id=user_id, is_deleted=False).first()
+    if not user:
+        return jsonify({'error': 'کاربر یافت نشد'}), 404
+    want_archived = _truthy(request.args.get('archived'))
+    unlocked = archive_unlocked(user)
+    if want_archived and not unlocked:
+        return jsonify({'error': 'آرشیو قفل است', 'archive_locked': True}), 423
+
     memberships = ChatMember.query.filter_by(user_id=user_id, is_deleted=False).all()
 
     result = []
+    archived_total = 0
+    archived_unread = 0
+    archived_chats_unread = 0
     for m in memberships:
         chat = Chat.query.filter_by(id=m.chat_id, is_deleted=False).first()
         if not chat:
@@ -45,6 +71,14 @@ def list_chats():
             if read_msg and read_msg.chat_id == chat.id:
                 unread_query = unread_query.filter(Message.created_at > read_msg.created_at)
         unread = unread_query.count()
+
+        if m.is_archived:
+            archived_total += 1
+            archived_unread += unread
+            if unread:
+                archived_chats_unread += 1
+        if bool(m.is_archived) != want_archived:
+            continue
 
         # برای چت خصوصی طرف مقابل را پیدا کن
         other_user = None
@@ -68,7 +102,9 @@ def list_chats():
             'title': title,
             'username': chat.username,
             'avatar_url': avatar,
-            'is_pinned': m.is_pinned,
+            'is_pinned': bool(m.is_pinned),
+            'pinned_at': utc_iso(m.pinned_at) if m.pinned_at else None,
+            'is_archived': bool(m.is_archived),
             'is_muted': m.is_muted,
             'unread_count': unread,
             'last_message': {
@@ -82,9 +118,179 @@ def list_chats():
             'other_user': other_user.to_dict() if other_user else None,
         })
 
-    # مرتب‌سازی: پین‌شده‌ها اول، بعد بر اساس updated_at
-    result.sort(key=lambda x: (x['is_pinned'], x['last_message']['created_at'] if x['last_message'] else x['updated_at']), reverse=True)
-    return jsonify({'chats': result}), 200
+    # مرتب‌سازی: پین‌شده‌ها اول (تازه‌ترین پین بالاتر)، بعد بر اساس آخرین پیام
+    def sort_key(item):
+        activity = (item['last_message']['created_at'] if item['last_message']
+                    else item['updated_at']) or ''
+        return (1 if item['is_pinned'] else 0, item['pinned_at'] or '', activity)
+
+    result.sort(key=sort_key, reverse=True)
+    return jsonify({
+        'chats': result,
+        'archived': {
+            'total': archived_total,
+            'unread': archived_unread,
+            'chats_with_unread': archived_chats_unread,
+        },
+        'archive_locked': bool(user.has_archive_pin) and not unlocked,
+        'has_archive_pin': user.has_archive_pin,
+    }), 200
+
+
+@chats_bp.route('/<chat_id>/archive', methods=['POST'])
+@jwt_required()
+def archive_chat(chat_id):
+    """Move a chat in or out of the archived folder (per user, like Telegram)."""
+    user_id = get_jwt_identity()
+    member = ChatMember.query.join(Chat).filter(
+        ChatMember.chat_id == chat_id, ChatMember.user_id == user_id,
+        ChatMember.is_deleted.is_(False), Chat.is_deleted.is_(False)).first()
+    if not member:
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    data = request.get_json() or {}
+    value = data.get('is_archived', True)
+    if type(value) is not bool:
+        return jsonify({'error': 'is_archived must be boolean'}), 400
+    member.is_archived = value
+    member.archived_at = datetime.utcnow() if value else None
+    if value:
+        # Telegram never keeps a chat pinned inside the main list once archived.
+        member.is_pinned = False
+        member.pinned_at = None
+    db.session.add(AuditLog(
+        actor_id=user_id, action='archive_chat' if value else 'unarchive_chat',
+        entity_type='chat', entity_id=chat_id, ip_address=get_client_ip()))
+    db.session.commit()
+    return jsonify({'ok': True, 'is_archived': member.is_archived}), 200
+
+
+# ----- Chat folders --------------------------------------------------------
+
+def _folder_payload(folder):
+    chat_ids = [item.chat_id for item in ChatFolderItem.query.filter_by(
+        folder_id=folder.id, is_deleted=False).all()]
+    return folder.to_dict(chat_ids=chat_ids)
+
+
+def _folder_body():
+    data = request.get_json() or {}
+    name = (data.get('name') or '').strip()
+    if not name or len(name) > 60:
+        raise ValueError('نام پوشه باید بین ۱ تا ۶۰ کاراکتر باشد')
+    flags = {}
+    for key in ('include_private', 'include_groups', 'include_channels', 'include_archived'):
+        value = data.get(key, False)
+        if type(value) is not bool:
+            raise ValueError(f'{key} must be boolean')
+        flags[key] = value
+    chat_ids = data.get('chat_ids', [])
+    if (not isinstance(chat_ids, list) or len(chat_ids) > MAX_FOLDER_CHATS
+            or any(not isinstance(cid, str) or not cid for cid in chat_ids)):
+        raise ValueError(f'حداکثر {MAX_FOLDER_CHATS} چت در هر پوشه مجاز است')
+    return name, flags, list(dict.fromkeys(chat_ids))
+
+
+def _sync_folder_items(folder, user_id, chat_ids):
+    allowed = {m.chat_id for m in ChatMember.query.filter_by(
+        user_id=user_id, is_deleted=False).all()}
+    keep = [cid for cid in chat_ids if cid in allowed]
+    existing = {item.chat_id: item for item in ChatFolderItem.query.filter_by(
+        folder_id=folder.id).all()}
+    for chat_id, item in existing.items():
+        should_keep = chat_id in keep
+        if item.is_deleted == (not should_keep):
+            continue
+        item.is_deleted = not should_keep
+        item.deleted_at = None if should_keep else datetime.utcnow()
+    for chat_id in keep:
+        if chat_id not in existing:
+            db.session.add(ChatFolderItem(folder_id=folder.id, chat_id=chat_id))
+    return keep
+
+
+@chats_bp.route('/folders', methods=['GET'])
+@jwt_required()
+def list_folders():
+    user_id = get_jwt_identity()
+    folders = ChatFolder.query.filter_by(user_id=user_id, is_deleted=False).order_by(
+        ChatFolder.position.asc(), ChatFolder.created_at.asc()).all()
+    return jsonify({'folders': [_folder_payload(folder) for folder in folders]}), 200
+
+
+@chats_bp.route('/folders', methods=['POST'])
+@jwt_required()
+def create_folder():
+    user_id = get_jwt_identity()
+    try:
+        name, flags, chat_ids = _folder_body()
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    count = ChatFolder.query.filter_by(user_id=user_id, is_deleted=False).count()
+    if count >= MAX_FOLDERS:
+        return jsonify({'error': f'حداکثر {MAX_FOLDERS} پوشه مجاز است'}), 400
+    folder = ChatFolder(user_id=user_id, name=name, position=count, **flags)
+    db.session.add(folder)
+    db.session.flush()
+    _sync_folder_items(folder, user_id, chat_ids)
+    db.session.add(AuditLog(actor_id=user_id, action='create_chat_folder',
+                            entity_type='chat_folder', entity_id=folder.id))
+    db.session.commit()
+    return jsonify({'folder': _folder_payload(folder)}), 201
+
+
+@chats_bp.route('/folders/<folder_id>', methods=['POST'])
+@jwt_required()
+def update_folder(folder_id):
+    user_id = get_jwt_identity()
+    folder = ChatFolder.query.filter_by(id=folder_id, user_id=user_id, is_deleted=False).first()
+    if not folder:
+        return jsonify({'error': 'پوشه یافت نشد'}), 404
+    try:
+        name, flags, chat_ids = _folder_body()
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    folder.name = name
+    for key, value in flags.items():
+        setattr(folder, key, value)
+    _sync_folder_items(folder, user_id, chat_ids)
+    db.session.add(AuditLog(actor_id=user_id, action='update_chat_folder',
+                            entity_type='chat_folder', entity_id=folder.id))
+    db.session.commit()
+    return jsonify({'folder': _folder_payload(folder)}), 200
+
+
+@chats_bp.route('/folders/<folder_id>/delete', methods=['POST'])
+@jwt_required()
+def delete_folder(folder_id):
+    user_id = get_jwt_identity()
+    folder = ChatFolder.query.filter_by(id=folder_id, user_id=user_id, is_deleted=False).first()
+    if not folder:
+        return jsonify({'error': 'پوشه یافت نشد'}), 404
+    folder.is_deleted = True
+    folder.deleted_at = datetime.utcnow()
+    db.session.add(AuditLog(actor_id=user_id, action='delete_chat_folder',
+                            entity_type='chat_folder', entity_id=folder.id))
+    db.session.commit()
+    return jsonify({'ok': True}), 200
+
+
+@chats_bp.route('/folders/reorder', methods=['POST'])
+@jwt_required()
+def reorder_folders():
+    user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    ids = data.get('folder_ids')
+    if not isinstance(ids, list) or any(not isinstance(fid, str) for fid in ids):
+        return jsonify({'error': 'folder_ids نامعتبر است'}), 400
+    folders = {f.id: f for f in ChatFolder.query.filter_by(
+        user_id=user_id, is_deleted=False).all()}
+    for position, folder_id in enumerate(dict.fromkeys(ids)):
+        folder = folders.get(folder_id)
+        if folder:
+            folder.position = position
+    db.session.commit()
+    return jsonify({'ok': True}), 200
+
 
 
 @chats_bp.route('/private', methods=['POST'])
@@ -248,13 +454,19 @@ def get_members(chat_id):
 @chats_bp.route('/<chat_id>/pin', methods=['POST'])
 @jwt_required()
 def pin_chat(chat_id):
+    """Pin a chat to the top of the list. Several chats can be pinned at once."""
     user_id = get_jwt_identity()
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
     if not member:
         return jsonify({'error': 'دسترسی ندارید'}), 403
-    member.is_pinned = True
+    data = request.get_json(silent=True) or {}
+    value = data.get('is_pinned', True)
+    if type(value) is not bool:
+        return jsonify({'error': 'is_pinned must be boolean'}), 400
+    member.is_pinned = value
+    member.pinned_at = datetime.utcnow() if value else None
     db.session.commit()
-    return jsonify({'ok': True}), 200
+    return jsonify({'ok': True, 'is_pinned': member.is_pinned}), 200
 
 
 @chats_bp.route('/<chat_id>/unpin', methods=['POST'])
@@ -265,8 +477,9 @@ def unpin_chat(chat_id):
     if not member:
         return jsonify({'error': 'دسترسی ندارید'}), 403
     member.is_pinned = False
+    member.pinned_at = None
     db.session.commit()
-    return jsonify({'ok': True}), 200
+    return jsonify({'ok': True, 'is_pinned': False}), 200
 
 
 @chats_bp.route('/<chat_id>/background', methods=['POST'])

@@ -21,6 +21,14 @@ messages_bp = Blueprint('messages', __name__)
 
 messages_bp.before_request(validate_object_body)
 
+# Telegram keeps a bounded pinned list per chat; the bar stays readable.
+MAX_PINNED_MESSAGES = 100
+
+
+def _pinned_count(chat_id):
+    return PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).count()
+
+
 def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr)
 
@@ -236,6 +244,10 @@ def delete_message(message_id):
         msg.is_deleted = True
         msg.deleted_at = datetime.utcnow()
         msg.deleted_by = user_id
+        # A deleted message must not stay in the pinned bar for anyone.
+        PinnedMessage.query.filter_by(message_id=message_id, is_deleted=False).update({
+            'is_deleted': True, 'deleted_at': datetime.utcnow(),
+        }, synchronize_session=False)
     else:
         # حذف یک‌طرفه واقعی با MessageHide
         existing_hide = MessageHide.query.filter_by(message_id=message_id, user_id=user_id).first()
@@ -316,21 +328,94 @@ def forward_message(message_id):
 @messages_bp.route('/<message_id>/pin', methods=['POST'])
 @jwt_required()
 def pin_message(message_id):
+    """Pin a message. Several messages can stay pinned at once, like Telegram."""
     user_id = get_jwt_identity()
-    msg = Message.query.filter_by(id=message_id, is_deleted=False).first()
+    msg = visible_messages(user_id).filter_by(id=message_id).first()
     if not msg or not user_in_chat(user_id, msg.chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
     if not can(db.session.get(Chat, msg.chat_id), user_id, 'pin_messages'):
         return jsonify({'error': 'Pinning messages is not permitted'}), 403
 
-    existing = PinnedMessage.query.filter_by(chat_id=msg.chat_id, message_id=message_id, is_deleted=False).first()
-    if existing:
-        return jsonify({'message': 'قبلاً پین شده'}), 200
+    existing = PinnedMessage.query.filter_by(chat_id=msg.chat_id, message_id=message_id).first()
+    if existing and not existing.is_deleted:
+        return jsonify({'ok': True, 'message': 'قبلاً پین شده',
+                        'pinned_count': _pinned_count(msg.chat_id)}), 200
 
-    db.session.add(PinnedMessage(chat_id=msg.chat_id, message_id=message_id, pinned_by=user_id))
+    if existing:
+        # Re-pin the same message by reviving its soft deleted row.
+        existing.is_deleted = False
+        existing.deleted_at = None
+        existing.pinned_by = user_id
+        existing.pinned_at = datetime.utcnow()
+    else:
+        if _pinned_count(msg.chat_id) >= MAX_PINNED_MESSAGES:
+            return jsonify({'error': f'حداکثر {MAX_PINNED_MESSAGES} پیام می‌تواند پین باشد'}), 400
+        db.session.add(PinnedMessage(chat_id=msg.chat_id, message_id=message_id, pinned_by=user_id))
+    db.session.add(AuditLog(actor_id=user_id, action='pin_message', entity_type='message',
+                            entity_id=message_id, ip_address=get_client_ip()))
     db.session.commit()
-    return jsonify({'ok': True}), 200
+    return jsonify({'ok': True, 'pinned_count': _pinned_count(msg.chat_id)}), 200
+
+
+@messages_bp.route('/<message_id>/unpin', methods=['POST'])
+@jwt_required()
+def unpin_message(message_id):
+    user_id = get_jwt_identity()
+    msg = Message.query.filter_by(id=message_id).first()
+    if not msg or not user_in_chat(user_id, msg.chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    if not can(db.session.get(Chat, msg.chat_id), user_id, 'pin_messages'):
+        return jsonify({'error': 'Pinning messages is not permitted'}), 403
+
+    pin = PinnedMessage.query.filter_by(chat_id=msg.chat_id, message_id=message_id,
+                                        is_deleted=False).first()
+    if pin:
+        pin.is_deleted = True
+        pin.deleted_at = datetime.utcnow()
+        db.session.add(AuditLog(actor_id=user_id, action='unpin_message', entity_type='message',
+                                entity_id=message_id, ip_address=get_client_ip()))
+        db.session.commit()
+    return jsonify({'ok': True, 'pinned_count': _pinned_count(msg.chat_id)}), 200
+
+
+@messages_bp.route('/chat/<chat_id>/pinned', methods=['GET'])
+@jwt_required()
+def list_pinned_messages(chat_id):
+    """Newest pin first, matching the pinned bar order used by Telegram."""
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    pins = PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).order_by(
+        PinnedMessage.pinned_at.desc()).all()
+    if not pins:
+        return jsonify({'messages': [], 'can_pin': can(db.session.get(Chat, chat_id), user_id, 'pin_messages')}), 200
+    order = {pin.message_id: index for index, pin in enumerate(pins)}
+    messages = visible_messages(user_id).filter(
+        Message.chat_id == chat_id, Message.id.in_(list(order))
+    ).all()
+    messages.sort(key=lambda m: order.get(m.id, len(order)))
+    return jsonify({
+        'messages': serialize_messages(messages, user_id),
+        'can_pin': can(db.session.get(Chat, chat_id), user_id, 'pin_messages'),
+    }), 200
+
+
+@messages_bp.route('/chat/<chat_id>/unpin-all', methods=['POST'])
+@jwt_required()
+def unpin_all_messages(chat_id):
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    if not can(db.session.get(Chat, chat_id), user_id, 'pin_messages'):
+        return jsonify({'error': 'Pinning messages is not permitted'}), 403
+    PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).update({
+        'is_deleted': True, 'deleted_at': datetime.utcnow(),
+    }, synchronize_session=False)
+    db.session.add(AuditLog(actor_id=user_id, action='unpin_all_messages', entity_type='chat',
+                            entity_id=chat_id, ip_address=get_client_ip()))
+    db.session.commit()
+    return jsonify({'ok': True, 'pinned_count': 0}), 200
 
 
 @messages_bp.route('/poll', methods=['GET'])
@@ -404,20 +489,23 @@ def clear_chat_history(chat_id):
 
     if for_all:
         chat = db.session.get(Chat, chat_id)
-        if chat.chat_type in ('group', 'channel'):
-            return jsonify({'error': 'Shared group/channel history cannot be cleared'}), 403
-        member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-        chat = db.session.get(Chat, chat_id)
-        if chat and chat.chat_type == 'private':
-            pass  # در خصوصی هر طرف می‌تواند برای همه پاک کند (مثل تلگرام با محدودیت)
-        elif not member or member.role not in ('owner', 'admin'):
-            return jsonify({'error': 'مجوز حذف برای همه را ندارید'}), 403
+        if not chat:
+            return jsonify({'error': 'چت یافت نشد'}), 404
+        # Private/saved/support: either side may wipe the thread. Group and
+        # channel: the OWNER always may (full control), delegated admins never.
+        if not can(chat, user_id, 'clear_history_for_all'):
+            return jsonify({'error': 'Clearing the shared history is not permitted'}), 403
 
         Message.query.filter_by(chat_id=chat_id).update({
             'is_deleted_for_all': True,
             'is_deleted': True,
             'deleted_at': datetime.utcnow(),
             'deleted_by': user_id,
+        }, synchronize_session=False)
+        # A wiped history keeps no pins pointing at unreachable messages.
+        PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).update({
+            'is_deleted': True,
+            'deleted_at': datetime.utcnow(),
         }, synchronize_session=False)
     else:
         # یک‌طرفه: فقط برای این کاربر با MessageHide
@@ -620,4 +708,9 @@ def get_message_statuses():
         'viewed_at': {msg.id: utc_iso(msg.viewed_at) if msg.viewed_at else None
                       for msg in visible if msg.is_view_once},
         'deleted_ids': sorted(deleted_ids),
+        # Pin state is state, not a message: reconcile it with the same poll.
+        'pinned_ids': sorted({row.message_id for row in PinnedMessage.query.filter(
+            PinnedMessage.message_id.in_([msg.id for msg in visible]),
+            PinnedMessage.is_deleted.is_(False),
+        ).all()}),
     }), 200

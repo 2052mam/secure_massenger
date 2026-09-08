@@ -51,7 +51,10 @@ def capabilities(chat, member):
     result['send_view_once_photos'] &= result['send_photos']
     result['manage_permissions'] = member.role == 'owner' or (
         chat.chat_type == 'group' and member.role == 'admin' and result['restrict_members'])
-    result['clear_history_for_all'] = chat.chat_type not in ('group', 'channel')
+    # The owner has full control over their own group/channel and may wipe the
+    # shared history on both sides. Delegated admins never inherit this right.
+    result['clear_history_for_all'] = (chat.chat_type not in ('group', 'channel')
+                                       or member.role == 'owner')
     return result
 
 
