@@ -88,6 +88,13 @@ def get_media(media_id):
     if Message.query.filter_by(media_id=media_id, is_view_once=True).first():
         return jsonify({'error': 'عکس یک‌بارمصرف فقط از داخل پیام باز می‌شود'}), 403
     upload_folder = os.path.abspath(current_app.config['UPLOAD_FOLDER'])
+    download = request.args.get('download') in ('1', 'true', 'yes')
     # Conditional responses explicitly preserve Range / Content-Range support
     # required by native voice/video players when seeking.
-    return send_from_directory(upload_folder, media.stored_name, conditional=True)
+    return send_from_directory(
+        upload_folder,
+        media.stored_name,
+        conditional=not download,
+        as_attachment=download,
+        download_name=media.original_name if download else None,
+    )

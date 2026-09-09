@@ -1,3 +1,5 @@
+import 'package:file_picker/file_picker.dart';
+import '../../widgets/chat/scheduled_messages_sheet.dart';
 import '../../../core/utils/api_datetime.dart';
 import 'chat_management_screen.dart';
 import 'dart:async';
@@ -107,6 +109,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   int _pinnedIndex = 0;
   bool _canPinMessages = false;
   bool _loadingPinned = false;
+  bool _isSpoiler = false;
+  int _slowModeDelay = 0;
+  int _slowModeRemaining = 0;
+  Timer? _slowModeTimer;
 
   bool _can(String right) {
     if (_chatUnavailable) return false;
@@ -195,6 +201,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           res['capabilities'] as Map? ?? {},
         );
         _isMuted = res['is_muted'] as bool? ?? false;
+        _slowModeDelay = res['slow_mode_delay'] as int? ?? 0;
         _membersCount = res['members_count'] as int? ?? 0;
         _loadedChatType = res['chat_type'] as String?;
         _chatTitle = res['title'] as String?;
@@ -241,6 +248,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     _highlightTimer?.cancel();
+    _slowModeTimer?.cancel();
     unawaited(_playback.pause());
     _textCtrl.dispose();
     _scrollCtrl.dispose();
@@ -688,39 +696,209 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         : message.copyWith(replyTo: reply.asReplyPreview);
   }
 
-  Future<void> _sendText() async {
+  void _startSlowModeTimer(int seconds) {
+    _slowModeTimer?.cancel();
+    setState(() => _slowModeRemaining = seconds);
+    _slowModeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      if (_slowModeRemaining <= 1) {
+        timer.cancel();
+        setState(() => _slowModeRemaining = 0);
+      } else {
+        setState(() => _slowModeRemaining--);
+      }
+    });
+  }
+
+  void _handleSlowModeError(String message) {
+    final match = RegExp(r'(\d+)').firstMatch(message);
+    final secs = match != null ? int.tryParse(match.group(1)!) ?? _slowModeDelay : _slowModeDelay;
+    _startSlowModeTimer(secs > 0 ? secs : 10);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Future<void> _sendText({DateTime? scheduledAt}) async {
     final text = _textCtrl.text.trim();
     if (text.isEmpty || _sending || !_can('send_messages')) return;
+    if (_slowModeRemaining > 0 && (_myRole != 'owner' && _myRole != 'admin')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('لطفاً $_slowModeRemaining ثانیه دیگر برای ارسال پیام صبر کنید.')),
+      );
+      return;
+    }
     final reply = _replyTo;
+    final sendSpoiler = _isSpoiler;
     setState(() => _sending = true);
     try {
       final body = <String, dynamic>{
         'chat_id': widget.chatId,
         'content': text,
         'message_type': 'text',
+        'is_spoiler': sendSpoiler,
       };
       if (reply != null) body['reply_to_id'] = reply.id;
+      if (scheduledAt != null) {
+        body['scheduled_at'] = scheduledAt.toIso8601String();
+      }
       final res = await _api.post('/messages/', body);
       if (!mounted) return;
+      if (res['is_scheduled'] == true) {
+        setState(() {
+          _textCtrl.clear();
+          _replyTo = null;
+          _isSpoiler = false;
+          _sending = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('پیام زمان‌بندی شد.')),
+        );
+        return;
+      }
       final msg = _sentMessage(res, reply);
       setState(() {
         _mergeMessages([msg]);
         _textCtrl.clear();
         _replyTo = null;
+        _isSpoiler = false;
         _sending = false;
       });
+      if (_slowModeDelay > 0 && (_myRole != 'owner' && _myRole != 'admin')) {
+        _startSlowModeTimer(_slowModeDelay);
+      }
       if (_historyMode) await _loadMessages();
       if (!mounted) return;
       _scrollToBottom();
       ref.read(chatListProvider.notifier).refresh();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _sending = false);
+      if (e.statusCode == 429) {
+        _handleSlowModeError(e.message);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() => _sending = false);
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(e.toString())));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(e.toString())));
+    }
+  }
+
+  Future<void> _scheduleMessage() async {
+    final text = _textCtrl.text.trim();
+    if (text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ابتدا متن پیام را وارد کنید')),
+      );
+      return;
+    }
+    final now = DateTime.now();
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: now.add(const Duration(minutes: 5)),
+      firstDate: now,
+      lastDate: now.add(const Duration(days: 365)),
+    );
+    if (pickedDate == null || !mounted) return;
+
+    final pickedTime = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(now.add(const Duration(minutes: 10))),
+    );
+    if (pickedTime == null || !mounted) return;
+
+    final scheduledDateTime = DateTime(
+      pickedDate.year,
+      pickedDate.month,
+      pickedDate.day,
+      pickedTime.hour,
+      pickedTime.minute,
+    );
+
+    if (scheduledDateTime.isBefore(DateTime.now().add(const Duration(seconds: 30)))) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('زمان انتخاب‌شده باید در آینده باشد')),
+      );
+      return;
+    }
+
+    _sendText(scheduledAt: scheduledDateTime);
+  }
+
+  void _openScheduledSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => ScheduledMessagesSheet(
+        chatId: widget.chatId,
+        api: _api,
+      ),
+    );
+  }
+
+  Future<void> _pickAndSendFile() async {
+    if (_sending || !_can('send_files')) return;
+    final result = await FilePicker.platform.pickFiles();
+    if (result == null || result.files.single.path == null || !mounted) return;
+
+    final file = File(result.files.single.path!);
+    final fileName = result.files.single.name;
+    final reply = _replyTo;
+
+    bool sendSpoiler = _isSpoiler;
+    setState(() => _sending = true);
+    try {
+      final upload = await _api.uploadFile('/media/upload', file);
+      final mediaId = upload['id'] as String;
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'file',
+        'media_id': mediaId,
+        'content': fileName,
+        'is_spoiler': sendSpoiler,
+      };
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({
+        ...res,
+        'media_id': mediaId,
+        'media_url': '/api/v1/media/$mediaId',
+        'message_type': 'file',
+        'original_name': fileName,
+        'is_spoiler': sendSpoiler,
+      }, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _isSpoiler = false;
+        _sending = false;
+      });
+      if (_slowModeDelay > 0 && (_myRole != 'owner' && _myRole != 'admin')) {
+        _startSlowModeTimer(_slowModeDelay);
       }
+      if (_historyMode) await _loadMessages();
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _sending = false);
+      if (e.statusCode == 429) {
+        _handleSlowModeError(e.message);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _sending = false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -1136,37 +1314,57 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   void _showAttachMenu() {
     showModalBottomSheet(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            if (_can('send_photos'))
-              ListTile(
-                leading: const Icon(Icons.photo_library),
-                title: const Text('عکس از گالری'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _pickAndSendMedia(ImageSource.gallery);
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setSheetState) => SafeArea(
+          child: Wrap(
+            children: [
+              if (_can('send_photos'))
+                ListTile(
+                  leading: const Icon(Icons.photo_library),
+                  title: const Text('عکس از گالری'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _pickAndSendMedia(ImageSource.gallery);
+                  },
+                ),
+              if (_can('send_photos'))
+                ListTile(
+                  leading: const Icon(Icons.camera_alt),
+                  title: const Text('دوربین'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _pickAndSendMedia(ImageSource.camera);
+                  },
+                ),
+              if (_can('send_videos'))
+                ListTile(
+                  leading: const Icon(Icons.videocam),
+                  title: const Text('ویدیو'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _pickAndSendMedia(ImageSource.gallery, isVideo: true);
+                  },
+                ),
+              if (_can('send_files'))
+                ListTile(
+                  leading: const Icon(Icons.insert_drive_file),
+                  title: const Text('ارسال فایل (اسناد، PDF، ...)'),
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _pickAndSendFile();
+                  },
+                ),
+              SwitchListTile(
+                secondary: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
+                title: const Text('حالت اسپویلر (مخفی تا زمان لمس)'),
+                value: _isSpoiler,
+                onChanged: (val) {
+                  setSheetState(() {});
+                  setState(() => _isSpoiler = val);
                 },
               ),
-            if (_can('send_photos'))
-              ListTile(
-                leading: const Icon(Icons.camera_alt),
-                title: const Text('دوربین'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _pickAndSendMedia(ImageSource.camera);
-                },
-              ),
-            if (_can('send_videos'))
-              ListTile(
-                leading: const Icon(Icons.videocam),
-                title: const Text('ویدیو'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _pickAndSendMedia(ImageSource.gallery, isVideo: true);
-                },
-              ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -1272,6 +1470,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   _openManagement();
                 },
               ),
+            ListTile(
+              leading: const Icon(Icons.schedule),
+              title: const Text('پیام‌های زمان‌بندی‌شده'),
+              onTap: () {
+                Navigator.pop(ctx);
+                _openScheduledSheet();
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.image),
               title: const Text('بک‌گراند تصویری'),
@@ -1703,57 +1909,107 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       ),
       child: SafeArea(
         top: false,
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            IconButton(
-              icon: const Icon(Icons.attach_file_rounded),
-              onPressed:
-                  _sending || (!_can('send_photos') && !_can('send_videos'))
-                  ? null
-                  : _showAttachMenu,
-            ),
-            Expanded(
-              child: TextField(
-                controller: _textCtrl,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) => _sendText(),
-                decoration: InputDecoration(
-                  hintText: _chatType == 'channel'
-                      ? _label('Broadcast a post...', 'انتشار پست...')
-                      : _label('Message...', 'پیام...'),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide.none,
+            if (_slowModeRemaining > 0)
+              Container(
+                margin: const EdgeInsets.only(bottom: 6),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.amber.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.timer, size: 16, color: Colors.amber),
+                    const SizedBox(width: 6),
+                    Text(
+                      'حالت کند فعال است: $_slowModeRemaining ثانیه تا امکان ارسال بعدی',
+                      style: const TextStyle(fontSize: 12, color: Colors.amber),
+                    ),
+                  ],
+                ),
+              ),
+            Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.attach_file_rounded),
+                  onPressed:
+                      _sending || (!_can('send_photos') && !_can('send_videos') && !_can('send_files'))
+                      ? null
+                      : _showAttachMenu,
+                ),
+                if (_isSpoiler)
+                  GestureDetector(
+                    onTap: () => setState(() => _isSpoiler = false),
+                    child: Container(
+                      margin: const EdgeInsets.only(right: 4),
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: Colors.purple.withValues(alpha: 0.2),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.purple),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.visibility_off, size: 14, color: Colors.purple),
+                          SizedBox(width: 4),
+                          Text('اسپویلر', style: TextStyle(fontSize: 11, color: Colors.purple)),
+                        ],
+                      ),
+                    ),
                   ),
-                  filled: true,
-                  fillColor: theme.scaffoldBackgroundColor,
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 10,
+                Expanded(
+                  child: TextField(
+                    controller: _textCtrl,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _sendText(),
+                    decoration: InputDecoration(
+                      hintText: _chatType == 'channel'
+                          ? _label('Broadcast a post...', 'انتشار پست...')
+                          : _label('Message...', 'پیام...'),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(24),
+                        borderSide: BorderSide.none,
+                      ),
+                      filled: true,
+                      fillColor: theme.scaffoldBackgroundColor,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                    ),
+                    maxLines: 4,
+                    minLines: 1,
                   ),
                 ),
-                maxLines: 4,
-                minLines: 1,
-              ),
-            ),
-            IconButton(
-              onPressed: _sending || (!_isRecording && !_can('send_voice'))
-                  ? null
-                  : _toggleVoiceRecord,
-              icon: Icon(
-                _isRecording ? Icons.stop_circle : Icons.mic_rounded,
-                color: _isRecording ? Colors.red : theme.colorScheme.primary,
-              ),
-            ),
-            IconButton(
-              onPressed: _sending ? null : _sendText,
-              icon: _sending
-                  ? const SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : Icon(Icons.send_rounded, color: theme.colorScheme.primary),
+                IconButton(
+                  onPressed: _sending || (!_isRecording && !_can('send_voice'))
+                      ? null
+                      : _toggleVoiceRecord,
+                  icon: Icon(
+                    _isRecording ? Icons.stop_circle : Icons.mic_rounded,
+                    color: _isRecording ? Colors.red : theme.colorScheme.primary,
+                  ),
+                ),
+                GestureDetector(
+                  onLongPress: _sending ? null : _scheduleMessage,
+                  child: IconButton(
+                    onPressed: _sending ? null : _sendText,
+                    tooltip: 'ارسال (برای زمان‌بندی نگه دارید)',
+                    icon: _sending
+                        ? const SizedBox(
+                            width: 22,
+                            height: 22,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : Icon(Icons.send_rounded, color: theme.colorScheme.primary),
+                  ),
+                ),
+              ],
             ),
           ],
         ),

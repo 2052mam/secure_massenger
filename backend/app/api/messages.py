@@ -25,6 +25,36 @@ messages_bp.before_request(validate_object_body)
 MAX_PINNED_MESSAGES = 100
 
 
+def dispatch_scheduled_messages(chat_id=None):
+    """Automatically dispatch due scheduled messages."""
+    now = datetime.utcnow()
+    query = Message.query.filter(
+        Message.is_scheduled == True,
+        Message.scheduled_at <= now,
+        Message.is_deleted == False,
+        Message.is_deleted_for_all == False,
+    )
+    if chat_id:
+        query = query.filter(Message.chat_id == chat_id)
+    scheduled_msgs = query.all()
+    if not scheduled_msgs:
+        return
+    for msg in scheduled_msgs:
+        msg.is_scheduled = False
+        msg.created_at = now
+        members = ChatMember.query.filter_by(chat_id=msg.chat_id, is_deleted=False).all()
+        for m in members:
+            if m.user_id != msg.sender_id:
+                db.session.add(MessageStatus(
+                    message_id=msg.id, user_id=m.user_id, status='delivered',
+                    delivered_at=now
+                ))
+        chat = db.session.get(Chat, msg.chat_id)
+        if chat:
+            chat.updated_at = now
+    db.session.commit()
+
+
 def _pinned_count(chat_id):
     return PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).count()
 
@@ -40,6 +70,8 @@ def get_messages(chat_id):
     user_id = get_jwt_identity()
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
+
+    dispatch_scheduled_messages(chat_id)
 
     try:
         limit = max(1, min(int(request.args.get('limit', 50)), 100))
@@ -100,6 +132,7 @@ def send_message():
     media_id = data.get('media_id')
     reply_to_id = data.get('reply_to_id')
     is_view_once = bool(data.get('is_view_once', False))
+    is_spoiler = bool(data.get('is_spoiler', False))
 
     if not chat_id:
         return jsonify({'error': 'chat_id الزامی است'}), 400
@@ -123,6 +156,33 @@ def send_message():
 
     if not can_send(chat, user_id, message_type, is_view_once):
         return jsonify({'error': 'Sending this type of message is not permitted'}), 403
+
+    # Slow mode enforcement for groups
+    if chat.chat_type == 'group' and chat.slow_mode_delay > 0:
+        member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+        if member and member.role not in ('owner', 'admin'):
+            last_msg = Message.query.filter_by(
+                chat_id=chat_id, sender_id=user_id, is_deleted=False, is_scheduled=False
+            ).order_by(Message.created_at.desc()).first()
+            if last_msg:
+                elapsed = (datetime.utcnow() - last_msg.created_at).total_seconds()
+                if elapsed < chat.slow_mode_delay:
+                    remaining = int(chat.slow_mode_delay - elapsed) + 1
+                    return jsonify({
+                        'error': f'حالت ارسال کند فعال است. لطفا {remaining} ثانیه دیگر صبر کنید.',
+                        'remaining_seconds': remaining
+                    }), 429
+
+    scheduled_at_raw = data.get('scheduled_at')
+    scheduled_dt = None
+    if scheduled_at_raw:
+        try:
+            scheduled_dt = datetime.fromisoformat(str(scheduled_at_raw).replace('Z', '+00:00'))
+            if scheduled_dt.tzinfo is not None:
+                import datetime as dt_module
+                scheduled_dt = scheduled_dt.astimezone(dt_module.timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return jsonify({'error': 'زمان‌بندی نامعتبر است'}), 400
 
     if chat.chat_type == 'private':
         other_member = ChatMember.query.filter(
@@ -166,6 +226,7 @@ def send_message():
         ):
             return jsonify({'error': 'این فایل قبلاً در پیام استفاده شده است'}), 400
 
+    is_scheduled = bool(scheduled_dt and scheduled_dt > datetime.utcnow())
     msg = Message(
         chat_id=chat_id,
         sender_id=user_id,
@@ -174,25 +235,30 @@ def send_message():
         media_id=media_id,
         reply_to_id=reply_to_id,
         is_view_once=is_view_once,
+        is_spoiler=is_spoiler,
+        is_scheduled=is_scheduled,
+        scheduled_at=scheduled_dt if is_scheduled else None,
     )
     db.session.add(msg)
     db.session.flush()
 
-    # وضعیت برای فرستنده
-    db.session.add(MessageStatus(message_id=msg.id, user_id=user_id, status='sent'))
+    if not is_scheduled:
+        # وضعیت برای فرستنده
+        db.session.add(MessageStatus(message_id=msg.id, user_id=user_id, status='sent'))
 
-    # وضعیت برای بقیه اعضا
-    members = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).all()
-    for m in members:
-        if m.user_id != user_id:
-            db.session.add(MessageStatus(
-                message_id=msg.id, user_id=m.user_id, status='delivered',
-                delivered_at=datetime.utcnow()
-            ))
+        # وضعیت برای بقیه اعضا
+        members = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).all()
+        for m in members:
+            if m.user_id != user_id:
+                db.session.add(MessageStatus(
+                    message_id=msg.id, user_id=m.user_id, status='delivered',
+                    delivered_at=datetime.utcnow()
+                ))
 
-    chat.updated_at = datetime.utcnow()
+        chat.updated_at = datetime.utcnow()
+
     db.session.add(AuditLog(
-        actor_id=user_id, action='send_message', entity_type='message', entity_id=msg.id,
+        actor_id=user_id, action='schedule_message' if is_scheduled else 'send_message', entity_type='message', entity_id=msg.id,
         ip_address=get_client_ip()
     ))
     db.session.commit()
@@ -309,6 +375,7 @@ def forward_message(message_id):
         media_id=original.media_id,
         forwarded_from_id=original.id,
         forwarded_from_chat_id=original.chat_id,
+        is_spoiler=original.is_spoiler,
     )
     db.session.add(new_msg)
     db.session.flush()
@@ -426,6 +493,7 @@ def poll_updates():
     کلاینت هر چند ثانیه این را صدا می‌زند و after timestamp یا last_event_id می‌دهد
     """
     user_id = get_jwt_identity()
+    dispatch_scheduled_messages()
     since = request.args.get('since')  # ISO datetime
     limit = min(int(request.args.get('limit', 50)), 100)
 
@@ -714,3 +782,53 @@ def get_message_statuses():
             PinnedMessage.is_deleted.is_(False),
         ).all()}),
     }), 200
+
+
+@messages_bp.route('/chat/<chat_id>/scheduled', methods=['GET'])
+@jwt_required()
+def get_scheduled_messages(chat_id):
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    dispatch_scheduled_messages(chat_id)
+    messages = Message.query.filter_by(
+        chat_id=chat_id, sender_id=user_id, is_scheduled=True, is_deleted=False
+    ).order_by(Message.scheduled_at.asc()).all()
+    return jsonify({'messages': serialize_messages(messages, user_id)}), 200
+
+
+@messages_bp.route('/<message_id>/scheduled/send-now', methods=['POST'])
+@jwt_required()
+def send_scheduled_now(message_id):
+    user_id = get_jwt_identity()
+    msg = Message.query.filter_by(id=message_id, sender_id=user_id, is_scheduled=True, is_deleted=False).first()
+    if not msg:
+        return jsonify({'error': 'پیام زمان‌بندی‌شده یافت نشد'}), 404
+    now = datetime.utcnow()
+    msg.is_scheduled = False
+    msg.scheduled_at = None
+    msg.created_at = now
+    members = ChatMember.query.filter_by(chat_id=msg.chat_id, is_deleted=False).all()
+    for m in members:
+        if m.user_id != msg.sender_id:
+            db.session.add(MessageStatus(
+                message_id=msg.id, user_id=m.user_id, status='delivered', delivered_at=now
+            ))
+    chat = db.session.get(Chat, msg.chat_id)
+    if chat:
+        chat.updated_at = now
+    db.session.commit()
+    return jsonify(serialize_messages([msg], user_id)[0]), 200
+
+
+@messages_bp.route('/<message_id>/scheduled', methods=['DELETE', 'POST'])
+@jwt_required()
+def cancel_scheduled_message(message_id):
+    user_id = get_jwt_identity()
+    msg = Message.query.filter_by(id=message_id, sender_id=user_id, is_scheduled=True, is_deleted=False).first()
+    if not msg:
+        return jsonify({'error': 'پیام زمان‌بندی‌شده یافت نشد'}), 404
+    msg.is_deleted = True
+    msg.deleted_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'ok': True}), 200

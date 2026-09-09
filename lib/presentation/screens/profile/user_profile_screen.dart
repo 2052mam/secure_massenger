@@ -7,6 +7,7 @@ import '../../providers/locale_provider.dart';
 import '../../../data/services/storage_service.dart';
 import '../../widgets/chat/chat_avatar.dart';
 import '../../widgets/chat/chat_labels.dart';
+import '../../widgets/chat/shared_media_tab.dart';
 import 'profile_photos_screen.dart';
 
 class UserProfileScreen extends ConsumerStatefulWidget {
@@ -21,12 +22,23 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
   UserModel? _user;
   bool _loading = true;
   String? _error;
+  String? _chatId;
 
   @override
   void initState() {
     super.initState();
     _load();
     _checkBlocked();
+    _loadChatId();
+  }
+
+  Future<void> _loadChatId() async {
+    try {
+      final res = await ApiService().post('/chats/private', {'user_id': widget.userId});
+      if (mounted && res['chat_id'] != null) {
+        setState(() => _chatId = res['chat_id'] as String);
+      }
+    } catch (_) {}
   }
 
   Future<void> _load() async {
@@ -197,6 +209,19 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
                   ),
                   onTap: _isBlocked ? _unblock : _block,
                 ),
+                if (_chatId != null) ...[
+                  const Divider(height: 32),
+                  Text(
+                    isFa ? 'رسانه‌ها و فایل‌های اشتراکی' : 'Shared Media & Files',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  ),
+                  const SizedBox(height: 8),
+                  SharedMediaSection(
+                    chatId: _chatId!,
+                    api: ApiService(),
+                    token: StorageService.getToken(),
+                  ),
+                ],
                 // ListTile(
                 //   leading: const Icon(Icons.block, color: Colors.red),
                 //   title: Text(isFa ? 'بلاک کردن' : 'Block', style: const TextStyle(color: Colors.red)),

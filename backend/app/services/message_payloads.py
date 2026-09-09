@@ -24,6 +24,7 @@ def visible_messages(user_id):
     return Message.query.filter(
         Message.is_deleted.is_(False),
         Message.is_deleted_for_all.is_(False),
+        Message.is_scheduled.is_(False),
         ~Message.id.in_(hidden),
     )
 
@@ -82,6 +83,7 @@ def serialize_messages(messages, user_id, status_override=None):
                     'content': (original.content or '')[:240]
                     if not original.is_view_once else None,
                     'is_view_once': original.is_view_once,
+                    'is_spoiler': bool(original.is_spoiler),
                     'is_unavailable': False,
                     # Never include a thumbnail or caption for ephemeral media.
                     'media_url': f'/api/v1/media/{original.media_id}'
@@ -115,6 +117,9 @@ def serialize_messages(messages, user_id, status_override=None):
             'reply_to': reply,
             'forwarded_from_id': msg.forwarded_from_id,
             'is_view_once': msg.is_view_once,
+            'is_spoiler': bool(msg.is_spoiler),
+            'is_scheduled': bool(msg.is_scheduled),
+            'scheduled_at': utc_iso(msg.scheduled_at) if msg.scheduled_at else None,
             'is_pinned': msg.id in pinned_ids,
             'viewed_at': utc_iso(msg.viewed_at) if msg.viewed_at else None,
             'is_edited': msg.is_edited,

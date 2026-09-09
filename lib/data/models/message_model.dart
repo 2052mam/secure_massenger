@@ -17,6 +17,11 @@ class MessageModel extends Equatable {
   final ReplyPreviewModel? replyTo;
   final String? forwardedFromId;
   final bool isViewOnce;
+  final bool isSpoiler;
+  final bool isScheduled;
+  final DateTime? scheduledAt;
+  final String? originalName;
+  final int? fileSize;
   final bool isPinned;
   final DateTime? viewedAt;
   final bool isEdited;
@@ -36,6 +41,11 @@ class MessageModel extends Equatable {
     this.replyTo,
     this.forwardedFromId,
     this.isViewOnce = false,
+    this.isSpoiler = false,
+    this.isScheduled = false,
+    this.scheduledAt,
+    this.originalName,
+    this.fileSize,
     this.isPinned = false,
     this.viewedAt,
     this.isEdited = false,
@@ -61,6 +71,13 @@ class MessageModel extends Equatable {
           : null,
       forwardedFromId: json['forwarded_from_id'] as String?,
       isViewOnce: json['is_view_once'] as bool? ?? false,
+      isSpoiler: json['is_spoiler'] as bool? ?? false,
+      isScheduled: json['is_scheduled'] as bool? ?? false,
+      scheduledAt: json['scheduled_at'] != null
+          ? parseApiDateTime(json['scheduled_at'] as String?)
+          : null,
+      originalName: json['original_name'] as String?,
+      fileSize: json['file_size'] as int?,
       isPinned: json['is_pinned'] as bool? ?? false,
       viewedAt: json['viewed_at'] != null
           ? parseApiDateTime(json['viewed_at'] as String?)
@@ -76,6 +93,9 @@ class MessageModel extends Equatable {
   MessageModel copyWith({
     String? status,
     bool? isViewOnce,
+    bool? isSpoiler,
+    bool? isScheduled,
+    DateTime? scheduledAt,
     bool? isPinned,
     DateTime? viewedAt,
     ReplyPreviewModel? replyTo,
@@ -93,6 +113,11 @@ class MessageModel extends Equatable {
       replyTo: replyTo ?? this.replyTo,
       forwardedFromId: forwardedFromId,
       isViewOnce: isViewOnce ?? this.isViewOnce,
+      isSpoiler: isSpoiler ?? this.isSpoiler,
+      isScheduled: isScheduled ?? this.isScheduled,
+      scheduledAt: scheduledAt ?? this.scheduledAt,
+      originalName: originalName,
+      fileSize: fileSize,
       isPinned: isPinned ?? this.isPinned,
       viewedAt: viewedAt ?? this.viewedAt,
       isEdited: isEdited,
@@ -133,6 +158,11 @@ class MessageModel extends Equatable {
     replyTo,
     forwardedFromId,
     isViewOnce,
+    isSpoiler,
+    isScheduled,
+    scheduledAt,
+    originalName,
+    fileSize,
     isPinned,
     viewedAt,
     isEdited,

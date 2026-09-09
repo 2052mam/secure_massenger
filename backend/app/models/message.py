@@ -23,6 +23,13 @@ class Message(db.Model):
     # View Once
     is_view_once = db.Column(db.Boolean, default=False)
     viewed_at = db.Column(db.DateTime, nullable=True)
+
+    # Spoiler Mode
+    is_spoiler = db.Column(db.Boolean, default=False, nullable=False)
+
+    # Scheduled Message
+    is_scheduled = db.Column(db.Boolean, default=False, nullable=False, index=True)
+    scheduled_at = db.Column(db.DateTime, nullable=True, index=True)
     
     # Soft Delete
     is_deleted = db.Column(db.Boolean, default=False, index=True)

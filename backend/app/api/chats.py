@@ -8,9 +8,10 @@ from app.models.user import User, BlockList
 from app.models.chat import Chat, ChatMember, ChatBackground
 from app.models.folder import ChatFolder, ChatFolderItem
 from app.models.message import Message, MessageStatus, PinnedMessage
+from app.models.media import MediaFile
 from app.models.audit import AuditLog
 from app.services.archive_lock import archive_unlocked
-from app.services.message_payloads import visible_messages
+from app.services.message_payloads import visible_messages, serialize_messages, user_in_chat
 from datetime import datetime
 import uuid
 from werkzeug.exceptions import HTTPException
@@ -768,6 +769,7 @@ def get_chat_info(chat_id):
         'members_count': members_count,
         'my_role': my_role,
         'is_muted': member.is_muted if member else False,
+        'slow_mode_delay': chat.slow_mode_delay or 0,
         'permissions': group_permissions(chat) if chat.chat_type == 'group' else None,
         'capabilities': capabilities(chat, member),
         'other_user': other_user.to_dict() if other_user else None,
@@ -817,6 +819,14 @@ def update_chat(chat_id):
             chat.username = new_username
         else:
             chat.username = None
+    if 'slow_mode_delay' in data and member.role in ('owner', 'admin'):
+        try:
+            delay = int(data['slow_mode_delay'])
+            if delay < 0:
+                return jsonify({'error': 'slow_mode_delay must be non-negative'}), 400
+            chat.slow_mode_delay = delay
+        except (ValueError, TypeError):
+            return jsonify({'error': 'Invalid slow_mode_delay'}), 400
     db.session.add(AuditLog(actor_id=user_id, action='update_chat', entity_type='chat', entity_id=chat_id))
     db.session.commit()
     return jsonify({'ok': True}), 200
@@ -968,6 +978,57 @@ def _join_chat(chat, user_id, created_status=200):
         if member is None:
             raise
     return jsonify(_invite_preview(chat, user_id)), created_status
+
+
+@chats_bp.route('/<chat_id>/shared-media', methods=['GET'])
+@jwt_required()
+def get_shared_media(chat_id):
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+
+    m_type = request.args.get('type')
+    query = visible_messages(user_id).filter(
+        Message.chat_id == chat_id,
+        Message.media_id.isnot(None),
+        Message.is_view_once.is_(False),
+    )
+
+    if m_type and m_type != 'all':
+        if m_type == 'media':
+            query = query.filter(Message.message_type.in_(['image', 'video']))
+        elif m_type == 'files':
+            query = query.filter(Message.message_type == 'file')
+        elif m_type == 'voice':
+            query = query.filter(Message.message_type.in_(['voice', 'audio']))
+        else:
+            query = query.filter(Message.message_type == m_type)
+
+    messages = query.order_by(Message.created_at.desc()).limit(200).all()
+    serialized = serialize_messages(messages, user_id)
+
+    # Attach original_name, file_size, mime_type from MediaFile to each serialized message
+    media_ids = [m.media_id for m in messages if m.media_id]
+    media_files = {m.id: m for m in MediaFile.query.filter(MediaFile.id.in_(media_ids)).all()} if media_ids else {}
+
+    for item in serialized:
+        mid = item.get('media_id')
+        if mid and mid in media_files:
+            mf = media_files[mid]
+            item['original_name'] = mf.original_name
+            item['file_size'] = mf.file_size
+            item['mime_type'] = mf.mime_type
+
+    media_items = [m for m in serialized if m['message_type'] in ('image', 'video')]
+    file_items = [m for m in serialized if m['message_type'] == 'file']
+    voice_items = [m for m in serialized if m['message_type'] in ('voice', 'audio')]
+
+    return jsonify({
+        'media': media_items,
+        'files': file_items,
+        'voice': voice_items,
+        'all': serialized,
+    }), 200
 
 
 @chats_bp.route('/<chat_id>/mute', methods=['POST'])

@@ -27,7 +27,7 @@ def test_send_history_search_and_poll_have_the_same_reply(client, auth, make_mes
     assert sent['reply_to'] == {
         'id': 'original', 'sender_id': 'alice', 'sender_name': 'Alice',
         'message_type': 'text', 'content': 'Original message',
-        'is_view_once': False, 'is_unavailable': False, 'media_url': None,
+        'is_view_once': False, 'is_spoiler': False, 'is_unavailable': False, 'media_url': None,
     }
     for endpoint in ('/chat', '/search/chat?q=reply', '/poll'):
         result = client.get('/api/v1/messages' + endpoint, headers=auth('bob'))

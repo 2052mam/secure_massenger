@@ -1,6 +1,7 @@
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 
+import '../../../data/services/media_download_service.dart';
 import '../../widgets/media/media_labels.dart';
 import '../../widgets/media/photo_canvas.dart';
 
@@ -28,6 +29,33 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
         : {'Authorization': 'Bearer ${widget.token}'},
   );
   bool _showChrome = true;
+  bool _downloading = false;
+
+  Future<void> _downloadPhoto() async {
+    if (_downloading) return;
+    setState(() => _downloading = true);
+    try {
+      final filename = 'photo_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final path = await MediaDownloadService.downloadMedia(
+        mediaUrl: widget.url,
+        fileName: filename,
+        token: widget.token,
+      );
+      if (mounted) {
+        setState(() => _downloading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('عکس با موفقیت ذخیره شد ($filename)')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _downloading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('خطا در ذخیره عکس: $e')),
+        );
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -69,6 +97,24 @@ class _PhotoViewerScreenState extends State<PhotoViewerScreen> {
                           color: Colors.white,
                           fontSize: 16,
                         ),
+                      ),
+                      const Spacer(),
+                      IconButton(
+                        tooltip: 'دانلود عکس',
+                        onPressed: _downloading ? null : _downloadPhoto,
+                        icon: _downloading
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.white,
+                                ),
+                              )
+                            : const Icon(
+                                Icons.download_rounded,
+                                color: Colors.white,
+                              ),
                       ),
                     ],
                   ),

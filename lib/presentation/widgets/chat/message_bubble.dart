@@ -10,6 +10,8 @@ import '../media/video_message_player.dart';
 import '../media/voice_message_player.dart';
 import 'reply_preview.dart';
 import 'message_text.dart';
+import 'spoiler_widget.dart';
+import 'file_message_bubble.dart';
 
 class MessageBubble extends StatelessWidget {
   final MessageModel message;
@@ -128,37 +130,40 @@ class MessageBubble extends StatelessWidget {
                     : null,
               )
             else if (message.messageType == 'image' && mediaUrl.isNotEmpty)
-              Semantics(
-                button: true,
-                label: labels.photo,
-                child: GestureDetector(
-                  onTap: onOpenPhoto,
-                  child: ClipRRect(
-                    borderRadius: BorderRadius.circular(10),
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 320),
-                      child: CachedNetworkImage(
-                        imageUrl: mediaUrl,
-                        httpHeaders: token == null
-                            ? null
-                            : {'Authorization': 'Bearer $token'},
-                        width: 280,
-                        fit: BoxFit.cover,
-                        placeholder: (_, __) => const SizedBox(
+              SpoilerWidget(
+                isSpoiler: message.isSpoiler,
+                child: Semantics(
+                  button: true,
+                  label: labels.photo,
+                  child: GestureDetector(
+                    onTap: onOpenPhoto,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(10),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxHeight: 320),
+                        child: CachedNetworkImage(
+                          imageUrl: mediaUrl,
+                          httpHeaders: token == null
+                              ? null
+                              : {'Authorization': 'Bearer $token'},
                           width: 280,
-                          height: 180,
-                          child: Center(
-                            child: CircularProgressIndicator(strokeWidth: 2),
+                          fit: BoxFit.cover,
+                          placeholder: (_, __) => const SizedBox(
+                            width: 280,
+                            height: 180,
+                            child: Center(
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
                           ),
-                        ),
-                        errorWidget: (_, __, ___) => SizedBox(
-                          width: 220,
-                          height: 100,
-                          child: Center(
-                            child: Icon(
-                              Icons.broken_image_outlined,
-                              size: 40,
-                              color: fg,
+                          errorWidget: (_, __, ___) => SizedBox(
+                            width: 220,
+                            height: 100,
+                            child: Center(
+                              child: Icon(
+                                Icons.broken_image_outlined,
+                                size: 40,
+                                color: fg,
+                              ),
                             ),
                           ),
                         ),
@@ -168,11 +173,14 @@ class MessageBubble extends StatelessWidget {
                 ),
               )
             else if (message.messageType == 'video' && mediaUrl.isNotEmpty)
-              VideoMessagePlayer(
-                url: mediaUrl,
-                authToken: token,
-                isMine: isMine,
-                coordinator: coordinator,
+              SpoilerWidget(
+                isSpoiler: message.isSpoiler,
+                child: VideoMessagePlayer(
+                  url: mediaUrl,
+                  authToken: token,
+                  isMine: isMine,
+                  coordinator: coordinator,
+                ),
               )
             else if (message.messageType == 'voice' ||
                 message.messageType == 'audio')
@@ -182,14 +190,25 @@ class MessageBubble extends StatelessWidget {
                 foreground: fg,
                 coordinator: coordinator,
               )
+            else if (message.messageType == 'file')
+              FileMessageBubble(
+                message: message,
+                mediaUrl: mediaUrl,
+                token: token,
+                isMine: isMine,
+                foregroundColor: fg,
+              )
             else
-              MessageText(
-                text: message.content?.isNotEmpty == true
-                    ? message.content!
-                    : labels.type(message.messageType),
-                style: TextStyle(color: fg, fontSize: 15, height: 1.35),
-                linkColor: isMine ? Colors.white : theme.colorScheme.primary,
-                onInviteTap: onInviteTap,
+              SpoilerWidget(
+                isSpoiler: message.isSpoiler,
+                child: MessageText(
+                  text: message.content?.isNotEmpty == true
+                      ? message.content!
+                      : labels.type(message.messageType),
+                  style: TextStyle(color: fg, fontSize: 15, height: 1.35),
+                  linkColor: isMine ? Colors.white : theme.colorScheme.primary,
+                  onInviteTap: onInviteTap,
+                ),
               ),
             if (hasCaption)
               Padding(

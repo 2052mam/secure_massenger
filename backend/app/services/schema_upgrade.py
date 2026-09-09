@@ -13,12 +13,20 @@ def upgrade_schema():
             'archive_pin_hash': 'VARCHAR(255) NULL',
             'archive_pin_updated_at': 'DATETIME NULL',
         },
-        'chats': {'permissions': 'JSON NULL'},
+        'chats': {
+            'permissions': 'JSON NULL',
+            'slow_mode_delay': 'INTEGER NOT NULL DEFAULT 0',
+        },
         'chat_members': {
             'permissions': 'JSON NULL',
             'is_archived': 'BOOLEAN NOT NULL DEFAULT 0',
             'archived_at': 'DATETIME NULL',
             'pinned_at': 'DATETIME NULL',
+        },
+        'messages': {
+            'is_spoiler': 'BOOLEAN NOT NULL DEFAULT 0',
+            'is_scheduled': 'BOOLEAN NOT NULL DEFAULT 0',
+            'scheduled_at': 'DATETIME NULL',
         },
     }
     with db.engine.begin() as connection:

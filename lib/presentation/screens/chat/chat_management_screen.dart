@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../data/services/api_service.dart';
 import '../../widgets/chat/chat_avatar.dart';
+import '../../widgets/chat/shared_media_tab.dart';
 
 bool _fa(BuildContext context) =>
     Localizations.localeOf(context).languageCode == 'fa';
@@ -206,6 +207,44 @@ class _ChatManagementState extends State<_ChatManagement> {
     );
   }
 
+  Future<void> _setSlowMode() async {
+    final currentDelay = _info?['slow_mode_delay'] as int? ?? 0;
+    final options = <int, String>{
+      0: _t(context, 'Off', 'غیرفعال'),
+      10: _t(context, '10 seconds', '۱۰ ثانیه'),
+      30: _t(context, '30 seconds', '۳۰ ثانیه'),
+      60: _t(context, '1 minute', '۱ دقیقه'),
+      300: _t(context, '5 minutes', '۵ دقیقه'),
+      900: _t(context, '15 minutes', '۱۵ دقیقه'),
+      3600: _t(context, '1 hour', '۱ ساعت'),
+    };
+
+    final selected = await showDialog<int>(
+      context: context,
+      builder: (ctx) => SimpleDialog(
+        title: Text(_t(context, 'Slow mode', 'حالت کند (محدودیت ارسال)')),
+        children: options.entries.map((e) {
+          return SimpleDialogOption(
+            onPressed: () => Navigator.pop(ctx, e.key),
+            child: Row(
+              children: [
+                if (e.key == currentDelay) const Icon(Icons.check, color: Colors.blue, size: 20),
+                const SizedBox(width: 8),
+                Text(e.value),
+              ],
+            ),
+          );
+        }).toList(),
+      ),
+    );
+
+    if (selected == null || selected == currentDelay || !mounted) return;
+
+    await _run(() async {
+      await widget.api.post('$_base/update', {'slow_mode_delay': selected});
+    });
+  }
+
   Future<void> _adminRights(Map<String, dynamic> member) async {
     final initial = {
       ..._adminDefaults,
@@ -346,6 +385,17 @@ class _ChatManagementState extends State<_ChatManagement> {
                           title: Text(_t(context, 'Permissions', 'دسترسی‌ها')),
                           onTap: _busy ? null : () => _run(_permissions),
                         ),
+                      if (!widget.channel && _admin)
+                        ListTile(
+                          leading: const Icon(Icons.timer_outlined),
+                          title: Text(_t(context, 'Slow mode', 'حالت کند (محدودیت ارسال)')),
+                          subtitle: Text(
+                            (_info?['slow_mode_delay'] as int? ?? 0) > 0
+                                ? '${_info!['slow_mode_delay']} ثانیه'
+                                : _t(context, 'Off', 'غیرفعال'),
+                          ),
+                          onTap: _busy ? null : _setSlowMode,
+                        ),
                       if (_can('invite_users')) ...[
                         ListTile(
                           key: const ValueKey('add-members'),
@@ -394,6 +444,17 @@ class _ChatManagementState extends State<_ChatManagement> {
                         for (final raw in _members)
                           _memberTile(Map<String, dynamic>.from(raw as Map)),
                       ],
+                      const Divider(),
+                      Text(
+                        _t(context, 'Shared Media & Files', 'رسانه‌ها و فایل‌های اشتراکی'),
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                      const SizedBox(height: 8),
+                      SharedMediaSection(
+                        chatId: widget.chatId,
+                        api: widget.api,
+                        token: widget.token,
+                      ),
                       const Divider(),
                       ListTile(
                         leading: const Icon(Icons.exit_to_app),

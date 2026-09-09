@@ -16,6 +16,7 @@ class Chat(db.Model):
     avatar_url = db.Column(db.String(500), nullable=True)
     
     permissions = db.Column(db.JSON, nullable=True)
+    slow_mode_delay = db.Column(db.Integer, default=0, nullable=False)
 
     created_by = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
     is_public = db.Column(db.Boolean, default=False)
