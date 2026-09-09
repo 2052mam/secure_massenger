@@ -919,6 +919,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (picked == null || !mounted) return;
 
     bool sendViewOnce = viewOnce;
+    bool sendSpoiler = _isSpoiler;
     if (!isVideo) {
       final choice = await showModalBottomSheet<String>(
         context: context,
@@ -929,6 +930,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 leading: const Icon(Icons.send),
                 title: const Text('ارسال معمولی'),
                 onTap: () => Navigator.pop(ctx, 'normal'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
+                title: const Text('ارسال عکس با اسپویلر (مخفی)'),
+                onTap: () => Navigator.pop(ctx, 'spoiler'),
               ),
               if (_can('send_view_once_photos'))
                 ListTile(
@@ -947,7 +953,37 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         ),
       );
       if (choice == null || choice == 'cancel' || !mounted) return;
-      sendViewOnce = choice == 'once';
+      if (choice == 'spoiler') sendSpoiler = true;
+      if (choice == 'once') sendViewOnce = true;
+    } else {
+      if (!sendSpoiler) {
+        final choice = await showModalBottomSheet<String>(
+          context: context,
+          builder: (ctx) => SafeArea(
+            child: Wrap(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.send),
+                  title: const Text('ارسال معمولی'),
+                  onTap: () => Navigator.pop(ctx, 'normal'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
+                  title: const Text('ارسال ویدیو با اسپویلر (مخفی)'),
+                  onTap: () => Navigator.pop(ctx, 'spoiler'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.close),
+                  title: const Text('لغو'),
+                  onTap: () => Navigator.pop(ctx, 'cancel'),
+                ),
+              ],
+            ),
+          ),
+        );
+        if (choice == null || choice == 'cancel' || !mounted) return;
+        if (choice == 'spoiler') sendSpoiler = true;
+      }
     }
 
     final reply = _replyTo;
@@ -963,6 +999,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         'media_id': mediaId,
         'content': '',
         'is_view_once': sendViewOnce,
+        'is_spoiler': sendSpoiler,
       };
       if (reply != null) body['reply_to_id'] = reply.id;
       final res = await _api.post('/messages/', body);
@@ -973,10 +1010,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         'media_url': sendViewOnce ? null : '/api/v1/media/$mediaId',
         'message_type': mediaType,
         'is_view_once': sendViewOnce,
+        'is_spoiler': sendSpoiler,
       }, reply);
       setState(() {
         _mergeMessages([msg]);
         _replyTo = null;
+        _isSpoiler = false;
         _sending = false;
       });
       if (_historyMode) await _loadMessages();
@@ -1987,6 +2026,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   ),
                 ),
                 IconButton(
+                  icon: const Icon(Icons.schedule_rounded),
+                  tooltip: 'زمان‌بندی ارسال پیام',
+                  onPressed: _sending ? null : _scheduleMessage,
+                ),
+                IconButton(
                   onPressed: _sending || (!_isRecording && !_can('send_voice'))
                       ? null
                       : _toggleVoiceRecord,
@@ -1995,18 +2039,23 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     color: _isRecording ? Colors.red : theme.colorScheme.primary,
                   ),
                 ),
-                GestureDetector(
-                  onLongPress: _sending ? null : _scheduleMessage,
-                  child: IconButton(
-                    onPressed: _sending ? null : _sendText,
-                    tooltip: 'ارسال (برای زمان‌بندی نگه دارید)',
-                    icon: _sending
-                        ? const SizedBox(
-                            width: 22,
-                            height: 22,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : Icon(Icons.send_rounded, color: theme.colorScheme.primary),
+                Material(
+                  color: Colors.transparent,
+                  shape: const CircleBorder(),
+                  clipBehavior: Clip.hardEdge,
+                  child: InkWell(
+                    onTap: _sending ? null : _sendText,
+                    onLongPress: _sending ? null : _scheduleMessage,
+                    child: Padding(
+                      padding: const EdgeInsets.all(10),
+                      child: _sending
+                          ? const SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Icon(Icons.send_rounded, color: theme.colorScheme.primary),
+                    ),
                   ),
                 ),
               ],

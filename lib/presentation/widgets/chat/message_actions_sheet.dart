@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../../data/models/message_model.dart';
+import '../../../data/services/media_download_service.dart';
 import 'chat_labels.dart';
 
 class MessageActionsSheet extends StatelessWidget {
@@ -47,6 +48,31 @@ class MessageActionsSheet extends StatelessWidget {
     }
   }
 
+  Future<void> _download(BuildContext context) async {
+    final mediaId = message.mediaId;
+    if (mediaId == null) return;
+    final messenger = ScaffoldMessenger.of(context);
+    Navigator.of(context).pop();
+
+    final ext = message.messageType == 'image' ? 'jpg' :
+                message.messageType == 'video' ? 'mp4' :
+                message.messageType == 'voice' ? 'm4a' : 'file';
+    final fileName = message.originalName ??
+        (message.content?.isNotEmpty == true ? message.content! : '${message.messageType}_${message.id}.$ext');
+    final mediaUrl = message.mediaUrl ?? '/api/v1/media/$mediaId';
+
+    try {
+      messenger.showSnackBar(const SnackBar(content: Text('در حال دانلود فایل...')));
+      final path = await MediaDownloadService.downloadMedia(
+        mediaUrl: mediaUrl,
+        fileName: fileName,
+      );
+      messenger.showSnackBar(SnackBar(content: Text('فایل ذخیره شد: $fileName')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('خطا در دانلود: $e')));
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final labels = ChatLabels.of(context);
@@ -72,6 +98,13 @@ class MessageActionsSheet extends StatelessWidget {
                 leading: const Icon(Icons.copy_outlined),
                 title: Text(labels.copy),
                 onTap: () => _copy(context),
+              ),
+            if (message.mediaId != null && !message.isViewOnce)
+              ListTile(
+                key: const ValueKey('download-media'),
+                leading: const Icon(Icons.download_rounded),
+                title: const Text('دانلود / ذخیره در دستگاه'),
+                onTap: () => _download(context),
               ),
             if (canPin && onTogglePin != null)
               ListTile(

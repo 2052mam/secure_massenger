@@ -5,6 +5,7 @@ import 'package:just_audio/just_audio.dart';
 
 import '../../../core/utils/media_utils.dart';
 import '../../../data/services/media_playback_coordinator.dart';
+import '../../../data/services/media_download_service.dart';
 import 'media_labels.dart';
 import 'media_seek_bar.dart';
 
@@ -282,6 +283,22 @@ class _VoiceMessagePlayerState extends State<VoiceMessagePlayer>
                     ),
                   ],
                 ),
+              ),
+              IconButton(
+                tooltip: 'دانلود ویس',
+                visualDensity: VisualDensity.compact,
+                color: color,
+                onPressed: _downloading ? null : _downloadVoice,
+                icon: _downloading
+                    ? SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: color,
+                        ),
+                      )
+                    : const Icon(Icons.download_rounded, size: 20),
               ),
               PopupMenuButton<double>(
                 tooltip: labels.speed,
