@@ -47,6 +47,7 @@ class _VoiceMessagePlayerState extends State<VoiceMessagePlayer>
   bool _buffering = false;
   bool _failed = false;
   bool _toggling = false;
+  bool _downloading = false;
   double _speed = 1;
 
   @override
@@ -182,6 +183,32 @@ class _VoiceMessagePlayerState extends State<VoiceMessagePlayer>
       if (mounted) setState(() => _speed = speed);
     } catch (_) {
       _showError();
+    }
+  }
+
+  Future<void> _downloadVoice() async {
+    if (_downloading || widget.url.isEmpty) return;
+    setState(() => _downloading = true);
+    try {
+      final fileName = 'voice_${DateTime.now().millisecondsSinceEpoch}.m4a';
+      await MediaDownloadService.downloadMedia(
+        mediaUrl: widget.url,
+        fileName: fileName,
+        token: widget.token,
+      );
+      if (mounted) {
+        setState(() => _downloading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('ویس ذخیره شد ($fileName)')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _downloading = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('خطا در دانلود ویس: $e')),
+        );
+      }
     }
   }
 
