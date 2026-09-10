@@ -944,8 +944,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       final choice = await showModalBottomSheet<String>(
         context: context,
         builder: (ctx) => SafeArea(
-          child: Wrap(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
+              Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
               ListTile(
                 leading: const Icon(Icons.send),
                 title: const Text('ارسال معمولی'),
@@ -968,6 +970,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 title: const Text('لغو'),
                 onTap: () => Navigator.pop(ctx, 'cancel'),
               ),
+              const SizedBox(height: 8),
             ],
           ),
         ),
@@ -980,8 +983,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         final choice = await showModalBottomSheet<String>(
           context: context,
           builder: (ctx) => SafeArea(
-            child: Wrap(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
+                Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
                 ListTile(
                   leading: const Icon(Icons.send),
                   title: const Text('ارسال معمولی'),
@@ -997,6 +1002,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   title: const Text('لغو'),
                   onTap: () => Navigator.pop(ctx, 'cancel'),
                 ),
+                const SizedBox(height: 8),
               ],
             ),
           ),
@@ -1237,36 +1243,45 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('امکان ارسال گیف وجود ندارد')));
       return;
     }
-    // Ensure can send gif: telegram allows if any media sending allowed
-    final canGif = _can('send_messages') || _can('send_photos') || _can('send_files') || _can('send_videos') || _can('send_gifs') || _capabilities['send_gifs'] == true;
-    // gif check lenient - backend already allows with send_messages fallback
     final reply = _replyTo;
     setState(() => _sending = true);
     try {
-      final gifUrl = gif is Map ? gif['gif_url'] ?? gif['url'] : gif.gifUrl ?? gif.previewUrl;
-      final title = gif is Map ? gif['title'] : gif.title;
+      // gif is SavedGif (has mediaId or gif_url) – online GIFs are no longer offered.
+      String? mediaId;
+      String? gifUrl;
+      String? title;
+      if (gif is Map) {
+        mediaId = gif['media_id'] as String?;
+        gifUrl = gif['gif_url'] as String? ?? gif['url'] as String?;
+        title = gif['title'] as String?;
+      } else {
+        // GifModel
+        try { mediaId = (gif as dynamic).mediaId as String?; } catch (_) {}
+        try { gifUrl = (gif as dynamic).gifUrl as String?; } catch (_) {}
+        try { title = (gif as dynamic).title as String?; } catch (_) {}
+        try { gifUrl ??= (gif as dynamic).previewUrl as String?; } catch (_) {}
+      }
       final body = <String, dynamic>{
         'chat_id': widget.chatId,
         'message_type': 'gif',
-        'content': title ?? gifUrl ?? 'GIF',
-        'media_id': gif is Map ? gif['media_id'] : gif.mediaId,
+        'content': (title?.isNotEmpty == true ? title : null) ?? gifUrl ?? 'GIF',
       };
-      // If no mediaId, server may store via content url; we pass preview_url in content fallback
-      // Use direct url via content if media not uploaded
-      if (body['media_id'] == null && gifUrl != null) {
-        // For locally trending gifs we just send URL as content and media_url fallback;
-        // backend will treat as gif with media lookup by gif_url duplication.
-        // We'll try to send with gif_url passed as content and let backend map to media via make endpoint if needed.
-        // Simplified: send as gif with content = gifUrl so UI can render via mediaUrl
+      if (mediaId != null && mediaId.isNotEmpty) {
+        body['media_id'] = mediaId;
+      } else if (gifUrl != null && gifUrl.isNotEmpty) {
+        // fallback: send URL as content; backend will still create gif message
         body['content'] = gifUrl;
+      } else {
+        throw Exception('گیف انتخاب‌شده فاقد اطلاعات است');
       }
       if (reply != null) body['reply_to_id'] = reply.id;
       final res = await _api.post('/messages/', body);
       if (!mounted) return;
-      // If backend returned gif without mediaUrl but we have gifUrl, hydrate
       final msg = _sentMessage({
         ...res,
-        if ((res['media_url'] == null || (res['media_url'] as String).isEmpty) && gifUrl != null) 'media_url': gifUrl,
+        // Hydrate media_url for local preview when backend omits it but we have the external URL
+        if ((res['media_url'] == null || (res['media_url'] as String).isEmpty) && gifUrl != null && !gifUrl.startsWith('/')) 'media_url': gifUrl,
+        if (res['media_id'] == null && mediaId != null) 'media_id': mediaId,
       }, reply);
       setState(() {
         _mergeMessages([msg]);
@@ -1280,25 +1295,65 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         setState(() => _sending = false);
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
       }
+    } finally {
+      if (mounted && _sending) setState(() => _sending = false);
     }
   }
 
   Future<void> _makeGifFromVideo() async {
     final picker = ImagePicker();
-    final video = await picker.pickVideo(source: ImageSource.gallery);
+    final video = await picker.pickVideo(source: ImageSource.gallery, maxDuration: const Duration(seconds: 60));
     if (video == null || !mounted) return;
     setState(() => _sending = true);
     try {
       final upload = await _api.uploadFile('/media/upload', File(video.path));
-      final mediaId = upload['id'] as String;
-      final res = await _api.post('/gifs/make', {'media_id': mediaId, 'title': 'Converted GIF'});
-      final gif = res['gif'] as Map<String, dynamic>?;
-      if (mounted && gif != null) {
-        await _sendGif(gif);
+      final mediaId = upload['id'] as String?;
+      if (mediaId == null || mediaId.isEmpty) throw Exception('آپلود ویدیو ناموفق بود');
+      // /gifs/make returns {ok:true, media_id, gif_url} – not {gif:{}}
+      Map<String, dynamic> res;
+      try {
+        res = await _api.post('/gifs/make', {'media_id': mediaId, 'title': 'Converted GIF'});
+      } catch (_) {
+        // If make endpoint fails, fall back to sending video as gif directly
+        res = {'media_id': mediaId, 'gif_url': '/api/v1/media/$mediaId'};
       }
+      final outMediaId = (res['media_id'] as String?) ?? mediaId;
+      final gifUrl = res['gif_url'] as String? ?? res['url'] as String? ?? '/api/v1/media/$outMediaId';
+      final gifMap = res['gif'] as Map<String, dynamic>?;
+      if (gifMap != null) {
+        await _sendGif(gifMap);
+        return;
+      }
+      // Fallback: optionally save to saved GIFs for future reuse (best-effort)
+      try {
+        await _api.post('/gifs/save', {'media_id': outMediaId, 'gif_url': gifUrl, 'preview_url': gifUrl, 'title': 'GIF از ویدیو'});
+      } catch (_) {}
+      // Direct send as gif message (most reliable, avoids double-save crash)
+      final reply = _replyTo;
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'gif',
+        'media_id': outMediaId,
+        'content': 'GIF',
+      };
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final msgRes = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({...msgRes, 'media_id': outMediaId, 'media_url': '/api/v1/media/$outMediaId', 'message_type': 'gif'}, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
-      if (mounted) setState(() => _sending = false);
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('ساخت گیف ناموفق: $e')));
+      }
+    } finally {
+      if (mounted && _sending) setState(() => _sending = false);
     }
   }
 
@@ -1537,61 +1592,45 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_reconciler.isUnavailable(msg.id)) return;
     showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
       builder: (sheetCtx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Quick reactions bar like Telegram
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: ['❤️', '👍', '😂', '😮', '😢', '🙏'].map((e) => InkWell(
-                  onTap: () {
-                    Navigator.pop(sheetCtx);
-                    _toggleReaction(msg, e);
-                  },
-                  borderRadius: BorderRadius.circular(24),
-                  child: Container(
-                    width: 44,
-                    height: 44,
-                    alignment: Alignment.center,
-                    decoration: BoxDecoration(color: Colors.grey.withValues(alpha: 0.08), shape: BoxShape.circle),
-                    child: Text(e, style: const TextStyle(fontSize: 22)),
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.85),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                  child: Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: ['❤️', '👍', '😂', '😮', '😢', '🙏'].map((e) => InkWell(
+                      onTap: () { Navigator.pop(sheetCtx); _toggleReaction(msg, e); },
+                      borderRadius: BorderRadius.circular(24),
+                      child: Container(width: 48, height: 48, alignment: Alignment.center, decoration: BoxDecoration(color: Colors.grey.withValues(alpha: 0.08), shape: BoxShape.circle, border: Border.all(color: Colors.grey.withValues(alpha: 0.12))), child: Text(e, style: const TextStyle(fontSize: 24))),
+                    )).toList(),
                   ),
-                )).toList(),
-              ),
+                ),
+                const Divider(height: 16),
+                MessageActionsSheet(
+                  message: msg,
+                  canDeleteForAll: _canDelete(msg),
+                  canReply: _can('send_messages'),
+                  canPin: _canPinMessages,
+                  onTogglePin: (pin) => _togglePin(msg, pin),
+                  onReply: () { if (mounted && _can('send_messages') && !_reconciler.isUnavailable(msg.id)) setState(() => _replyTo = msg); },
+                  onForward: () => _forwardMessage(msg),
+                  onDelete: (forAll) => _deleteMessage(msg, forAll: forAll),
+                ),
+                ListTile(leading: const Icon(Icons.add_reaction_outlined), title: const Text('افزودن واکنش (بیشتر)'), onTap: () { Navigator.pop(sheetCtx); _showReactionPicker(msg); }),
+                ListTile(leading: const Icon(Icons.report_outlined, color: Colors.orange), title: const Text('گزارش و بلاک'), subtitle: const Text('گزارش + بلاک همزمان', style: TextStyle(fontSize: 11, color: Colors.grey)), onTap: () { Navigator.pop(sheetCtx); _reportMessage(msg); }),
+                const SizedBox(height: 16),
+              ],
             ),
-            const Divider(height: 1),
-            MessageActionsSheet(
-              message: msg,
-              canDeleteForAll: _canDelete(msg),
-              canReply: _can('send_messages'),
-              canPin: _canPinMessages,
-              onTogglePin: (pin) => _togglePin(msg, pin),
-              onReply: () {
-                if (mounted && _can('send_messages') && !_reconciler.isUnavailable(msg.id)) setState(() => _replyTo = msg);
-              },
-              onForward: () => _forwardMessage(msg),
-              onDelete: (forAll) => _deleteMessage(msg, forAll: forAll),
-            ),
-            ListTile(
-              leading: const Icon(Icons.add_reaction_outlined),
-              title: const Text('افزودن واکنش'),
-              onTap: () {
-                Navigator.pop(sheetCtx);
-                _showReactionPicker(msg);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.report_outlined, color: Colors.orange),
-              title: const Text('گزارش پیام'),
-              onTap: () {
-                Navigator.pop(sheetCtx);
-                _reportMessage(msg);
-              },
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -1659,92 +1698,100 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   void _showAttachMenu() {
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setSheetState) => SafeArea(
-          child: Wrap(
-            children: [
-              if (_can('send_photos'))
-                ListTile(
-                  leading: const Icon(Icons.photo_library),
-                  title: const Text('عکس از گالری'),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _pickAndSendMedia(ImageSource.gallery);
-                  },
-                ),
-              if (_can('send_photos'))
-                ListTile(
-                  leading: const Icon(Icons.camera_alt),
-                  title: const Text('دوربین'),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _pickAndSendMedia(ImageSource.camera);
-                  },
-                ),
-              if (_can('send_videos'))
-                ListTile(
-                  leading: const Icon(Icons.videocam),
-                  title: const Text('ویدیو'),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _pickAndSendMedia(ImageSource.gallery, isVideo: true);
-                  },
-                ),
-              if (_can('send_files'))
-                ListTile(
-                  leading: const Icon(Icons.insert_drive_file),
-                  title: const Text('ارسال فایل (اسناد، PDF، ZIP، PNG، TXT، ...)'),
-                  subtitle: const Text('همه فرمت‌ها مانند تلگرام پشتیبانی می‌شوند', style: TextStyle(fontSize: 11, color: Colors.grey)),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _pickAndSendFile();
-                  },
-                ),
-              ListTile(
-                leading: const Icon(Icons.emoji_emotions_outlined, color: Colors.orange),
-                title: const Text('استیکر'),
-                subtitle: const Text('انتخاب از پک‌های آماده', style: TextStyle(fontSize: 11, color: Colors.grey)),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _showStickerPicker();
-                },
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.75),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(top: 12, bottom: 8),
+                    decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2)),
+                  ),
+                  if (_can('send_photos'))
+                    ListTile(
+                      leading: const Icon(Icons.photo_library),
+                      title: const Text('عکس از گالری'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendMedia(ImageSource.gallery);
+                      },
+                    ),
+                  if (_can('send_photos'))
+                    ListTile(
+                      leading: const Icon(Icons.camera_alt),
+                      title: const Text('دوربین'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendMedia(ImageSource.camera);
+                      },
+                    ),
+                  if (_can('send_videos'))
+                    ListTile(
+                      leading: const Icon(Icons.videocam),
+                      title: const Text('ویدیو'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendMedia(ImageSource.gallery, isVideo: true);
+                      },
+                    ),
+                  if (_can('send_files'))
+                    ListTile(
+                      leading: const Icon(Icons.insert_drive_file),
+                      title: const Text('ارسال فایل (اسناد، PDF، ZIP، PNG، TXT، ...)'),
+                      subtitle: const Text('همه فرمت‌ها مانند تلگرام پشتیبانی می‌شوند', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendFile();
+                      },
+                    ),
+                  ListTile(
+                    leading: const Icon(Icons.emoji_emotions_outlined, color: Colors.orange),
+                    title: const Text('استیکر'),
+                    subtitle: const Text('انتخاب از پک‌های آماده', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _showStickerPicker();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.gif_box_outlined, color: Colors.blue),
+                    title: const Text('GIF (ساخت از ویدیو)'),
+                    subtitle: const Text('گیف‌های ذخیره‌شده + ساخت گیف از ویدیو', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _showGifPicker();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.circle, color: Colors.teal),
+                    title: const Text('پیام ویدیویی گرد'),
+                    subtitle: const Text('ویدیو دایره‌ای مانند تلگرام (video_note)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _recordVideoNote();
+                    },
+                  ),
+                  const Divider(height: 1),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
+                    title: const Text('حالت اسپویلر (مخفی تا زمان لمس)'),
+                    subtitle: const Text('پیام بعدی محو نمایش داده می‌شود', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    value: _isSpoiler,
+                    onChanged: (val) {
+                      setSheetState(() {});
+                      setState(() => _isSpoiler = val);
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                ],
               ),
-              ListTile(
-                leading: const Icon(Icons.gif_box_outlined, color: Colors.blue),
-                title: const Text('GIF'),
-                subtitle: const Text('جستجو، ذخیره و ساخت گیف مانند تلگرام', style: TextStyle(fontSize: 11, color: Colors.grey)),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _showGifPicker();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.video_library_outlined, color: Colors.red),
-                title: const Text('ساخت GIF از ویدیو'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _makeGifFromVideo();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.circle, color: Colors.teal),
-                title: const Text('پیام ویدیویی گرد'),
-                subtitle: const Text('ویدیو دایره‌ای مانند تلگرام (video_note)', style: TextStyle(fontSize: 11, color: Colors.grey)),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _recordVideoNote();
-                },
-              ),
-              SwitchListTile(
-                secondary: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
-                title: const Text('حالت اسپویلر (مخفی تا زمان لمس)'),
-                value: _isSpoiler,
-                onChanged: (val) {
-                  setSheetState(() {});
-                  setState(() => _isSpoiler = val);
-                },
-              ),
-            ],
+            ),
           ),
         ),
       ),
@@ -1831,107 +1878,48 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final isGroupOrChannel = _chatType == 'group' || _chatType == 'channel';
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            if (isGroupOrChannel)
-              ListTile(
-                leading: Icon(
-                  _chatType == 'channel'
-                      ? Icons.campaign_outlined
-                      : Icons.group_outlined,
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.78),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
+                if (isGroupOrChannel)
+                  ListTile(
+                    leading: Icon(_chatType == 'channel' ? Icons.campaign_outlined : Icons.group_outlined),
+                    title: Text(_chatType == 'channel' ? _label('Channel information', 'اطلاعات کانال') : _label('Group information', 'اطلاعات گروه')),
+                    onTap: () { Navigator.pop(ctx); _openManagement(); },
+                  ),
+                ListTile(
+                  leading: const Icon(Icons.report_outlined, color: Colors.orange),
+                  title: Text(_chatType == 'private' ? 'گزارش و بلاک کاربر' : 'گزارش گروه/کانال'),
+                  subtitle: const Text('گزارش + بلاک همزمان (مانند تلگرام)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  onTap: () { Navigator.pop(ctx); _reportCurrentChat(); },
                 ),
-                title: Text(
-                  _chatType == 'channel'
-                      ? _label('Channel information', 'اطلاعات کانال')
-                      : _label('Group information', 'اطلاعات گروه'),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _openManagement();
-                },
-              ),
-            ListTile(
-              leading: const Icon(Icons.report_outlined, color: Colors.orange),
-              title: Text(_chatType == 'private' ? 'گزارش کاربر' : 'گزارش گروه/کانال'),
-              subtitle: const Text('ارسال گزارش به مدیریت (مانند تلگرام)', style: TextStyle(fontSize: 11, color: Colors.grey)),
-              onTap: () {
-                Navigator.pop(ctx);
-                _reportCurrentChat();
-              },
+                ListTile(leading: const Icon(Icons.schedule), title: const Text('پیام‌های زمان‌بندی‌شده'), onTap: () { Navigator.pop(ctx); _openScheduledSheet(); }),
+                ListTile(leading: const Icon(Icons.image), title: const Text('بک‌گراند تصویری'), onTap: () { Navigator.pop(ctx); _setBackgroundImage(); }),
+                ListTile(leading: const Icon(Icons.search), title: const Text('جستجو در چت'), onTap: () { Navigator.pop(ctx); setState(() => _searchMode = true); }),
+                const Divider(height: 12),
+                ListTile(leading: const Icon(Icons.delete_outline), title: const Text('پاک کردن تاریخچه برای من'), onTap: () { Navigator.pop(ctx); _clearHistory(forAll: false); }),
+                if (!isGroupOrChannel || _myRole == 'owner' || _capabilities['clear_history_for_all'] == true)
+                  ListTile(
+                    key: const ValueKey('clear-history-for-all'),
+                    leading: const Icon(Icons.delete_forever, color: Colors.red),
+                    title: const Text('پاک کردن برای همه', style: TextStyle(color: Colors.red)),
+                    subtitle: const Text('برای همه اعضای چت حذف می‌شود', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () { Navigator.pop(ctx); _clearHistory(forAll: true); },
+                  ),
+                if (_canPinMessages && _pinned.isNotEmpty)
+                  ListTile(key: const ValueKey('unpin-all'), leading: const Icon(Icons.push_pin_outlined), title: Text(ChatLabels.of(context).unpinAll), onTap: () { Navigator.pop(ctx); _unpinAll(); }),
+                if (!isGroupOrChannel)
+                  ListTile(leading: const Icon(Icons.block, color: Colors.red), title: const Text('بلاک کاربر', style: TextStyle(color: Colors.red)), onTap: () { Navigator.pop(ctx); _blockUser(); }),
+                const SizedBox(height: 16),
+              ],
             ),
-            ListTile(
-              leading: const Icon(Icons.schedule),
-              title: const Text('پیام‌های زمان‌بندی‌شده'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _openScheduledSheet();
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.image),
-              title: const Text('بک‌گراند تصویری'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _setBackgroundImage();
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.search),
-              title: const Text('جستجو در چت'),
-              onTap: () {
-                Navigator.pop(ctx);
-                setState(() => _searchMode = true);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline),
-              title: const Text('پاک کردن تاریخچه برای من'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _clearHistory(forAll: false);
-              },
-            ),
-            // Owners always keep "delete history for everyone", in private
-            // chats as well as in their own groups and channels.
-            if (!isGroupOrChannel ||
-                _myRole == 'owner' ||
-                _capabilities['clear_history_for_all'] == true)
-              ListTile(
-                key: const ValueKey('clear-history-for-all'),
-                leading: const Icon(Icons.delete_forever, color: Colors.red),
-                title: const Text(
-                  'پاک کردن برای همه',
-                  style: TextStyle(color: Colors.red),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _clearHistory(forAll: true);
-                },
-              ),
-            if (_canPinMessages && _pinned.isNotEmpty)
-              ListTile(
-                key: const ValueKey('unpin-all'),
-                leading: const Icon(Icons.push_pin_outlined),
-                title: Text(ChatLabels.of(context).unpinAll),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _unpinAll();
-                },
-              ),
-            if (!isGroupOrChannel)
-              ListTile(
-                leading: const Icon(Icons.block, color: Colors.red),
-                title: const Text(
-                  'بلاک کاربر',
-                  style: TextStyle(color: Colors.red),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _blockUser();
-                },
-              ),
-          ],
+          ),
         ),
       ),
     );
@@ -2351,73 +2339,64 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   ],
                 ),
               ),
+            // Compact bar – avoids overflow on 360dp screens: only attach + field + schedule/voice/send.
+            // Sticker/GIF/video_note/spoiler live inside attach sheet to keep delete-for-all visible.
             Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 IconButton(
                   icon: const Icon(Icons.attach_file_rounded),
-                  onPressed:
-                      _sending || (!_can('send_photos') && !_can('send_videos') && !_can('send_files'))
-                      ? null
-                      : _showAttachMenu,
-                ),
-                IconButton(
-                  icon: const Icon(Icons.emoji_emotions_outlined),
-                  tooltip: 'استیکر',
-                  onPressed: _sending ? null : _showStickerPicker,
-                ),
-                IconButton(
-                  icon: const Icon(Icons.gif_box_outlined),
-                  tooltip: 'GIF',
-                  onPressed: _sending ? null : _showGifPicker,
-                ),
-                IconButton(
-                  icon: const Icon(Icons.videocam_outlined),
-                  tooltip: 'ویدیو گرد',
-                  onPressed: _sending ? null : _recordVideoNote,
+                  tooltip: 'پیوست (عکس، فایل، استیکر، GIF، ویدیو گرد)',
+                  onPressed: _sending ? null : _showAttachMenu,
                 ),
                 if (_isSpoiler)
-                  GestureDetector(
-                    onTap: () => setState(() => _isSpoiler = false),
-                    child: Container(
-                      margin: const EdgeInsets.only(right: 4),
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: Colors.purple.withValues(alpha: 0.2),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: Colors.purple),
-                      ),
-                      child: const Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.visibility_off, size: 14, color: Colors.purple),
-                          SizedBox(width: 4),
-                          Text('اسپویلر', style: TextStyle(fontSize: 11, color: Colors.purple)),
-                        ],
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10, right: 2),
+                    child: GestureDetector(
+                      onTap: () => setState(() => _isSpoiler = false),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.purple.withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.purple),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.visibility_off, size: 14, color: Colors.purple),
+                            SizedBox(width: 4),
+                            Text('اسپویلر', style: TextStyle(fontSize: 11, color: Colors.purple)),
+                          ],
+                        ),
                       ),
                     ),
                   ),
                 Expanded(
-                  child: TextField(
-                    controller: _textCtrl,
-                    textInputAction: TextInputAction.send,
-                    onSubmitted: (_) => _sendText(),
-                    decoration: InputDecoration(
-                      hintText: _chatType == 'channel'
-                          ? _label('Broadcast a post...', 'انتشار پست...')
-                          : _label('Message...', 'پیام...'),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(24),
-                        borderSide: BorderSide.none,
-                      ),
-                      filled: true,
-                      fillColor: theme.scaffoldBackgroundColor,
-                      contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 10,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: TextField(
+                      controller: _textCtrl,
+                      textInputAction: TextInputAction.send,
+                      onSubmitted: (_) => _sendText(),
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: InputDecoration(
+                        hintText: _chatType == 'channel'
+                            ? _label('Broadcast a post...', 'انتشار پست...')
+                            : _label('Message...', 'پیام...'),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(24),
+                          borderSide: BorderSide.none,
+                        ),
+                        filled: true,
+                        fillColor: theme.scaffoldBackgroundColor,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
                       ),
                     ),
-                    maxLines: 4,
-                    minLines: 1,
                   ),
                 ),
                 IconButton(

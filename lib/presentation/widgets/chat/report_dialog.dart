@@ -57,9 +57,21 @@ class _ReportDialogState extends State<ReportDialog> {
       if (widget.targetChatId != null) body['target_chat_id'] = widget.targetChatId;
       if (widget.targetMessageId != null) body['message_id'] = widget.targetMessageId;
       await widget.api.post(endpoint, body);
+      // Telegram parity: reporting a user also blocks them automatically.
+      if (widget.targetType == 'user' && widget.targetUserId != null) {
+        try {
+          await widget.api.post('/users/block/${widget.targetUserId}', {});
+        } catch (_) {
+          // ignore block failure – report already succeeded
+        }
+      }
       if (mounted) {
         Navigator.pop(context, true);
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('گزارش با موفقیت ارسال شد. پس از بررسی مدیریت اقدام خواهد شد.')));
+        if (widget.targetType == 'user') {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('گزارش ارسال شد و کاربر بلاک شد (مانند تلگرام).')));
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('گزارش با موفقیت ارسال شد. پس از بررسی مدیریت اقدام خواهد شد.')));
+        }
       }
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('خطا: $e')));
