@@ -3,7 +3,6 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/device_service.dart';
-import '../../../data/services/storage_service.dart';
 import '../../../data/models/user_model.dart';
 import '../../providers/auth_provider.dart';
 
@@ -35,6 +34,7 @@ class _TwoFactorScreenState extends ConsumerState<TwoFactorScreen> {
   }
 
   Future<void> _submit() async {
+    if (_loading) return;
     if (_codeCtrl.text.trim().length != 6) {
       setState(() => _error = 'کد ۶ رقمی وارد کنید');
       return;
@@ -52,19 +52,21 @@ class _TwoFactorScreenState extends ConsumerState<TwoFactorScreen> {
         'device_info': await DeviceService.getDeviceInfo(),
       });
 
-      final user = UserModel.fromJson(res['user'] as Map<String, dynamic>);
-      await ref.read(authNotifierProvider.notifier).setLoggedIn(
-        user,
-        res['access_token'] as String,
-        res['refresh_token'] as String? ?? '',
-      );
-
       if (!mounted) return;
-      Navigator.of(context).popUntil((route) => route.isFirst);
+      final user = UserModel.fromJson(res['user'] as Map<String, dynamic>);
+      await ref
+          .read(authNotifierProvider.notifier)
+          .setLoggedIn(
+            user,
+            res['access_token'] as String,
+            res['refresh_token'] as String? ?? '',
+          );
+
+      // The session-keyed app Navigator now owns the transition to chats.
     } on ApiException catch (e) {
-      setState(() => _error = e.message);
+      if (mounted) setState(() => _error = e.message);
     } catch (_) {
-      setState(() => _error = 'خطا در ورود');
+      if (mounted) setState(() => _error = 'خطا در ورود');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -114,7 +116,10 @@ class _TwoFactorScreenState extends ConsumerState<TwoFactorScreen> {
                       ? const SizedBox(
                           width: 24,
                           height: 24,
-                          child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
                         )
                       : const Text('تأیید'),
                 ),

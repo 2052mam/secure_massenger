@@ -1,5 +1,6 @@
+from app.services.timestamps import utc_iso
 from app import db
-from datetime import datetime
+from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
 import pyotp
 import uuid
@@ -26,10 +27,22 @@ class User(db.Model):
     show_profile_photo = db.Column(db.Boolean, default=True)
     show_bio = db.Column(db.Boolean, default=True)
     
+    allow_group_adds = db.Column(db.Boolean, nullable=False, default=True, server_default=db.true())
+
+    # Optional 4 digit lock for the archived chats folder (hashed, never stored raw)
+    archive_pin_hash = db.Column(db.String(255), nullable=True)
+    archive_pin_updated_at = db.Column(db.DateTime, nullable=True)
+
     # Status
     is_active = db.Column(db.Boolean, default=True)
     is_admin = db.Column(db.Boolean, default=False)
     is_support = db.Column(db.Boolean, default=False)
+
+    # Telegram-like restriction after reports (limited account)
+    is_limited = db.Column(db.Boolean, default=False, nullable=False)
+    limited_until = db.Column(db.DateTime, nullable=True)
+    limited_reason = db.Column(db.Text, nullable=True)
+    limited_by = db.Column(db.String(36), nullable=True)
     
     # Soft Delete
     is_deleted = db.Column(db.Boolean, default=False, index=True)
@@ -61,24 +74,53 @@ class User(db.Model):
         totp = pyotp.TOTP(self.totp_secret)
         return totp.verify(code, valid_window=2)  # ±60s برای ناهمزمانی ساعت سرور/گوشی (تهران)
 
+    # ----- Archive lock (4 digit PIN) -------------------------------------
+    def set_archive_pin(self, pin: str):
+        """Store only a hash; the PIN itself can never be read back."""
+        self.archive_pin_hash = generate_password_hash(pin)
+        self.archive_pin_updated_at = datetime.utcnow()
+
+    def clear_archive_pin(self):
+        self.archive_pin_hash = None
+        self.archive_pin_updated_at = datetime.utcnow()
+
+    def check_archive_pin(self, pin: str) -> bool:
+        if not self.archive_pin_hash:
+            return True
+        if not isinstance(pin, str):
+            return False
+        return check_password_hash(self.archive_pin_hash, pin)
+
+    @property
+    def has_archive_pin(self) -> bool:
+        return bool(self.archive_pin_hash)
+
     def to_dict(self, include_private=False):
+        # A killed/offline app cannot send a final offline request. Expire its
+        # heartbeat instead of leaving the profile online indefinitely.
+        online = bool(self.is_online and self.last_seen and
+                      timedelta(0) <= datetime.utcnow() - self.last_seen < timedelta(seconds=60))
         data = {
             'id': self.id,
             'username': self.username,
             'display_name': self.display_name,
             'bio': self.bio if self.show_bio else None,
             'avatar_url': self.avatar_url if self.show_profile_photo else None,
-            'is_online': self.is_online if self.show_last_seen else False,
-            'last_seen': self.last_seen.isoformat() if self.show_last_seen and self.last_seen else None,
-            'created_at': self.created_at.isoformat(),
+            'is_online': online if self.show_last_seen else False,
+            'last_seen': utc_iso(self.last_seen) if self.show_last_seen and self.last_seen else None,
+            'created_at': utc_iso(self.created_at),
         }
         if include_private:
             data.update({
                 'email': self.email,
+                'avatar_url': self.avatar_url,
+                'bio': self.bio,
+                'allow_group_adds': self.allow_group_adds,
                 'show_last_seen': self.show_last_seen,
                 'show_profile_photo': self.show_profile_photo,
                 'show_bio': self.show_bio,
                 'is_2fa_enabled': self.is_2fa_enabled,
+                'has_archive_pin': self.has_archive_pin,
             })
         return data
 

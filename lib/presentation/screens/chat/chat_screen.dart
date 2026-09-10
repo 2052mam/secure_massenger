@@ -1,3 +1,7 @@
+import 'package:file_picker/file_picker.dart';
+import '../../widgets/chat/scheduled_messages_sheet.dart';
+import '../../../core/utils/api_datetime.dart';
+import 'chat_management_screen.dart';
 import 'dart:async';
 import 'dart:io';
 
@@ -8,6 +12,13 @@ import 'package:cached_network_image/cached_network_image.dart';
 import 'package:collection/collection.dart';
 
 import '../../../data/models/message_model.dart';
+import '../../../data/models/user_model.dart';
+import '../../../data/models/chat_invite_model.dart';
+import '../../../data/services/message_reconciler.dart';
+import '../../../core/utils/chat_invite_link.dart';
+import '../../../data/models/reply_preview_model.dart';
+import '../../../data/services/media_playback_coordinator.dart';
+import '../../../core/utils/media_utils.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/storage_service.dart';
 import '../../../data/services/voice_service.dart';
@@ -15,31 +26,75 @@ import '../../../core/constants/api_constants.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/chat_list_provider.dart';
 import '../profile/user_profile_screen.dart';
-import '../../widgets/media/video_message_player.dart';
-
-import 'package:just_audio/just_audio.dart' as just_audio;
+import '../../widgets/chat/message_bubble.dart';
+import '../../widgets/chat/chat_header.dart';
+import '../../widgets/chat/chat_labels.dart';
+import '../../widgets/chat/chat_invite_dialog.dart';
+import '../../widgets/chat/message_actions_sheet.dart';
+import '../../widgets/chat/pinned_messages_bar.dart';
+import '../../widgets/chat/reaction_bar.dart';
+import '../../widgets/chat/sticker_picker.dart';
+import '../../widgets/chat/gif_picker.dart';
+import '../../widgets/chat/report_dialog.dart';
+import '../../widgets/media/video_note_player.dart';
+import 'pinned_messages_screen.dart';
+import '../../widgets/chat/reply_preview.dart';
+import '../../widgets/media/media_labels.dart';
+import '../media/photo_viewer_screen.dart';
+import '../media/view_once_photo_screen.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final String chatId;
   final String title;
   final String chatType;
+  final UserModel? otherUser;
+  final String? avatarUrl;
   const ChatScreen({
     super.key,
     required this.chatId,
     required this.title,
     this.chatType = 'private',
+    this.otherUser,
+    this.avatarUrl,
   });
 
   @override
   ConsumerState<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends ConsumerState<ChatScreen> {
+class _ChatScreenState extends ConsumerState<ChatScreen>
+    with WidgetsBindingObserver {
+  late ApiService _api;
+  late String? _authToken;
+  late final String? _sessionUserId;
+  final _reconciler = MessageReconciler();
+  UserModel? _otherUser;
+  String? _loadedChatType;
+  String? _chatTitle;
+  String? _chatAvatarUrl;
+  bool _hasChatInfo = false;
+  bool _refreshingChatInfo = false;
+  bool _chatUnavailable = false;
+  bool _openingInvite = false;
+  Route<void>? _photoRoute;
+  String? _photoMessageId;
   final _textCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
   final _searchCtrl = TextEditingController();
   final List<MessageModel> _messages = [];
   final VoiceService _voice = VoiceService();
+  final _playback = MediaPlaybackCoordinator();
+  final Map<String, GlobalKey> _messageKeys = {};
+  Timer? _highlightTimer;
+  String? _highlightedMessageId;
+  bool _openingMedia = false;
+  bool _jumpingToReply = false;
+  bool _historyMode = false;
+  bool _hasEarlier = false;
+  bool _loadingEarlier = false;
+  bool _polling = false;
+  bool _refreshingStatuses = false;
+  int _loadGeneration = 0;
   bool _loading = true;
   bool _sending = false;
   bool _searchMode = false;
@@ -52,35 +107,77 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   String? _bgImageUrl;
   bool _isRecording = false;
   String? _myRole;
-  int _membersCount = 0;
-  bool _isPublic = false;
-  String? _chatUsername;
-  String? _chatDescription;
+  Map<String, dynamic> _capabilities = {};
+  bool _isMuted = false;
+  bool _muting = false;
+  final List<MessageModel> _pinned = [];
+  int _pinnedIndex = 0;
+  bool _canPinMessages = false;
+  bool _loadingPinned = false;
+  bool _isSpoiler = false;
+  int _slowModeDelay = 0;
+  int _slowModeRemaining = 0;
+  Timer? _slowModeTimer;
 
-  String _mediaFullUrl(String? mediaId, {String? existingUrl}) {
-    if (existingUrl != null && existingUrl.isNotEmpty) {
-      if (existingUrl.startsWith('http')) return existingUrl;
-      final base = ApiConstants.baseUrl.replaceAll('/api/v1', '');
-      return '$base$existingUrl';
-    }
-    if (mediaId == null || mediaId.isEmpty) return '';
-    return '${ApiConstants.baseUrl}/media/$mediaId';
+  bool _can(String right) {
+    if (_chatUnavailable) return false;
+    if (_chatType != 'group' && _chatType != 'channel') return true;
+    return _capabilities[right] == true;
   }
+
+  bool _canDelete(MessageModel msg) {
+    if (_chatType == 'private' || _chatType == 'saved') return true;
+    if (_chatType == 'support')
+      return msg.senderId == _currentUserId ||
+          _myRole == 'owner' ||
+          _myRole == 'admin';
+    if (_chatType == 'channel') return _can('delete_messages');
+    return _can('delete_messages') ||
+        (msg.senderId == _currentUserId && _can('delete_own_messages'));
+  }
+
+  int _membersCount = 0;
+  int _onlineCount = 0;
+  bool _hideMembers = false;
+  bool _isSuspended = false;
+  String? _suspensionReason;
+  bool _isClosed = false;
+  String? _closedReason;
+
+  String get _chatType => _loadedChatType ?? widget.chatType;
+  String get _displayTitle =>
+      _otherUser?.displayName ?? _chatTitle ?? widget.title;
+  bool get _foreground {
+    final state = WidgetsBinding.instance.lifecycleState;
+    return state == null || state == AppLifecycleState.resumed;
+  }
+
+  String _mediaFullUrl(String? mediaId, {String? existingUrl}) =>
+      resolveMediaUrl(mediaId, existingUrl: existingUrl);
 
   @override
   void initState() {
     super.initState();
-    _currentUserId = StorageService.getUserId();
+    WidgetsBinding.instance.addObserver(this);
+    final session = ref.read(authenticatedSessionProvider);
+    _sessionUserId = session.userId;
+    _authToken = session.token;
+    _api = session.api;
+    _otherUser = widget.otherUser;
+    _chatAvatarUrl = widget.avatarUrl;
+    _currentUserId =
+        ref.read(authNotifierProvider).valueOrNull?.id ??
+        StorageService.getUserId();
     _loadMessages();
     _startPolling();
-    _markChatRead();
     _loadBackground();
-    _loadChatInfo(); // این رو اضافه کن
+    _loadChatInfo();
+    _loadPinned();
   }
 
   Future<void> _loadBackground() async {
     try {
-      final res = await ApiService().get('/chats/${widget.chatId}/background');
+      final res = await _api.get('/chats/${widget.chatId}/background');
       final bg = res['background'] as Map<String, dynamic>?;
       if (bg == null) return;
       final type = bg['type'] as String?;
@@ -99,23 +196,77 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   Future<void> _loadChatInfo() async {
+    if (!mounted || _refreshingChatInfo || _chatUnavailable) return;
+    _refreshingChatInfo = true;
     try {
-      final res = await ApiService().get('/chats/${widget.chatId}/info');
-      if (mounted) {
-        setState(() {
-          _myRole = res['my_role'] as String?;
-          _membersCount = res['members_count'] as int? ?? 0;
-          _isPublic = res['is_public'] as bool? ?? false;
-          _chatUsername = res['username'] as String?;
-          _chatDescription = res['description'] as String?;
-        });
+      final res = await _api.get('/chats/${widget.chatId}/info');
+      if (!mounted) return;
+      if (res['my_role'] == null &&
+          ['group', 'channel'].contains(res['chat_type'])) {
+        _showChatUnavailable();
+        return;
       }
-    } catch (_) {}
+      setState(() {
+        _myRole = res['my_role'] as String?;
+        _capabilities = Map<String, dynamic>.from(
+          res['capabilities'] as Map? ?? {},
+        );
+        _isMuted = res['is_muted'] as bool? ?? false;
+        _slowModeDelay = res['slow_mode_delay'] as int? ?? 0;
+        _membersCount = res['members_count'] as int? ?? 0;
+        _onlineCount = res['online_count'] as int? ?? 0;
+        _hideMembers = res['hide_members'] as bool? ?? false;
+        _isSuspended = res['is_suspended'] as bool? ?? false;
+        _suspensionReason = res['suspension_reason'] as String?;
+        _isClosed = res['is_closed'] as bool? ?? false;
+        _closedReason = res['closed_reason'] as String?;
+        _loadedChatType = res['chat_type'] as String?;
+        _chatTitle = res['title'] as String?;
+        _chatAvatarUrl = res['avatar_url'] as String?;
+        _otherUser = res['other_user'] is Map<String, dynamic>
+            ? UserModel.fromJson(res['other_user'] as Map<String, dynamic>)
+            : null;
+        _hasChatInfo = true;
+        if (!_can('send_messages')) _replyTo = null;
+      });
+      if (_isRecording && !_can('send_voice')) {
+        setState(() => _isRecording = false);
+        await _voice.cancelRecording();
+      }
+    } on ApiException catch (error) {
+      if ([403, 404].contains(error.statusCode)) _showChatUnavailable();
+    } catch (_) {
+      // Keep the last known profile during a temporary network failure.
+    } finally {
+      _refreshingChatInfo = false;
+    }
+  }
+
+  void _showChatUnavailable() {
+    if (!mounted || _chatUnavailable) return;
+    _pollTimer?.cancel();
+    unawaited(_playback.pause());
+    final route = _photoRoute;
+    if (route != null && route.isActive) route.navigator?.removeRoute(route);
+    setState(() {
+      ++_loadGeneration;
+      _chatUnavailable = true;
+      _loading = false;
+      _error = ChatLabels.of(context).chatUnavailable;
+      _messages.clear();
+      _messageKeys.clear();
+      _replyTo = null;
+    });
   }
 
   @override
   void dispose() {
+    ++_loadGeneration;
+    WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
+    _highlightTimer?.cancel();
+    _slowModeTimer?.cancel();
+    unawaited(_playback.pause());
     _textCtrl.dispose();
     _scrollCtrl.dispose();
     _searchCtrl.dispose();
@@ -123,15 +274,31 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state != AppLifecycleState.resumed) {
+      unawaited(_playback.pause());
+    } else {
+      _pollNow();
+    }
+  }
+
   Future<void> _markChatRead() async {
-    if (!mounted) return;
+    if (!mounted ||
+        !_foreground ||
+        _chatUnavailable ||
+        ModalRoute.of(context)?.isCurrent == false)
+      return;
     try {
-      await ApiService().post('/messages/chat/${widget.chatId}/read', {});
+      await _api.post('/messages/chat/${widget.chatId}/read', {});
+      if (!mounted) return;
       ref.read(chatListProvider.notifier).refresh();
     } catch (_) {}
   }
 
   Future<void> _loadMessages({String? query}) async {
+    if (!mounted || _chatUnavailable) return;
+    final generation = ++_loadGeneration;
     setState(() {
       _loading = true;
       _error = null;
@@ -139,28 +306,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     try {
       final Map<String, dynamic> res;
       if (query != null && query.length >= 2) {
-        res = await ApiService().get(
+        res = await _api.get(
           '/messages/search/${widget.chatId}',
           query: {'q': query},
         );
       } else {
-        res = await ApiService().get('/messages/${widget.chatId}');
+        res = await _api.get('/messages/${widget.chatId}');
       }
-      final list = (res['messages'] as List? ?? [])
+      if (!mounted || generation != _loadGeneration) return;
+      final rawMessages = (res['messages'] as List? ?? [])
           .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
           .toList();
+      final list = _reconciler.reconcile(rawMessages);
       setState(() {
         _messages
           ..clear()
           ..addAll(list);
-        if (list.isNotEmpty && query == null) _lastMessageId = list.last.id;
+        _messageKeys.removeWhere((id, _) => !list.any((m) => m.id == id));
+        if (query == null) {
+          _lastMessageId = rawMessages.isEmpty ? null : rawMessages.last.id;
+        }
+        _hasEarlier = query == null && res['has_more'] == true;
+        _historyMode = false;
         _loading = false;
       });
+      unawaited(_refreshMessageStatuses());
       if (query == null) {
         _scrollToBottom();
         _markChatRead();
       }
     } catch (e) {
+      if (!mounted || generation != _loadGeneration) return;
+      if (e is ApiException && [403, 404].contains(e.statusCode)) {
+        _showChatUnavailable();
+        return;
+      }
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -168,99 +348,577 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     }
   }
 
+  void _mergeMessages(Iterable<MessageModel> messages) {
+    for (final message in _reconciler.reconcile(messages)) {
+      final index = _messages.indexWhere((m) => m.id == message.id);
+      if (index == -1) {
+        _messages.add(message);
+      } else {
+        final previous = _messages[index];
+        _messages[index] = message.copyWith(
+          status: MessageReconciler.newestStatus(
+            previous.status,
+            message.status,
+          ),
+          viewedAt: previous.viewedAt ?? message.viewedAt,
+        );
+      }
+    }
+    _messages.sort((a, b) {
+      final order = a.createdAt.compareTo(b.createdAt);
+      return order == 0 ? a.id.compareTo(b.id) : order;
+    });
+    // Only history/new-message polls advance the server cursor. A send or
+    // an older page must not skip remote messages still waiting to be polled.
+  }
+
+  Future<void> _loadEarlier() async {
+    if (_loadingEarlier || _messages.isEmpty || !_hasEarlier) return;
+    final generation = _loadGeneration;
+    setState(() => _loadingEarlier = true);
+    final oldExtent = _scrollCtrl.hasClients
+        ? _scrollCtrl.position.maxScrollExtent
+        : 0.0;
+    final oldOffset = _scrollCtrl.hasClients ? _scrollCtrl.offset : 0.0;
+    try {
+      final res = await _api.get(
+        '/messages/${widget.chatId}',
+        query: {'before_id': _messages.first.id},
+      );
+      if (!mounted || generation != _loadGeneration) return;
+      final list = (res['messages'] as List? ?? []).map(
+        (e) => MessageModel.fromJson(e as Map<String, dynamic>),
+      );
+      setState(() {
+        _mergeMessages(list);
+        _hasEarlier = res['has_more'] == true;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted ||
+            !_scrollCtrl.hasClients ||
+            generation != _loadGeneration)
+          return;
+        final offset =
+            oldOffset + _scrollCtrl.position.maxScrollExtent - oldExtent;
+        _scrollCtrl.jumpTo(
+          offset.clamp(0.0, _scrollCtrl.position.maxScrollExtent).toDouble(),
+        );
+      });
+    } catch (e) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
+    } finally {
+      if (mounted) setState(() => _loadingEarlier = false);
+    }
+  }
+
+  ReplyPreviewModel? _replyPreviewFor(MessageModel message) {
+    if (message.replyTo != null) return message.replyTo;
+    final id = message.replyToId;
+    if (id == null) return null;
+    return _messages.firstWhereOrNull((m) => m.id == id)?.asReplyPreview ??
+        ReplyPreviewModel.unavailable(id);
+  }
+
+  Future<void> _jumpToReply(String id) async {
+    if (_jumpingToReply || _reconciler.isUnavailable(id)) return;
+    _jumpingToReply = true;
+    try {
+      var target = _messageKeys[id]?.currentContext;
+      if (target == null) {
+        final generation = ++_loadGeneration;
+        // Start the history window at the original, so it can be reached even
+        // outside the lazy list's built items without an estimated pixel jump.
+        final res = await _api.get(
+          '/messages/${widget.chatId}',
+          query: {'from_id': id},
+        );
+        if (!mounted || generation != _loadGeneration) return;
+        final list = (res['messages'] as List? ?? [])
+            .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
+            .toList();
+        if (list.isEmpty || list.first.id != id)
+          throw StateError('Message unavailable');
+        await _playback.pause();
+        if (!mounted) return;
+        setState(() {
+          _messages
+            ..clear()
+            ..addAll(_reconciler.reconcile(list));
+          _historyMode = true;
+          _searchMode = false;
+          _hasEarlier = true;
+          _loading = false;
+          _error = null;
+        });
+        if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+        await WidgetsBinding.instance.endOfFrame;
+        if (!mounted) return;
+        target = _messageKeys[id]?.currentContext;
+      }
+      if (target != null && target.mounted) {
+        await Scrollable.ensureVisible(
+          target,
+          alignment: 0.25,
+          duration: const Duration(milliseconds: 280),
+          curve: Curves.easeOutCubic,
+        );
+      }
+      if (!mounted) return;
+      _highlightTimer?.cancel();
+      setState(() => _highlightedMessageId = id);
+      _highlightTimer = Timer(const Duration(seconds: 2), () {
+        if (mounted) setState(() => _highlightedMessageId = null);
+      });
+    } catch (_) {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(MediaLabels.of(context).unavailable)),
+        );
+    } finally {
+      _jumpingToReply = false;
+    }
+  }
+
+  /// The pinned bar is chat state, not message state: it must survive
+  /// scrolling, search and history mode, so it is loaded separately.
+  Future<void> _loadPinned() async {
+    if (!mounted || _loadingPinned || _chatUnavailable) return;
+    _loadingPinned = true;
+    try {
+      final res = await _api.get('/messages/chat/${widget.chatId}/pinned');
+      if (!mounted) return;
+      final list = (res['messages'] as List? ?? [])
+          .whereType<Map<String, dynamic>>()
+          .map(MessageModel.fromJson)
+          .where((m) => !_reconciler.isUnavailable(m.id))
+          .toList();
+      final canPin = res['can_pin'] == true;
+      if (const ListEquality<MessageModel>().equals(_pinned, list) &&
+          canPin == _canPinMessages) {
+        return;
+      }
+      setState(() {
+        _pinned
+          ..clear()
+          ..addAll(list);
+        _canPinMessages = canPin;
+        if (_pinnedIndex >= _pinned.length) _pinnedIndex = 0;
+      });
+    } catch (_) {
+      // The bar simply stays as it is; the next poll retries.
+    } finally {
+      _loadingPinned = false;
+    }
+  }
+
+  Future<void> _togglePin(MessageModel msg, bool pin) async {
+    try {
+      await _api.post('/messages/${msg.id}/${pin ? 'pin' : 'unpin'}', {});
+      if (!mounted) return;
+      setState(() {
+        final index = _messages.indexWhere((m) => m.id == msg.id);
+        if (index != -1) {
+          _messages[index] = _messages[index].copyWith(isPinned: pin);
+        }
+        if (!pin) {
+          _pinned.removeWhere((m) => m.id == msg.id);
+          if (_pinnedIndex >= _pinned.length) _pinnedIndex = 0;
+        }
+      });
+      await _loadPinned();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _unpinAll() async {
+    try {
+      await _api.post('/messages/chat/${widget.chatId}/unpin-all', {});
+      if (!mounted) return;
+      setState(() {
+        _pinned.clear();
+        _pinnedIndex = 0;
+      });
+      await _loadPinned();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _openPinnedMessages() async {
+    final id = await Navigator.of(context).push<String>(
+      MaterialPageRoute<String>(
+        builder: (_) => PinnedMessagesScreen(
+          pinned: List<MessageModel>.from(_pinned),
+          canPin: _canPinMessages,
+          onUnpin: (message) => unawaited(_togglePin(message, false)),
+          onUnpinAll: _unpinAll,
+        ),
+      ),
+    );
+    if (!mounted || id == null) return;
+    await _jumpToReply(id);
+  }
+
+  void _tapPinnedBar() {
+    if (_pinned.isEmpty) return;
+    final index = _pinnedIndex < _pinned.length ? _pinnedIndex : 0;
+    final message = _pinned[index];
+    setState(() => _pinnedIndex = (index + 1) % _pinned.length);
+    unawaited(_jumpToReply(message.id));
+  }
+
   void _startPolling() {
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(
-      Duration(seconds: ApiConstants.pollingIntervalSeconds),
-      (_) {
-        if (!_searchMode) {
-          _pollNewMessages();
-          _refreshMessageStatuses();
-        }
-      },
+      const Duration(seconds: ApiConstants.pollingIntervalSeconds),
+      (_) => _pollNow(),
     );
   }
 
-  Future<void> _refreshMessageStatuses() async {
+  void _pollNow() {
+    if (!mounted || !_foreground || _chatUnavailable) return;
+    unawaited(_loadChatInfo());
+    if (_loading) return;
+    if (!_searchMode && !_historyMode) unawaited(_pollNewMessages());
+    unawaited(_loadPinned());
+    // Reconcile all loaded pages, even in search/history and after read ticks.
+    unawaited(_refreshMessageStatuses());
+  }
+
+  void _applyMessageUpdate(MessageSyncResult update) {
     if (!mounted) return;
-    final pendingIds = _messages
-        .where((m) => m.senderId == _currentUserId && m.status != 'read')
-        .map((m) => m.id)
-        .toList();
-    if (pendingIds.isEmpty) return;
+    final updated = _reconciler.reconcile(_messages, update: update);
+    final clearReply =
+        _replyTo != null && _reconciler.isUnavailable(_replyTo!.id);
+    if (const ListEquality<MessageModel>().equals(_messages, updated) &&
+        !clearReply)
+      return;
+    final removedMedia = _messages.any(
+      (m) => update.deletedIds.contains(m.id) && m.mediaId != null,
+    );
+    if (removedMedia) unawaited(_playback.pause());
+    setState(() {
+      _messages
+        ..clear()
+        ..addAll(updated);
+      _messageKeys.removeWhere((id, _) => _reconciler.isUnavailable(id));
+      if (clearReply) _replyTo = null;
+      if (_highlightedMessageId != null &&
+          _reconciler.isUnavailable(_highlightedMessageId!)) {
+        _highlightedMessageId = null;
+      }
+    });
+    // Close only the deleted photo's route, never an unrelated dialog/chat.
+    final photoRoute = _photoRoute;
+    if (photoRoute != null &&
+        photoRoute.isActive &&
+        _photoMessageId != null &&
+        update.deletedIds.contains(_photoMessageId)) {
+      photoRoute.navigator?.removeRoute(photoRoute);
+    }
+    if (update.deletedIds.isNotEmpty) {
+      unawaited(ref.read(chatListProvider.notifier).refresh());
+    }
+    final pinnedIds = update.pinnedIds;
+    if (pinnedIds != null &&
+        !const SetEquality<String>().equals(
+          pinnedIds.toSet(),
+          _pinned.map((m) => m.id).toSet(),
+        )) {
+      unawaited(_loadPinned());
+    }
+  }
+
+  Future<void> _refreshMessageStatuses() async {
+    if (!mounted || _refreshingStatuses || _chatUnavailable || !_foreground)
+      return;
+    final generation = _loadGeneration;
+    final batches = _reconciler.batches(
+      _messages.reversed,
+      selectedReply: _replyTo,
+    );
+    if (batches.isEmpty) return;
+    _refreshingStatuses = true;
     try {
-      final res = await ApiService().post('/messages/statuses', {
-        'message_ids': pendingIds,
-      });
-      final statuses = (res['statuses'] as Map<String, dynamic>? ?? {});
-      if (statuses.isEmpty || !mounted) return;
-      setState(() {
-        for (var i = 0; i < _messages.length; i++) {
-          final m = _messages[i];
-          final newStatus = statuses[m.id] as String?;
-          if (newStatus != null && newStatus != m.status) {
-            _messages[i] = m.copyWith(status: newStatus);
-          }
-        }
-      });
-    } catch (_) {}
+      // Do not truncate at 100: users can have many earlier pages loaded.
+      for (final ids in batches) {
+        final res = await _api.post('/messages/statuses', {
+          'chat_id': widget.chatId,
+          'message_ids': ids,
+        });
+        if (!mounted || generation != _loadGeneration || !_foreground) return;
+        _applyMessageUpdate(MessageSyncResult.fromJson(res));
+      }
+    } on ApiException catch (error) {
+      if ([403, 404].contains(error.statusCode)) _showChatUnavailable();
+    } catch (_) {
+      // Every batch is reconciled again next cycle; missed polls lose no state.
+    } finally {
+      _refreshingStatuses = false;
+    }
   }
 
   Future<void> _pollNewMessages() async {
-    if (!mounted) return;
+    if (!mounted || _polling || _loading || _historyMode) return;
+    _polling = true;
+    final generation = _loadGeneration;
     try {
       final query = <String, String>{};
       if (_lastMessageId != null) query['after_id'] = _lastMessageId!;
-      final res = await ApiService().get(
-        '/messages/${widget.chatId}',
-        query: query,
-      );
+      final res = await _api.get('/messages/${widget.chatId}', query: query);
+      if (!mounted ||
+          _searchMode ||
+          _historyMode ||
+          generation != _loadGeneration)
+        return;
       final list = (res['messages'] as List? ?? [])
           .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
           .toList();
-      if (list.isNotEmpty && mounted) {
-        setState(() {
-          for (final m in list) {
-            if (!_messages.any((x) => x.id == m.id)) {
-              _messages.add(m);
-            }
-          }
-          _lastMessageId = _messages.last.id;
-        });
-        _scrollToBottom();
+      if (list.isNotEmpty) {
+        _lastMessageId = list.last.id;
+        final atBottom =
+            !_scrollCtrl.hasClients ||
+            _scrollCtrl.position.maxScrollExtent - _scrollCtrl.offset < 160;
+        setState(() => _mergeMessages(list));
+        if (atBottom) _scrollToBottom();
         _markChatRead();
       }
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      _polling = false;
+    }
   }
 
-  Future<void> _sendText() async {
+  MessageModel _sentMessage(Map<String, dynamic> payload, MessageModel? reply) {
+    final message = MessageModel.fromJson({
+      'reply_to_id': reply?.id,
+      ...payload,
+    });
+    // Trust the current server's privacy-filtered snapshot. Only older servers
+    // with abbreviated send responses need the locally selected quote fallback.
+    return message.replyTo != null || reply == null
+        ? message
+        : message.copyWith(replyTo: reply.asReplyPreview);
+  }
+
+  void _startSlowModeTimer(int seconds) {
+    _slowModeTimer?.cancel();
+    setState(() => _slowModeRemaining = seconds);
+    _slowModeTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      if (_slowModeRemaining <= 1) {
+        timer.cancel();
+        setState(() => _slowModeRemaining = 0);
+      } else {
+        setState(() => _slowModeRemaining--);
+      }
+    });
+  }
+
+  void _handleSlowModeError(String message) {
+    final match = RegExp(r'(\d+)').firstMatch(message);
+    final secs = match != null ? int.tryParse(match.group(1)!) ?? _slowModeDelay : _slowModeDelay;
+    _startSlowModeTimer(secs > 0 ? secs : 10);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
+  Future<void> _sendText({DateTime? scheduledAt}) async {
     final text = _textCtrl.text.trim();
-    if (text.isEmpty || _sending) return;
+    if (text.isEmpty || _sending || !_can('send_messages')) return;
+    if (_slowModeRemaining > 0 && (_myRole != 'owner' && _myRole != 'admin')) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('لطفاً $_slowModeRemaining ثانیه دیگر برای ارسال پیام صبر کنید.')),
+      );
+      return;
+    }
+    final reply = _replyTo;
+    final sendSpoiler = _isSpoiler;
     setState(() => _sending = true);
     try {
       final body = <String, dynamic>{
         'chat_id': widget.chatId,
         'content': text,
         'message_type': 'text',
+        'is_spoiler': sendSpoiler,
       };
-      if (_replyTo != null) body['reply_to_id'] = _replyTo!.id;
-      final res = await ApiService().post('/messages/', body);
-      final msg = MessageModel.fromJson(res);
+      if (reply != null) body['reply_to_id'] = reply.id;
+      if (scheduledAt != null) {
+        // Iran time fix: Flutter DateTime is local (e.g. Asia/Tehran +03:30).
+        // toUtc().toIso8601String() sends UTC with 'Z', so backend stores correct UTC
+        // and displays it back in local time via parseApiDateTime(...).toLocal().
+        body['scheduled_at'] = scheduledAt.toUtc().toIso8601String();
+      }
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      if (res['is_scheduled'] == true) {
+        setState(() {
+          _textCtrl.clear();
+          _replyTo = null;
+          _isSpoiler = false;
+          _sending = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('پیام زمان‌بندی شد.')),
+        );
+        return;
+      }
+      final msg = _sentMessage(res, reply);
       setState(() {
-        _messages.add(msg);
-        _lastMessageId = msg.id;
+        _mergeMessages([msg]);
         _textCtrl.clear();
         _replyTo = null;
+        _isSpoiler = false;
         _sending = false;
       });
+      if (_slowModeDelay > 0 && (_myRole != 'owner' && _myRole != 'admin')) {
+        _startSlowModeTimer(_slowModeDelay);
+      }
+      if (_historyMode) await _loadMessages();
+      if (!mounted) return;
       _scrollToBottom();
       ref.read(chatListProvider.notifier).refresh();
-    } catch (e) {
+    } on ApiException catch (e) {
+      if (!mounted) return;
       setState(() => _sending = false);
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+      if (e.statusCode == 429) {
+        _handleSlowModeError(e.message);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
       }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _sending = false);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(e.toString())));
+    }
+  }
+
+  Future<void> _scheduleMessage() async {
+    final text = _textCtrl.text.trim();
+    if (text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('ابتدا متن پیام را وارد کنید')),
+      );
+      return;
+    }
+    final now = DateTime.now();
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: now.add(const Duration(minutes: 5)),
+      firstDate: now,
+      lastDate: now.add(const Duration(days: 365)),
+    );
+    if (pickedDate == null || !mounted) return;
+
+    final pickedTime = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(now.add(const Duration(minutes: 10))),
+    );
+    if (pickedTime == null || !mounted) return;
+
+    final scheduledDateTime = DateTime(
+      pickedDate.year,
+      pickedDate.month,
+      pickedDate.day,
+      pickedTime.hour,
+      pickedTime.minute,
+    );
+
+    if (scheduledDateTime.isBefore(DateTime.now().add(const Duration(seconds: 30)))) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('زمان انتخاب‌شده باید در آینده باشد')),
+      );
+      return;
+    }
+
+    _sendText(scheduledAt: scheduledDateTime);
+  }
+
+  void _openScheduledSheet() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => ScheduledMessagesSheet(
+        chatId: widget.chatId,
+        api: _api,
+      ),
+    );
+  }
+
+  Future<void> _pickAndSendFile() async {
+    if (_sending || !_can('send_files')) return;
+    final result = await FilePicker.platform.pickFiles();
+    if (result == null || result.files.single.path == null || !mounted) return;
+
+    final file = File(result.files.single.path!);
+    final fileName = result.files.single.name;
+    final reply = _replyTo;
+
+    bool sendSpoiler = _isSpoiler;
+    setState(() => _sending = true);
+    try {
+      final upload = await _api.uploadFile('/media/upload', file);
+      final mediaId = upload['id'] as String;
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'file',
+        'media_id': mediaId,
+        'content': fileName,
+        'is_spoiler': sendSpoiler,
+      };
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({
+        ...res,
+        'media_id': mediaId,
+        'media_url': '/api/v1/media/$mediaId',
+        'message_type': 'file',
+        'original_name': fileName,
+        'is_spoiler': sendSpoiler,
+      }, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _isSpoiler = false;
+        _sending = false;
+      });
+      if (_slowModeDelay > 0 && (_myRole != 'owner' && _myRole != 'admin')) {
+        _startSlowModeTimer(_slowModeDelay);
+      }
+      if (_historyMode) await _loadMessages();
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _sending = false);
+      if (e.statusCode == 429) {
+        _handleSlowModeError(e.message);
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _sending = false);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -269,52 +927,95 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     bool isVideo = false,
     bool viewOnce = false,
   }) async {
+    if (_sending || !_can(isVideo ? 'send_videos' : 'send_photos')) return;
     final picker = ImagePicker();
     final XFile? picked = isVideo
         ? await picker.pickVideo(source: source)
         : await picker.pickImage(
             source: source,
-            maxWidth: 1600,
-            imageQuality: 85,
+            maxWidth: 4096,
+            imageQuality: 95,
           );
-    if (picked == null) return;
+    if (picked == null || !mounted) return;
 
     bool sendViewOnce = viewOnce;
+    bool sendSpoiler = _isSpoiler;
     if (!isVideo) {
       final choice = await showModalBottomSheet<String>(
         context: context,
         builder: (ctx) => SafeArea(
-          child: Wrap(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
+              Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
               ListTile(
                 leading: const Icon(Icons.send),
                 title: const Text('ارسال معمولی'),
                 onTap: () => Navigator.pop(ctx, 'normal'),
               ),
               ListTile(
-                leading: const Icon(Icons.timer, color: Colors.orange),
-                title: const Text('ارسال تایم‌دار (View Once)'),
-                onTap: () => Navigator.pop(ctx, 'once'),
+                leading: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
+                title: const Text('ارسال عکس با اسپویلر (مخفی)'),
+                onTap: () => Navigator.pop(ctx, 'spoiler'),
               ),
+              if (_can('send_view_once_photos'))
+                ListTile(
+                  leading: const Icon(Icons.timer, color: Colors.orange),
+                  title: Text(MediaLabels.of(ctx).viewOnce),
+                  subtitle: Text(MediaLabels.of(ctx).disappears),
+                  onTap: () => Navigator.pop(ctx, 'once'),
+                ),
               ListTile(
                 leading: const Icon(Icons.close),
                 title: const Text('لغو'),
                 onTap: () => Navigator.pop(ctx, 'cancel'),
               ),
+              const SizedBox(height: 8),
             ],
           ),
         ),
       );
-      if (choice == null || choice == 'cancel') return;
-      sendViewOnce = choice == 'once';
+      if (choice == null || choice == 'cancel' || !mounted) return;
+      if (choice == 'spoiler') sendSpoiler = true;
+      if (choice == 'once') sendViewOnce = true;
+    } else {
+      if (!sendSpoiler) {
+        final choice = await showModalBottomSheet<String>(
+          context: context,
+          builder: (ctx) => SafeArea(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
+                ListTile(
+                  leading: const Icon(Icons.send),
+                  title: const Text('ارسال معمولی'),
+                  onTap: () => Navigator.pop(ctx, 'normal'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
+                  title: const Text('ارسال ویدیو با اسپویلر (مخفی)'),
+                  onTap: () => Navigator.pop(ctx, 'spoiler'),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.close),
+                  title: const Text('لغو'),
+                  onTap: () => Navigator.pop(ctx, 'cancel'),
+                ),
+                const SizedBox(height: 8),
+              ],
+            ),
+          ),
+        );
+        if (choice == null || choice == 'cancel' || !mounted) return;
+        if (choice == 'spoiler') sendSpoiler = true;
+      }
     }
 
+    final reply = _replyTo;
     setState(() => _sending = true);
     try {
-      final upload = await ApiService().uploadFile(
-        '/media/upload',
-        File(picked.path),
-      );
+      final upload = await _api.uploadFile('/media/upload', File(picked.path));
       final mediaId = upload['id'] as String;
       final mediaType =
           upload['media_type'] as String? ?? (isVideo ? 'video' : 'image');
@@ -324,41 +1025,54 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         'media_id': mediaId,
         'content': '',
         'is_view_once': sendViewOnce,
+        'is_spoiler': sendSpoiler,
       };
-      if (_replyTo != null) body['reply_to_id'] = _replyTo!.id;
-      final res = await ApiService().post('/messages/', body);
-      final msg = MessageModel.fromJson({
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({
         ...res,
         'media_id': mediaId,
-        'media_url': '/api/v1/media/$mediaId',
+        'media_url': sendViewOnce ? null : '/api/v1/media/$mediaId',
         'message_type': mediaType,
         'is_view_once': sendViewOnce,
-      });
+        'is_spoiler': sendSpoiler,
+      }, reply);
       setState(() {
-        _messages.add(msg);
-        _lastMessageId = msg.id;
+        _mergeMessages([msg]);
         _replyTo = null;
+        _isSpoiler = false;
         _sending = false;
       });
+      if (_historyMode) await _loadMessages();
       _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
+      if (!mounted) return;
       setState(() => _sending = false);
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
 
   Future<void> _toggleVoiceRecord() async {
-    if (_sending) return;
+    if (_sending || (!_isRecording && !_can('send_voice'))) return;
     if (_isRecording) {
       final file = await _voice.stopRecording();
+      if (!mounted) return;
       setState(() => _isRecording = false);
       if (file == null) return;
+      if (!_can('send_voice')) {
+        await _voice.cancelRecording();
+        return;
+      }
+      final reply = _replyTo;
       setState(() => _sending = true);
       try {
-        final upload = await ApiService().uploadFile('/media/upload', file);
+        final upload = await _api.uploadFile('/media/upload', file);
         final mediaId = upload['id'] as String;
         final body = <String, dynamic>{
           'chat_id': widget.chatId,
@@ -366,30 +1080,40 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
           'media_id': mediaId,
           'content': '',
         };
-        if (_replyTo != null) body['reply_to_id'] = _replyTo!.id;
-        final res = await ApiService().post('/messages/', body);
-        final msg = MessageModel.fromJson({
+        if (reply != null) body['reply_to_id'] = reply.id;
+        final res = await _api.post('/messages/', body);
+        if (!mounted) return;
+        final msg = _sentMessage({
           ...res,
           'media_id': mediaId,
           'media_url': '/api/v1/media/$mediaId',
           'message_type': 'voice',
-        });
+        }, reply);
         setState(() {
-          _messages.add(msg);
-          _lastMessageId = msg.id;
+          _mergeMessages([msg]);
           _replyTo = null;
           _sending = false;
         });
+        if (_historyMode) await _loadMessages();
         _scrollToBottom();
+        if (mounted) ref.read(chatListProvider.notifier).refresh();
       } catch (e) {
+        if (!mounted) return;
         setState(() => _sending = false);
         if (mounted) {
-          ScaffoldMessenger.of(context)
-              .showSnackBar(SnackBar(content: Text(e.toString())));
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text(e.toString())));
         }
       }
     } else {
+      await _playback.pause();
       final ok = await _voice.startRecording();
+      if (!mounted) return;
+      if (ok && !_can('send_voice')) {
+        await _voice.cancelRecording();
+        return;
+      }
       if (ok) {
         setState(() => _isRecording = true);
       } else if (mounted) {
@@ -402,19 +1126,313 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   Future<void> _cancelVoiceRecord() async {
     await _voice.cancelRecording();
+    if (!mounted) return;
     setState(() => _isRecording = false);
+  }
+
+  // --- Telegram-like reactions ---
+  Future<void> _toggleReaction(MessageModel msg, String emoji) async {
+    try {
+      await _api.post('/reactions/${msg.id}/reaction', {'emoji': emoji});
+      // Local optimistic toggle: update reactions list immediately, then refresh from server
+      // For simplicity, trigger a status refresh which will pull reactions via payloads
+      unawaited(_refreshMessageStatuses());
+      // Also poll messages to get updated reactions quickly
+      final res = await _api.get('/messages/${widget.chatId}', query: {'from_id': msg.id});
+      if (!mounted) return;
+      final list = (res['messages'] as List? ?? []).map((e) => MessageModel.fromJson(e as Map<String, dynamic>)).toList();
+      if (list.isNotEmpty) {
+        setState(() {
+          for (final updated in list) {
+            final idx = _messages.indexWhere((m) => m.id == updated.id);
+            if (idx != -1) _messages[idx] = updated;
+          }
+        });
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+    }
+  }
+
+  Future<void> _showReactionPicker(MessageModel msg) async {
+    final emoji = await showModalBottomSheet<String>(
+      context: context,
+      builder: (_) => const QuickReactionSheet(),
+    );
+    if (emoji != null && mounted) await _toggleReaction(msg, emoji);
+  }
+
+  // --- Telegram-like stickers ---
+  Future<void> _showStickerPicker() async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StickerPicker(
+        api: _api,
+        onStickerSelected: (sticker) async {
+          Navigator.pop(ctx);
+          await _sendSticker(sticker);
+        },
+      ),
+    );
+  }
+
+  Future<void> _sendSticker(dynamic sticker) async {
+    if (_sending || !_can('send_messages')) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('امکان ارسال استیکر در این چت وجود ندارد')));
+      return;
+    }
+    final reply = _replyTo;
+    setState(() => _sending = true);
+    try {
+      // sticker is StickerModel or map with id/media
+      final stickerId = sticker is Map ? sticker['id'] : sticker.id;
+      final emoji = sticker is Map ? sticker['emoji'] : sticker.emoji;
+      // If sticker has media_id, use it; else send content emoji
+      String? mediaId;
+      if (sticker is Map && sticker['media_id'] != null) mediaId = sticker['media_id'] as String;
+      else if (sticker is! Map && sticker.mediaId != null) mediaId = sticker.mediaId;
+      else if (sticker is! Map && sticker.fileUrl != null) {
+        // For seeded packs we may have url only - send as sticker via content fallback
+      }
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'sticker',
+        'content': emoji ?? '🙂',
+      };
+      if (mediaId != null) body['media_id'] = mediaId;
+      // If no mediaId but fileUrl exists, we send without media and server will fallback to display emoji
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage(res, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  // --- Telegram-like GIFs ---
+  Future<void> _showGifPicker() async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => GifPicker(
+        api: _api,
+        onGifSelected: (gif) async {
+          Navigator.pop(ctx);
+          await _sendGif(gif);
+        },
+      ),
+    );
+  }
+
+  Future<void> _sendGif(dynamic gif) async {
+    if (_sending || !_can('send_messages')) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('امکان ارسال گیف وجود ندارد')));
+      return;
+    }
+    final reply = _replyTo;
+    setState(() => _sending = true);
+    try {
+      // gif is SavedGif (has mediaId or gif_url) – online GIFs are no longer offered.
+      String? mediaId;
+      String? gifUrl;
+      String? title;
+      if (gif is Map) {
+        mediaId = gif['media_id'] as String?;
+        gifUrl = gif['gif_url'] as String? ?? gif['url'] as String?;
+        title = gif['title'] as String?;
+      } else {
+        // GifModel
+        try { mediaId = (gif as dynamic).mediaId as String?; } catch (_) {}
+        try { gifUrl = (gif as dynamic).gifUrl as String?; } catch (_) {}
+        try { title = (gif as dynamic).title as String?; } catch (_) {}
+        try { gifUrl ??= (gif as dynamic).previewUrl as String?; } catch (_) {}
+      }
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'gif',
+        'content': (title?.isNotEmpty == true ? title : null) ?? gifUrl ?? 'GIF',
+      };
+      if (mediaId != null && mediaId.isNotEmpty) {
+        body['media_id'] = mediaId;
+      } else if (gifUrl != null && gifUrl.isNotEmpty) {
+        // fallback: send URL as content; backend will still create gif message
+        body['content'] = gifUrl;
+      } else {
+        throw Exception('گیف انتخاب‌شده فاقد اطلاعات است');
+      }
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({
+        ...res,
+        // Hydrate media_url for local preview when backend omits it but we have the external URL
+        if ((res['media_url'] == null || (res['media_url'] as String).isEmpty) && gifUrl != null && !gifUrl.startsWith('/')) 'media_url': gifUrl,
+        if (res['media_id'] == null && mediaId != null) 'media_id': mediaId,
+      }, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    } finally {
+      if (mounted && _sending) setState(() => _sending = false);
+    }
+  }
+
+  Future<void> _makeGifFromVideo() async {
+    final picker = ImagePicker();
+    final video = await picker.pickVideo(source: ImageSource.gallery, maxDuration: const Duration(seconds: 60));
+    if (video == null || !mounted) return;
+    setState(() => _sending = true);
+    try {
+      final upload = await _api.uploadFile('/media/upload', File(video.path));
+      final mediaId = upload['id'] as String?;
+      if (mediaId == null || mediaId.isEmpty) throw Exception('آپلود ویدیو ناموفق بود');
+      // /gifs/make returns {ok:true, media_id, gif_url} – not {gif:{}}
+      Map<String, dynamic> res;
+      try {
+        res = await _api.post('/gifs/make', {'media_id': mediaId, 'title': 'Converted GIF'});
+      } catch (_) {
+        // If make endpoint fails, fall back to sending video as gif directly
+        res = {'media_id': mediaId, 'gif_url': '/api/v1/media/$mediaId'};
+      }
+      final outMediaId = (res['media_id'] as String?) ?? mediaId;
+      final gifUrl = res['gif_url'] as String? ?? res['url'] as String? ?? '/api/v1/media/$outMediaId';
+      final gifMap = res['gif'] as Map<String, dynamic>?;
+      if (gifMap != null) {
+        await _sendGif(gifMap);
+        return;
+      }
+      // Fallback: optionally save to saved GIFs for future reuse (best-effort)
+      try {
+        await _api.post('/gifs/save', {'media_id': outMediaId, 'gif_url': gifUrl, 'preview_url': gifUrl, 'title': 'GIF از ویدیو'});
+      } catch (_) {}
+      // Direct send as gif message (most reliable, avoids double-save crash)
+      final reply = _replyTo;
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'gif',
+        'media_id': outMediaId,
+        'content': 'GIF',
+      };
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final msgRes = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({...msgRes, 'media_id': outMediaId, 'media_url': '/api/v1/media/$outMediaId', 'message_type': 'gif'}, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('ساخت گیف ناموفق: $e')));
+      }
+    } finally {
+      if (mounted && _sending) setState(() => _sending = false);
+    }
+  }
+
+  // --- Telegram-like round video messages (video_note) ---
+  Future<void> _recordVideoNote() async {
+    if (_sending || !_can('send_messages')) return;
+    // Telegram round videos are portrait, max 60s, circular. We reuse gallery/camera video picker and send as video_note.
+    final picker = ImagePicker();
+    final XFile? video = await picker.pickVideo(source: ImageSource.camera, maxDuration: const Duration(seconds: 60));
+    if (video == null || !mounted) return;
+    final file = File(video.path);
+    final reply = _replyTo;
+    setState(() => _sending = true);
+    try {
+      final upload = await _api.uploadFile('/media/upload', file);
+      final mediaId = upload['id'] as String;
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'video_note',
+        'media_id': mediaId,
+        'content': '',
+      };
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({...res, 'media_id': mediaId, 'media_url': '/api/v1/media/$mediaId', 'message_type': 'video_note'}, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _reportCurrentChat() async {
+    final targetType = _chatType == 'private' ? 'user' : 'chat';
+    final targetUserId = _chatType == 'private' ? _otherUser?.id : null;
+    await showDialog(
+      context: context,
+      builder: (_) => ReportDialog(
+        api: _api,
+        targetType: targetType == 'user' ? 'user' : 'group',
+        targetUserId: targetUserId,
+        targetChatId: widget.chatId,
+        title: _displayTitle,
+      ),
+    );
+  }
+
+  Future<void> _reportMessage(MessageModel msg) async {
+    await showDialog(
+      context: context,
+      builder: (_) => ReportDialog(
+        api: _api,
+        targetType: 'message',
+        targetMessageId: msg.id,
+        targetChatId: widget.chatId,
+        title: 'پیام',
+      ),
+    );
   }
 
   Future<void> _deleteMessage(MessageModel msg, {required bool forAll}) async {
     try {
-      await ApiService().post('/messages/${msg.id}/delete', {
-        'for_all': forAll,
-      });
-      setState(() => _messages.removeWhere((m) => m.id == msg.id));
+      await _api.post('/messages/${msg.id}/delete', {'for_all': forAll});
+      if (!mounted) return;
+      _applyMessageUpdate(MessageSyncResult(deletedIds: {msg.id}));
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
@@ -443,25 +1461,41 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
     if (confirm != true) return;
     try {
-      await ApiService().post('/messages/chat/${widget.chatId}/clear', {
+      await _api.post('/messages/chat/${widget.chatId}/clear', {
         'for_all': forAll,
       });
-      setState(() => _messages.clear());
+      if (!mounted) return;
+      setState(() {
+        ++_loadGeneration;
+        _reconciler.remove(
+          _reconciler
+              .batches(_messages, selectedReply: _replyTo)
+              .expand((ids) => ids),
+        );
+        _messages.clear();
+        _messageKeys.clear();
+        // Keep the soft-deleted cursor to fetch the next message reliably.
+        _loading = false;
+        _replyTo = null;
+        _hasEarlier = false;
+        _historyMode = false;
+        _pinned.clear();
+        _pinnedIndex = 0;
+      });
+      unawaited(_loadPinned());
       ref.read(chatListProvider.notifier).refresh();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
 
   Future<void> _blockUser() async {
     _currentUserId ??= StorageService.getUserId();
-    final other = _messages
-        .where((m) => m.senderId != null && m.senderId != _currentUserId)
-        .map((m) => m.senderId)
-        .firstOrNull;
+    final other = _otherUser?.id;
     if (other == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -471,123 +1505,294 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       return;
     }
     try {
-      await ApiService().post('/users/block/$other', {});
+      await _api.post('/users/block/$other', {});
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('کاربر بلاک شد')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('کاربر بلاک شد')));
         Navigator.pop(context);
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
 
-  Future<void> _markViewOnce(MessageModel msg) async {
-    if (!msg.isViewOnce || msg.viewedAt != null) return;
+  Future<void> _openPhoto(MessageModel message) async {
+    if (_openingMedia || _reconciler.isUnavailable(message.id)) return;
+    _openingMedia = true;
     try {
-      await ApiService().post('/messages/${msg.id}/view-once', {});
-      setState(() {
-        final idx = _messages.indexWhere((m) => m.id == msg.id);
-        if (idx != -1) {
-          _messages[idx] = msg.copyWith(viewedAt: DateTime.now());
-        }
-      });
-    } catch (_) {}
+      await _playback.pause();
+      if (!mounted) return;
+      final route = MaterialPageRoute<void>(
+        builder: (_) => PhotoViewerScreen(
+          url: _mediaFullUrl(message.mediaId, existingUrl: message.mediaUrl),
+          token: _authToken,
+          caption: message.content,
+        ),
+      );
+      _photoRoute = route;
+      _photoMessageId = message.id;
+      await Navigator.of(context).push(route);
+    } finally {
+      _openingMedia = false;
+      _photoRoute = null;
+      _photoMessageId = null;
+    }
+  }
+
+  Future<void> _openViewOnce(MessageModel message) async {
+    if (_openingMedia ||
+        !message.isViewOnce ||
+        message.viewedAt != null ||
+        message.senderId == _currentUserId ||
+        _reconciler.isUnavailable(message.id))
+      return;
+    _openingMedia = true;
+    try {
+      await _playback.pause();
+      if (!mounted) return;
+      final route = MaterialPageRoute<void>(
+        builder: (_) => ViewOncePhotoScreen(
+          loadPhoto: () =>
+              _api.getBytes('/messages/${message.id}/view-once/media'),
+          consumePhoto: () async {
+            final result = await _api
+                .post('/messages/${message.id}/view-once', {})
+                .timeout(const Duration(seconds: 20));
+            return parseApiDateTime(result['viewed_at'] as String)!;
+          },
+          onViewed: (viewedAt) {
+            if (!mounted) return;
+            setState(() {
+              final index = _messages.indexWhere((m) => m.id == message.id);
+              if (index != -1)
+                _messages[index] = _messages[index].copyWith(
+                  viewedAt: viewedAt,
+                );
+            });
+          },
+        ),
+      );
+      _photoRoute = route;
+      _photoMessageId = message.id;
+      await Navigator.of(context).push(route);
+      if (mounted) _refreshMessageStatuses();
+    } finally {
+      _openingMedia = false;
+      _photoRoute = null;
+      _photoMessageId = null;
+    }
   }
 
   void _showMessageActions(MessageModel msg) {
-    final isMine = msg.senderId == _currentUserId;
-    showModalBottomSheet(
+    if (_reconciler.isUnavailable(msg.id)) return;
+    showModalBottomSheet<void>(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.reply),
-              title: const Text('پاسخ'),
-              onTap: () {
-                Navigator.pop(ctx);
-                setState(() => _replyTo = msg);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.forward),
-              title: const Text('فوروارد'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _forwardMessage(msg);
-              },
-            ),
-            if (isMine)
-              ListTile(
-                leading: const Icon(Icons.delete_outline),
-                title: const Text('حذف برای من'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _deleteMessage(msg, forAll: false);
-                },
-              ),
-            if (isMine)
-              ListTile(
-                leading: const Icon(Icons.delete_forever, color: Colors.red),
-                title: const Text(
-                  'حذف برای همه',
-                  style: TextStyle(color: Colors.red),
+      isScrollControlled: true,
+      builder: (sheetCtx) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.85),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                  child: Wrap(
+                    alignment: WrapAlignment.center,
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: ['❤️', '👍', '😂', '😮', '😢', '🙏'].map((e) => InkWell(
+                      onTap: () { Navigator.pop(sheetCtx); _toggleReaction(msg, e); },
+                      borderRadius: BorderRadius.circular(24),
+                      child: Container(width: 48, height: 48, alignment: Alignment.center, decoration: BoxDecoration(color: Colors.grey.withValues(alpha: 0.08), shape: BoxShape.circle, border: Border.all(color: Colors.grey.withValues(alpha: 0.12))), child: Text(e, style: const TextStyle(fontSize: 24))),
+                    )).toList(),
+                  ),
                 ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _deleteMessage(msg, forAll: true);
-                },
-              ),
-            if (!isMine)
-              ListTile(
-                leading: const Icon(Icons.delete_outline),
-                title: const Text('حذف برای من'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _deleteMessage(msg, forAll: false);
-                },
-              ),
-          ],
+                const Divider(height: 16),
+                MessageActionsSheet(
+                  message: msg,
+                  canDeleteForAll: _canDelete(msg),
+                  canReply: _can('send_messages'),
+                  canPin: _canPinMessages,
+                  onTogglePin: (pin) => _togglePin(msg, pin),
+                  onReply: () { if (mounted && _can('send_messages') && !_reconciler.isUnavailable(msg.id)) setState(() => _replyTo = msg); },
+                  onForward: () => _forwardMessage(msg),
+                  onDelete: (forAll) => _deleteMessage(msg, forAll: forAll),
+                ),
+                ListTile(leading: const Icon(Icons.add_reaction_outlined), title: const Text('افزودن واکنش (بیشتر)'), onTap: () { Navigator.pop(sheetCtx); _showReactionPicker(msg); }),
+                ListTile(leading: const Icon(Icons.report_outlined, color: Colors.orange), title: const Text('گزارش و بلاک'), subtitle: const Text('گزارش + بلاک همزمان', style: TextStyle(fontSize: 11, color: Colors.grey)), onTap: () { Navigator.pop(sheetCtx); _reportMessage(msg); }),
+                const SizedBox(height: 16),
+              ],
+            ),
+          ),
         ),
       ),
     );
   }
 
+  Future<void> _openInvite(ChatInviteLink link) async {
+    if (_openingInvite || _chatUnavailable) return;
+    setState(() => _openingInvite = true);
+    final labels = ChatLabels.of(context);
+    try {
+      await _playback.pause();
+      if (!mounted) return;
+      final response = await _api.post('/chats/invite-preview', {
+        'invite_link': link.value,
+      });
+      if (!mounted) return;
+      var invite = ChatInviteModel.fromJson(response);
+      if (!invite.isMember) {
+        final confirm = await showDialog<bool>(
+          context: context,
+          builder: (_) => ChatInviteDialog(invite: invite, token: _authToken),
+        );
+        if (confirm != true || !mounted) return;
+        final joined = await _api.post('/chats/join', {
+          'invite_link': link.value,
+        });
+        if (!mounted) return;
+        invite = ChatInviteModel.fromJson(joined);
+      }
+      unawaited(ref.read(chatListProvider.notifier).refresh());
+      if (invite.id == widget.chatId) {
+        unawaited(_loadChatInfo());
+        return;
+      }
+      if (!mounted) return;
+      setState(() => _openingInvite = false);
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ChatScreen(
+            chatId: invite.id,
+            title: invite.title,
+            chatType: invite.chatType,
+            avatarUrl: invite.avatarUrl,
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted) {
+        final unavailable =
+            error is ApiException &&
+            [400, 403, 404, 410].contains(error.statusCode);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              unavailable ? labels.inviteUnavailable : labels.inviteFailed,
+            ),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _openingInvite = false);
+    }
+  }
+
   void _showAttachMenu() {
     showModalBottomSheet(
       context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            ListTile(
-              leading: const Icon(Icons.photo_library),
-              title: const Text('عکس از گالری'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _pickAndSendMedia(ImageSource.gallery);
-              },
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setSheetState) => SafeArea(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.75),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 40,
+                    height: 4,
+                    margin: const EdgeInsets.only(top: 12, bottom: 8),
+                    decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2)),
+                  ),
+                  if (_can('send_photos'))
+                    ListTile(
+                      leading: const Icon(Icons.photo_library),
+                      title: const Text('عکس از گالری'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendMedia(ImageSource.gallery);
+                      },
+                    ),
+                  if (_can('send_photos'))
+                    ListTile(
+                      leading: const Icon(Icons.camera_alt),
+                      title: const Text('دوربین'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendMedia(ImageSource.camera);
+                      },
+                    ),
+                  if (_can('send_videos'))
+                    ListTile(
+                      leading: const Icon(Icons.videocam),
+                      title: const Text('ویدیو'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendMedia(ImageSource.gallery, isVideo: true);
+                      },
+                    ),
+                  if (_can('send_files'))
+                    ListTile(
+                      leading: const Icon(Icons.insert_drive_file),
+                      title: const Text('ارسال فایل (اسناد، PDF، ZIP، PNG، TXT، ...)'),
+                      subtitle: const Text('همه فرمت‌ها مانند تلگرام پشتیبانی می‌شوند', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _pickAndSendFile();
+                      },
+                    ),
+                  ListTile(
+                    leading: const Icon(Icons.emoji_emotions_outlined, color: Colors.orange),
+                    title: const Text('استیکر'),
+                    subtitle: const Text('انتخاب از پک‌های آماده', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _showStickerPicker();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.gif_box_outlined, color: Colors.blue),
+                    title: const Text('GIF (ساخت از ویدیو)'),
+                    subtitle: const Text('گیف‌های ذخیره‌شده + ساخت گیف از ویدیو', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _showGifPicker();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.circle, color: Colors.teal),
+                    title: const Text('پیام ویدیویی گرد'),
+                    subtitle: const Text('ویدیو دایره‌ای مانند تلگرام (video_note)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () {
+                      Navigator.pop(ctx);
+                      _recordVideoNote();
+                    },
+                  ),
+                  const Divider(height: 1),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
+                    title: const Text('حالت اسپویلر (مخفی تا زمان لمس)'),
+                    subtitle: const Text('پیام بعدی محو نمایش داده می‌شود', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    value: _isSpoiler,
+                    onChanged: (val) {
+                      setSheetState(() {});
+                      setState(() => _isSpoiler = val);
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                ],
+              ),
             ),
-            ListTile(
-              leading: const Icon(Icons.camera_alt),
-              title: const Text('دوربین'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _pickAndSendMedia(ImageSource.camera);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.videocam),
-              title: const Text('ویدیو'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _pickAndSendMedia(ImageSource.gallery, isVideo: true);
-              },
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -602,13 +1807,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
     if (picked == null) return;
     try {
-      final upload = await ApiService().uploadFile(
-        '/media/upload',
-        File(picked.path),
-      );
+      final upload = await _api.uploadFile('/media/upload', File(picked.path));
       final mediaId = upload['id'] as String;
       final url = _mediaFullUrl(mediaId, existingUrl: null);
-      await ApiService().post('/chats/${widget.chatId}/background', {
+      await _api.post('/chats/${widget.chatId}/background', {
         'type': 'image',
         'value': url,
       });
@@ -617,19 +1819,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         _bgColor = null;
       });
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('کب‌دنارگ میظنت دش')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('کب‌دنارگ میظنت دش')));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
       }
     }
   }
 
   Future<void> _forwardMessage(MessageModel msg) async {
-    final chatsRes = await ApiService().get('/chats/');
+    final chatsRes = await _api.get('/chats/');
     final chats = (chatsRes['chats'] as List? ?? []);
     if (!mounted) return;
     showModalBottomSheet(
@@ -648,7 +1852,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
             onTap: () async {
               Navigator.pop(ctx);
               try {
-                await ApiService().post('/messages/${msg.id}/forward', {
+                await _api.post('/messages/${msg.id}/forward', {
                   'target_chat_id': c['id'],
                 });
                 if (mounted) {
@@ -658,8 +1862,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 }
               } catch (e) {
                 if (mounted) {
-                  ScaffoldMessenger.of(context)
-                      .showSnackBar(SnackBar(content: Text(e.toString())));
+                  ScaffoldMessenger.of(
+                    context,
+                  ).showSnackBar(SnackBar(content: Text(e.toString())));
                 }
               }
             },
@@ -670,258 +1875,96 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   }
 
   void _showMoreMenu() {
-    final isGroupOrChannel =
-        widget.chatType == 'group' || widget.chatType == 'channel';
-    final isAdmin = _myRole == 'owner' || _myRole == 'admin';
-    showModalBottomSheet(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Wrap(
-          children: [
-            if (isGroupOrChannel) ...[
-              ListTile(
-                leading: const Icon(Icons.info_outline),
-                title: const Text('اطلاعات گروه/کانال'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _showGroupInfoSheet();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.people_outline),
-                title: const Text('اعضا'),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _showMembersSheet();
-                },
-              ),
-              if (isAdmin)
-                ListTile(
-                  leading: const Icon(Icons.link),
-                  title: const Text('لینک دعوت'),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _showInviteLink();
-                  },
-                ),
-              if (isAdmin)
-                ListTile(
-                  leading: const Icon(Icons.edit),
-                  title: const Text('ویرایش گروه/کانال'),
-                  onTap: () {
-                    Navigator.pop(ctx);
-                    _showEditGroupSheet();
-                  },
-                ),
-              ListTile(
-                leading: const Icon(Icons.exit_to_app, color: Colors.orange),
-                title: const Text(
-                  'خروج از گروه',
-                  style: TextStyle(color: Colors.orange),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _leaveGroup();
-                },
-              ),
-            ],
-            ListTile(
-              leading: const Icon(Icons.image),
-              title: const Text('بک‌گراند تصویری'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _setBackgroundImage();
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.search),
-              title: const Text('جستجو در چت'),
-              onTap: () {
-                Navigator.pop(ctx);
-                setState(() => _searchMode = true);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete_outline),
-              title: const Text('پاک کردن تاریخچه برای من'),
-              onTap: () {
-                Navigator.pop(ctx);
-                _clearHistory(forAll: false);
-              },
-            ),
-            if (!isGroupOrChannel)
-              ListTile(
-                leading: const Icon(Icons.delete_forever, color: Colors.red),
-                title: const Text(
-                  'پاک کردن برای همه',
-                  style: TextStyle(color: Colors.red),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _clearHistory(forAll: true);
-                },
-              ),
-            if (!isGroupOrChannel)
-              ListTile(
-                leading: const Icon(Icons.block, color: Colors.red),
-                title: const Text(
-                  'بلاک کاربر',
-                  style: TextStyle(color: Colors.red),
-                ),
-                onTap: () {
-                  Navigator.pop(ctx);
-                  _blockUser();
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Future<void> _leaveGroup() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('خروج از گروه'),
-        content: const Text('آیا مطمئن هستید؟'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('لغو'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('خروج'),
-          ),
-        ],
-      ),
-    );
-    if (confirm != true) return;
-    try {
-      await ApiService().post('/chats/${widget.chatId}/leave', {});
-      if (mounted) Navigator.of(context).pop();
-    } catch (e) {
-      if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
-    }
-  }
-
-  Future<void> _showInviteLink() async {
-    try {
-      final res = await ApiService().get('/chats/${widget.chatId}/invite-link');
-      final link = res['invite_link'] as String? ?? '';
-      if (!mounted) return;
-      showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('لینک دعوت'),
-          content: SelectableText(
-            link,
-            style: const TextStyle(fontFamily: 'monospace'),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(ctx);
-              },
-              child: const Text('بستن'),
-            ),
-          ],
-        ),
-      );
-    } catch (e) {
-      if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
-    }
-  }
-
-  void _showGroupInfoSheet() {
+    final isGroupOrChannel = _chatType == 'group' || _chatType == 'channel';
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      builder: (ctx) => DraggableScrollableSheet(
-        expand: false,
-        initialChildSize: 0.5,
-        builder: (_, sc) => ListView(
-          controller: sc,
-          padding: const EdgeInsets.all(24),
-          children: [
-            Text(
-              widget.title,
-              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            if (_chatUsername != null)
-              Text(
-                '@$_chatUsername',
-                style: TextStyle(color: Colors.grey[600]),
-              ),
-            const SizedBox(height: 8),
-            Row(
+      builder: (ctx) => SafeArea(
+        child: ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: MediaQuery.of(context).size.height * 0.78),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.people, size: 16, color: Colors.grey),
-                const SizedBox(width: 6),
-                Text('$_membersCount عضو'),
-                const SizedBox(width: 16),
-                Icon(
-                  _isPublic ? Icons.lock_open : Icons.lock,
-                  size: 16,
-                  color: Colors.grey,
+                Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
+                if (isGroupOrChannel)
+                  ListTile(
+                    leading: Icon(_chatType == 'channel' ? Icons.campaign_outlined : Icons.group_outlined),
+                    title: Text(_chatType == 'channel' ? _label('Channel information', 'اطلاعات کانال') : _label('Group information', 'اطلاعات گروه')),
+                    onTap: () { Navigator.pop(ctx); _openManagement(); },
+                  ),
+                ListTile(
+                  leading: const Icon(Icons.report_outlined, color: Colors.orange),
+                  title: Text(_chatType == 'private' ? 'گزارش و بلاک کاربر' : 'گزارش گروه/کانال'),
+                  subtitle: const Text('گزارش + بلاک همزمان (مانند تلگرام)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  onTap: () { Navigator.pop(ctx); _reportCurrentChat(); },
                 ),
-                const SizedBox(width: 6),
-                Text(_isPublic ? 'عمومی' : 'خصوصی'),
+                ListTile(leading: const Icon(Icons.schedule), title: const Text('پیام‌های زمان‌بندی‌شده'), onTap: () { Navigator.pop(ctx); _openScheduledSheet(); }),
+                ListTile(leading: const Icon(Icons.image), title: const Text('بک‌گراند تصویری'), onTap: () { Navigator.pop(ctx); _setBackgroundImage(); }),
+                ListTile(leading: const Icon(Icons.search), title: const Text('جستجو در چت'), onTap: () { Navigator.pop(ctx); setState(() => _searchMode = true); }),
+                const Divider(height: 12),
+                ListTile(leading: const Icon(Icons.delete_outline), title: const Text('پاک کردن تاریخچه برای من'), onTap: () { Navigator.pop(ctx); _clearHistory(forAll: false); }),
+                if (!isGroupOrChannel || _myRole == 'owner' || _capabilities['clear_history_for_all'] == true)
+                  ListTile(
+                    key: const ValueKey('clear-history-for-all'),
+                    leading: const Icon(Icons.delete_forever, color: Colors.red),
+                    title: const Text('پاک کردن برای همه', style: TextStyle(color: Colors.red)),
+                    subtitle: const Text('برای همه اعضای چت حذف می‌شود', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    onTap: () { Navigator.pop(ctx); _clearHistory(forAll: true); },
+                  ),
+                if (_canPinMessages && _pinned.isNotEmpty)
+                  ListTile(key: const ValueKey('unpin-all'), leading: const Icon(Icons.push_pin_outlined), title: Text(ChatLabels.of(context).unpinAll), onTap: () { Navigator.pop(ctx); _unpinAll(); }),
+                if (!isGroupOrChannel)
+                  ListTile(leading: const Icon(Icons.block, color: Colors.red), title: const Text('بلاک کاربر', style: TextStyle(color: Colors.red)), onTap: () { Navigator.pop(ctx); _blockUser(); }),
+                const SizedBox(height: 16),
               ],
             ),
-            if (_chatDescription != null && _chatDescription!.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              const Text(
-                'توضیحات:',
-                style: TextStyle(fontWeight: FontWeight.w600),
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _label(String en, String fa) =>
+      Localizations.localeOf(context).languageCode == 'fa' ? fa : en;
+
+  Future<void> _openManagement() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _chatType == 'channel'
+            ? ChannelManagementScreen(
+                chatId: widget.chatId,
+                api: _api,
+                token: _authToken,
+              )
+            : GroupManagementScreen(
+                chatId: widget.chatId,
+                api: _api,
+                token: _authToken,
               ),
-              const SizedBox(height: 4),
-              Text(_chatDescription!),
-            ],
-          ],
-        ),
       ),
     );
+    if (!mounted) return;
+    await _loadChatInfo();
+    if (mounted) ref.read(chatListProvider.notifier).refresh();
   }
 
-  void _showMembersSheet() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => DraggableScrollableSheet(
-        expand: false,
-        initialChildSize: 0.6,
-        builder: (_, sc) => _MembersSheet(
-          chatId: widget.chatId,
-          myRole: _myRole,
-          scrollController: sc,
-        ),
-      ),
-    );
-  }
-
-  void _showEditGroupSheet() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      builder: (ctx) => _EditGroupSheet(
-        chatId: widget.chatId,
-        currentTitle: widget.title,
-        currentDescription: _chatDescription,
-        currentUsername: _chatUsername,
-        isPublic: _isPublic,
-        myRole: _myRole,
-        onSaved: () {
-          _loadChatInfo();
-        },
-      ),
-    );
+  Future<void> _toggleMute() async {
+    if (_muting) return;
+    setState(() => _muting = true);
+    try {
+      final res = await _api.post('/chats/${widget.chatId}/mute', {
+        'is_muted': !_isMuted,
+      });
+      if (mounted) setState(() => _isMuted = res['is_muted'] as bool);
+    } catch (error) {
+      if (mounted)
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('$error')));
+    } finally {
+      if (mounted) setState(() => _muting = false);
+    }
   }
 
   void _scrollToBottom() {
@@ -939,8 +1982,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final auth = ref.watch(authNotifierProvider);
-    _currentUserId = auth.valueOrNull?.id ?? StorageService.getUserId();
+    final session = ref.watch(authenticatedSessionProvider);
+    if (session.userId == _sessionUserId) {
+      _api = session.api;
+      _authToken = session.token;
+    }
+    _currentUserId = _sessionUserId;
 
     return Scaffold(
       appBar: AppBar(
@@ -957,39 +2004,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                 ),
                 onSubmitted: (q) => _loadMessages(query: q),
               )
-            : InkWell(
-                onTap: () {
-                  final otherId = _messages
-                      .where((m) => m.senderId != _currentUserId)
-                      .map((m) => m.senderId)
-                      .firstOrNull;
-                  if (otherId != null) {
-                    Navigator.of(context).push(
-                      MaterialPageRoute(
-                        builder: (_) => UserProfileScreen(userId: otherId),
-                      ),
-                    );
-                  }
-                },
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      widget.title,
-                      style: const TextStyle(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                    Text(
-                      'برای مشاهده پروفایل بزنید',
-                      style: TextStyle(
-                        fontSize: 11,
-                        color: Colors.white.withValues(alpha: 0.8),
-                      ),
-                    ),
-                  ],
-                ),
+            : ChatHeader(
+                title: _displayTitle,
+                chatType: _chatType,
+                otherUser: _otherUser,
+                avatarUrl: _chatAvatarUrl,
+                membersCount: _hasChatInfo ? _membersCount : null,
+                onlineCount: _hasChatInfo ? _onlineCount : null,
+                token: _authToken,
+                onTap: _chatType == 'group' || _chatType == 'channel'
+                    ? _openManagement
+                    : _otherUser == null
+                    ? null
+                    : () async {
+                        await _playback.pause();
+                        if (!mounted || _otherUser == null) return;
+                        await Navigator.of(context).push(
+                          MaterialPageRoute<void>(
+                            builder: (_) =>
+                                UserProfileScreen(userId: _otherUser!.id),
+                          ),
+                        );
+                        if (mounted) unawaited(_loadChatInfo());
+                      },
               ),
         actions: [
           if (_searchMode)
@@ -1016,11 +2053,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
               ? DecorationImage(
                   image: CachedNetworkImageProvider(
                     _bgImageUrl!,
-                    headers: StorageService.getToken() != null
-                        ? {
-                            'Authorization':
-                                'Bearer ${StorageService.getToken()}',
-                          }
+                    headers: _authToken != null
+                        ? {'Authorization': 'Bearer ${_authToken}'}
                         : null,
                   ),
                   fit: BoxFit.cover,
@@ -1030,31 +2064,49 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         child: SafeArea(
           child: Column(
             children: [
-              if (_replyTo != null)
+              if (_openingInvite) const LinearProgressIndicator(minHeight: 2),
+              if (_isSuspended)
                 Container(
                   width: double.infinity,
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 8,
-                  ),
-                  color: theme.colorScheme.primary.withValues(alpha: 0.1),
+                  color: Colors.red.withValues(alpha: 0.12),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                   child: Row(
                     children: [
-                      const Icon(Icons.reply, size: 18),
+                      const Icon(Icons.block, color: Colors.red, size: 20),
                       const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          _replyTo!.content ?? _replyTo!.messageType,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.close, size: 18),
-                        onPressed: () => setState(() => _replyTo = null),
-                      ),
+                      Expanded(child: Text('این گروه/کانال تعلیق شده است${_suspensionReason != null ? ': $_suspensionReason' : ''}', style: const TextStyle(color: Colors.red, fontSize: 12, fontWeight: FontWeight.w600))),
+                      if (_myRole == 'owner')
+                        TextButton(onPressed: _loadChatInfo, child: const Text('به‌روزرسانی', style: TextStyle(fontSize: 12))),
                     ],
                   ),
+                ),
+              if (_isClosed)
+                Container(
+                  width: double.infinity,
+                  color: Colors.orange.withValues(alpha: 0.14),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.lock, color: Colors.orange, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text('این گروه/کانال بسته شده است${_closedReason != null ? ': $_closedReason' : ' (فقط مالک می‌تواند ارسال کند)'}', style: const TextStyle(color: Colors.orange, fontSize: 12, fontWeight: FontWeight.w600))),
+                    ],
+                  ),
+                ),
+              if (_pinned.isNotEmpty && !_searchMode)
+                PinnedMessagesBar(
+                  pinned: _pinned,
+                  index: _pinnedIndex,
+                  onTap: _tapPinnedBar,
+                  onShowAll: _openPinnedMessages,
+                  onUnpin: _canPinMessages
+                      ? () => _togglePin(
+                          _pinned[_pinnedIndex < _pinned.length
+                              ? _pinnedIndex
+                              : 0],
+                          false,
+                        )
+                      : null,
                 ),
               Expanded(
                 child: _loading
@@ -1069,8 +2121,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                               style: const TextStyle(color: Colors.red),
                             ),
                             ElevatedButton(
-                              onPressed: () => _loadMessages(),
-                              child: const Text('تلاش مجدد'),
+                              onPressed: _chatUnavailable
+                                  ? () => Navigator.of(context).maybePop()
+                                  : () => _loadMessages(),
+                              child: Text(
+                                _chatUnavailable
+                                    ? ChatLabels.of(context).close
+                                    : MediaLabels.of(context).retry,
+                              ),
                             ),
                           ],
                         ),
@@ -1088,37 +2146,91 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
                           horizontal: 10,
                           vertical: 8,
                         ),
-                        itemCount: _messages.length,
+                        itemCount: _messages.length + 1,
+                        findChildIndexCallback: (key) {
+                          if (key == const ValueKey('history-header')) return 0;
+                          final index = _messages.indexWhere(
+                            (m) => _messageKeys[m.id] == key,
+                          );
+                          return index == -1 ? null : index + 1;
+                        },
                         itemBuilder: (context, index) {
-                          final msg = _messages[index];
-                          final isMine = msg.senderId == _currentUserId;
+                          if (index == 0) {
+                            return Center(
+                              key: const ValueKey('history-header'),
+                              child: _hasEarlier
+                                  ? TextButton.icon(
+                                      onPressed: _loadingEarlier
+                                          ? null
+                                          : _loadEarlier,
+                                      icon: _loadingEarlier
+                                          ? const SizedBox(
+                                              width: 16,
+                                              height: 16,
+                                              child: CircularProgressIndicator(
+                                                strokeWidth: 2,
+                                              ),
+                                            )
+                                          : const Icon(Icons.expand_less),
+                                      label: Text(
+                                        MediaLabels.of(context).earlier,
+                                      ),
+                                    )
+                                  : const SizedBox.shrink(),
+                            );
+                          }
+                          final msg = _messages[index - 1];
+                          final isMine =
+                              _chatType != 'channel' &&
+                              msg.senderId == _currentUserId;
                           return GestureDetector(
+                            key: _messageKeys.putIfAbsent(
+                              msg.id,
+                              () => GlobalKey(),
+                            ),
                             onLongPress: () => _showMessageActions(msg),
-                            onTap: () {
-                              if (msg.isViewOnce && msg.viewedAt == null) {
-                                _markViewOnce(msg);
-                              }
-                            },
-                            onHorizontalDragEnd: (d) {
-                              if (d.primaryVelocity != null &&
-                                  d.primaryVelocity! > 200) {
+                            onDoubleTap: () => _showReactionPicker(msg),
+                            // Reply gestures do not own taps on media anymore.
+                            onHorizontalDragEnd: (details) {
+                              final velocity = details.primaryVelocity ?? 0;
+                              if (velocity.abs() > 200 &&
+                                  _can('send_messages')) {
                                 setState(() => _replyTo = msg);
                               }
                             },
-                            child: _MessageBubble(
+                            child: MessageBubble(
                               message: msg,
                               isMine: isMine,
-                              mediaUrl: _mediaFullUrl(
-                                msg.mediaId,
-                                existingUrl: msg.mediaUrl,
-                              ),
-                              token: StorageService.getToken(),
+                              currentUserId: _currentUserId,
+                              reply: _replyPreviewFor(msg),
+                              onReplyTap: msg.replyToId == null ? null : () => _jumpToReply(msg.replyToId!),
+                              onOpenPhoto: () {
+                                // For sticker/gif/video_note also allow viewing
+                                if (msg.messageType == 'sticker' || msg.messageType == 'gif' || msg.messageType == 'video_note') return;
+                                _openPhoto(msg);
+                              },
+                              onOpenViewOnce: () => _openViewOnce(msg),
+                              onInviteTap: _openInvite,
+                              coordinator: _playback,
+                              highlighted: _highlightedMessageId == msg.id,
+                              showSender: _chatType == 'group' || _chatType == 'channel',
+                              mediaUrl: _mediaFullUrl(msg.mediaId, existingUrl: msg.mediaUrl),
+                              token: _authToken,
+                              onReactionTap: (emoji) => _toggleReaction(msg, emoji),
+                              onAddReaction: () => _showReactionPicker(msg),
                             ),
                           );
                         },
                       ),
               ),
-              if (!_searchMode) _buildInputBar(theme),
+              if (_historyMode)
+                TextButton.icon(
+                  onPressed: () => _loadMessages(),
+                  icon: const Icon(Icons.arrow_downward_rounded),
+                  label: Text(MediaLabels.of(context).latest),
+                ),
+              if (_replyTo != null && !_searchMode) _buildReplyComposer(theme),
+              if (!_searchMode && !_chatUnavailable) _buildInputBar(theme),
             ],
           ),
         ),
@@ -1126,7 +2238,70 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
     );
   }
 
+  Widget _buildReplyComposer(ThemeData theme) {
+    return Container(
+      color: theme.cardColor,
+      padding: const EdgeInsetsDirectional.fromSTEB(12, 8, 4, 0),
+      child: Row(
+        children: [
+          Expanded(
+            child: ReplyPreview(
+              reply: _replyTo!.asReplyPreview,
+              currentUserId: _currentUserId,
+              token: _authToken,
+            ),
+          ),
+          IconButton(
+            tooltip: MediaLabels.of(context).cancelReply,
+            onPressed: () => setState(() => _replyTo = null),
+            icon: const Icon(Icons.close, size: 20),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildInputBar(ThemeData theme) {
+    if (!_can('send_messages')) {
+      return SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _chatType == 'channel'
+                    ? _label(
+                        'Broadcast channel — only authorized administrators can publish.',
+                        'کانال انتشار — فقط مدیران مجاز می‌توانند پست منتشر کنند.',
+                      )
+                    : _label(
+                        'Sending messages is not allowed in this group.',
+                        'ارسال پیام در این گروه مجاز نیست.',
+                      ),
+                textAlign: TextAlign.center,
+              ),
+              if (_chatType == 'channel')
+                TextButton.icon(
+                  onPressed: _muting ? null : _toggleMute,
+                  icon: Icon(
+                    _isMuted
+                        ? Icons.notifications_off_outlined
+                        : Icons.notifications_outlined,
+                  ),
+                  label: Text(
+                    _isMuted
+                        ? _label('Unmute', 'فعال کردن اعلان‌ها')
+                        : _label('Mute', 'بی‌صدا'),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
       decoration: BoxDecoration(
@@ -1141,608 +2316,126 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
       ),
       child: SafeArea(
         top: false,
-        child: Row(
-          children: [
-            IconButton(
-              icon: const Icon(Icons.attach_file_rounded),
-              onPressed: _sending ? null : _showAttachMenu,
-            ),
-            Expanded(
-              child: TextField(
-                controller: _textCtrl,
-                textInputAction: TextInputAction.send,
-                onSubmitted: (_) => _sendText(),
-                decoration: InputDecoration(
-                  hintText: 'پیام...',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide.none,
-                  ),
-                  filled: true,
-                  fillColor: theme.scaffoldBackgroundColor,
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 10,
-                  ),
-                ),
-                maxLines: 4,
-                minLines: 1,
-              ),
-            ),
-            IconButton(
-              onPressed: _sending ? null : _toggleVoiceRecord,
-              icon: Icon(
-                _isRecording ? Icons.stop_circle : Icons.mic_rounded,
-                color: _isRecording ? Colors.red : theme.colorScheme.primary,
-              ),
-            ),
-            IconButton(
-              onPressed: _sending ? null : _sendText,
-              icon: _sending
-                  ? const SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : Icon(Icons.send_rounded, color: theme.colorScheme.primary),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _MessageBubble extends StatelessWidget {
-  final MessageModel message;
-  final bool isMine;
-  final String mediaUrl;
-  final String? token;
-
-  const _MessageBubble({
-    required this.message,
-    required this.isMine,
-    required this.mediaUrl,
-    this.token,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final bg = isMine ? theme.colorScheme.primary : theme.cardColor;
-    final fg = isMine ? Colors.white : theme.textTheme.bodyLarge?.color;
-
-    return Align(
-      alignment: isMine ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 3),
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.78,
-        ),
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(isMine ? 16 : 4),
-            bottomRight: Radius.circular(isMine ? 4 : 16),
-          ),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.04),
-              blurRadius: 3,
-              offset: const Offset(0, 1),
-            ),
-          ],
-        ),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.end,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            if (message.replyToId != null)
+            if (_slowModeRemaining > 0)
               Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(6),
                 margin: const EdgeInsets.only(bottom: 6),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                 decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: 0.08),
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border(
-                    left: BorderSide(
-                      color: isMine ? Colors.white60 : Colors.blue,
-                      width: 3,
-                    ),
-                  ),
-                ),
-                child: Text(
-                  message.content != null ? 'ریپلای' : 'پیام',
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ),
-            if (message.isViewOnce && message.viewedAt != null)
-              Container(
-                width: 220,
-                height: 80,
-                decoration: BoxDecoration(
-                  color: Colors.black54,
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: const Center(
-                  child: Text(
-                    'مشاهده شد',
-                    style: TextStyle(color: Colors.white),
-                  ),
-                ),
-              )
-            else if (message.isViewOnce && message.viewedAt == null)
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 12,
-                  vertical: 8,
-                ),
-                decoration: BoxDecoration(
-                  color: Colors.orange.withValues(alpha: 0.2),
-                  borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: Colors.orange),
+                  color: Colors.amber.withValues(alpha: 0.2),
+                  borderRadius: BorderRadius.circular(12),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    Icon(
-                      Icons.timer,
-                      size: 16,
-                      color: isMine ? Colors.white70 : Colors.orange,
-                    ),
+                    const Icon(Icons.timer, size: 16, color: Colors.amber),
                     const SizedBox(width: 6),
                     Text(
-                      'View Once - برای مشاهده بزن',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: isMine ? Colors.white70 : Colors.orange,
-                      ),
+                      'حالت کند فعال است: $_slowModeRemaining ثانیه تا امکان ارسال بعدی',
+                      style: const TextStyle(fontSize: 12, color: Colors.amber),
                     ),
                   ],
                 ),
-              )
-            else if (message.messageType == 'image' && mediaUrl.isNotEmpty)
-              GestureDetector(
-                onTap: () {
-                  showDialog(
-                    context: context,
-                    builder: (_) => Dialog(
-                      backgroundColor: Colors.black,
-                      child: InteractiveViewer(
-                        child: CachedNetworkImage(
-                          imageUrl: mediaUrl,
-                          httpHeaders: token != null
-                              ? {'Authorization': 'Bearer $token'}
-                              : null,
-                          fit: BoxFit.contain,
+              ),
+            // Compact bar – avoids overflow on 360dp screens: only attach + field + schedule/voice/send.
+            // Sticker/GIF/video_note/spoiler live inside attach sheet to keep delete-for-all visible.
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.attach_file_rounded),
+                  tooltip: 'پیوست (عکس، فایل، استیکر، GIF، ویدیو گرد)',
+                  onPressed: _sending ? null : _showAttachMenu,
+                ),
+                if (_isSpoiler)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10, right: 2),
+                    child: GestureDetector(
+                      onTap: () => setState(() => _isSpoiler = false),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.purple.withValues(alpha: 0.18),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: Colors.purple),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.visibility_off, size: 14, color: Colors.purple),
+                            SizedBox(width: 4),
+                            Text('اسپویلر', style: TextStyle(fontSize: 11, color: Colors.purple)),
+                          ],
                         ),
                       ),
                     ),
-                  );
-                },
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(10),
-                  child: CachedNetworkImage(
-                    imageUrl: mediaUrl,
-                    httpHeaders: token != null
-                        ? {'Authorization': 'Bearer $token'}
-                        : null,
-                    width: 220,
-                    fit: BoxFit.cover,
-                    placeholder: (_, __) => Container(
-                      width: 220,
-                      height: 160,
-                      color: Colors.black12,
-                      child: const Center(
-                        child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: TextField(
+                      controller: _textCtrl,
+                      textInputAction: TextInputAction.send,
+                      onSubmitted: (_) => _sendText(),
+                      minLines: 1,
+                      maxLines: 4,
+                      decoration: InputDecoration(
+                        hintText: _chatType == 'channel'
+                            ? _label('Broadcast a post...', 'انتشار پست...')
+                            : _label('Message...', 'پیام...'),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(24),
+                          borderSide: BorderSide.none,
+                        ),
+                        filled: true,
+                        fillColor: theme.scaffoldBackgroundColor,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 10,
+                        ),
                       ),
                     ),
-                    errorWidget: (_, __, ___) =>
-                        const Icon(Icons.broken_image, size: 48),
                   ),
                 ),
-              )
-            else if (message.messageType == 'video' && mediaUrl.isNotEmpty)
-              VideoMessagePlayer(
-                url: mediaUrl,
-                authToken: token,
-                isMine: isMine,
-              )
-            else if (message.messageType == 'video')
-              const Text('ویدیو')
-            else if (message.messageType == 'voice' ||
-                message.messageType == 'audio')
-              _AudioPlayer(url: mediaUrl, token: token, fg: fg)
-            else
-              Text(
-                message.content ?? '',
-                style: TextStyle(color: fg, fontSize: 15, height: 1.35),
-              ),
-            const SizedBox(height: 4),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                  '${message.createdAt.hour.toString().padLeft(2, '0')}:${message.createdAt.minute.toString().padLeft(2, '0')}',
-                  style: TextStyle(
-                    color: isMine ? Colors.white70 : Colors.grey,
-                    fontSize: 11,
+                IconButton(
+                  icon: const Icon(Icons.schedule_rounded),
+                  tooltip: 'زمان‌بندی ارسال پیام',
+                  onPressed: _sending ? null : _scheduleMessage,
+                ),
+                IconButton(
+                  onPressed: _sending || (!_isRecording && !_can('send_voice'))
+                      ? null
+                      : _toggleVoiceRecord,
+                  icon: Icon(
+                    _isRecording ? Icons.stop_circle : Icons.mic_rounded,
+                    color: _isRecording ? Colors.red : theme.colorScheme.primary,
                   ),
                 ),
-                if (isMine) ...[
-                  const SizedBox(width: 4),
-                  Icon(
-                    message.status == 'read' ? Icons.done_all : Icons.done_all,
-                    size: 16,
-                    color: message.status == 'read'
-                        ? const Color(0xFF4FC3F7)
-                        : (message.status == 'delivered'
-                              ? Colors.white70
-                              : Colors.white54),
+                Material(
+                  color: Colors.transparent,
+                  shape: const CircleBorder(),
+                  clipBehavior: Clip.hardEdge,
+                  child: InkWell(
+                    onTap: _sending ? null : _sendText,
+                    onLongPress: _sending ? null : _scheduleMessage,
+                    child: Padding(
+                      padding: const EdgeInsets.all(10),
+                      child: _sending
+                          ? const SizedBox(
+                              width: 22,
+                              height: 22,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : Icon(Icons.send_rounded, color: theme.colorScheme.primary),
+                    ),
                   ),
-                ],
+                ),
               ],
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _AudioPlayer extends StatefulWidget {
-  final String url;
-  final String? token;
-  final Color? fg;
-  const _AudioPlayer({required this.url, this.token, this.fg});
-
-  @override
-  State<_AudioPlayer> createState() => _AudioPlayerState();
-}
-
-class _AudioPlayerState extends State<_AudioPlayer> {
-  late final just_audio.AudioPlayer _player;
-  bool _playing = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _player = just_audio.AudioPlayer();
-    _player.playerStateStream.listen((s) {
-      if (mounted) {
-        setState(() => _playing = s.playing);
-      }
-    });
-  }
-
-  @override
-  void dispose() {
-    _player.dispose();
-    super.dispose();
-  }
-
-  Future<void> _toggle() async {
-    try {
-      if (_playing) {
-        await _player.pause();
-      } else {
-        if (_player.duration == null) {
-          if (widget.url.isEmpty) return;
-          await _player.setAudioSource(
-            just_audio.AudioSource.uri(
-              Uri.parse(widget.url),
-              headers: widget.token != null
-                  ? {'Authorization': 'Bearer ${widget.token}'}
-                  : {},
-            ),
-          );
-        }
-        await _player.play();
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('خطا در پخش صدا: $e')));
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: _toggle,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(_playing ? Icons.pause : Icons.play_arrow, color: widget.fg),
-          const SizedBox(width: 6),
-          Text('پیام صوتی', style: TextStyle(color: widget.fg)),
-        ],
-      ),
-    );
-  }
-}
-
-class _MembersSheet extends StatefulWidget {
-  final String chatId;
-  final String? myRole;
-  final ScrollController scrollController;
-  const _MembersSheet({
-    required this.chatId,
-    this.myRole,
-    required this.scrollController,
-  });
-  @override
-  State<_MembersSheet> createState() => _MembersSheetState();
-}
-
-class _MembersSheetState extends State<_MembersSheet> {
-  List<dynamic> _members = [];
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    try {
-      final res = await ApiService().get('/chats/${widget.chatId}/members');
-      setState(() {
-        _members = res['members'] as List? ?? [];
-        _loading = false;
-      });
-    } catch (_) {
-      setState(() => _loading = false);
-    }
-  }
-
-  Future<void> _promoteMember(String userId, String role) async {
-    try {
-      await ApiService().post('/chats/${widget.chatId}/promote', {
-        'user_id': userId,
-        'role': role,
-      });
-      _load();
-    } catch (e) {
-      if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
-    }
-  }
-
-  Future<void> _removeMember(String userId) async {
-    try {
-      await ApiService().post('/chats/${widget.chatId}/remove-member', {
-        'user_id': userId,
-      });
-      _load();
-    } catch (e) {
-      if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        const Padding(
-          padding: EdgeInsets.all(16),
-          child: Text(
-            'اعضا',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-        ),
-        if (_loading)
-          const Expanded(child: Center(child: CircularProgressIndicator()))
-        else
-          Expanded(
-            child: ListView.builder(
-              controller: widget.scrollController,
-              itemCount: _members.length,
-              itemBuilder: (_, i) {
-                final m = _members[i];
-                final role = m['role'] as String? ?? 'member';
-                final isOwner = widget.myRole == 'owner';
-                return ListTile(
-                  leading: CircleAvatar(
-                    child: Text(
-                      (m['display_name'] as String? ?? '?').isNotEmpty
-                          ? (m['display_name'] as String)[0].toUpperCase()
-                          : '?',
-                    ),
-                  ),
-                  title: Text(m['display_name'] as String? ?? ''),
-                  subtitle: Text(_roleLabel(role)),
-                  trailing: isOwner && role != 'owner'
-                      ? PopupMenuButton<String>(
-                          onSelected: (v) {
-                            if (v == 'remove') {
-                              _removeMember(m['id'] as String);
-                            } else {
-                              _promoteMember(m['id'] as String, v);
-                            }
-                          },
-                          itemBuilder: (_) => [
-                            if (role != 'admin')
-                              const PopupMenuItem(
-                                value: 'admin',
-                                child: Text('ادمین کردن'),
-                              ),
-                            if (role == 'admin')
-                              const PopupMenuItem(
-                                value: 'member',
-                                child: Text('حذف ادمین'),
-                              ),
-                            const PopupMenuItem(
-                              value: 'remove',
-                              child: Text(
-                                'حذف از گروه',
-                                style: TextStyle(color: Colors.red),
-                              ),
-                            ),
-                          ],
-                        )
-                      : null,
-                );
-              },
-            ),
-          ),
-      ],
-    );
-  }
-
-  String _roleLabel(String role) {
-    switch (role) {
-      case 'owner':
-        return 'مالک';
-      case 'admin':
-        return 'ادمین';
-      default:
-        return 'عضو';
-    }
-  }
-}
-
-class _EditGroupSheet extends StatefulWidget {
-  final String chatId;
-  final String currentTitle;
-  final String? currentDescription;
-  final String? currentUsername;
-  final bool isPublic;
-  final String? myRole;
-  final VoidCallback onSaved;
-  const _EditGroupSheet({
-    required this.chatId,
-    required this.currentTitle,
-    this.currentDescription,
-    this.currentUsername,
-    required this.isPublic,
-    this.myRole,
-    required this.onSaved,
-  });
-  @override
-  State<_EditGroupSheet> createState() => _EditGroupSheetState();
-}
-
-class _EditGroupSheetState extends State<_EditGroupSheet> {
-  late TextEditingController _titleCtrl;
-  late TextEditingController _descCtrl;
-  late TextEditingController _usernameCtrl;
-  late bool _isPublic;
-  bool _saving = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _titleCtrl = TextEditingController(text: widget.currentTitle);
-    _descCtrl = TextEditingController(text: widget.currentDescription ?? '');
-    _usernameCtrl = TextEditingController(text: widget.currentUsername ?? '');
-    _isPublic = widget.isPublic;
-  }
-
-  @override
-  void dispose() {
-    _titleCtrl.dispose();
-    _descCtrl.dispose();
-    _usernameCtrl.dispose();
-    super.dispose();
-  }
-
-  Future<void> _save() async {
-    setState(() => _saving = true);
-    try {
-      final body = <String, dynamic>{
-        'title': _titleCtrl.text.trim(),
-        'description': _descCtrl.text.trim(),
-      };
-      if (widget.myRole == 'owner') {
-        body['is_public'] = _isPublic;
-        body['username'] = _usernameCtrl.text.trim().toLowerCase();
-      }
-      await ApiService().post('/chats/${widget.chatId}/update', body);
-      widget.onSaved();
-      if (mounted) {
-        Navigator.pop(context);
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('تغییرات ذخیره شد')));
-      }
-    } catch (e) {
-      if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
-    } finally {
-      if (mounted) setState(() => _saving = false);
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.only(
-        left: 24,
-        right: 24,
-        top: 24,
-        bottom: MediaQuery.of(context).viewInsets.bottom + 24,
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          const Text(
-            'ویرایش',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const SizedBox(height: 16),
-          TextField(
-            controller: _titleCtrl,
-            decoration: const InputDecoration(labelText: 'نام'),
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: _descCtrl,
-            maxLines: 2,
-            decoration: const InputDecoration(labelText: 'توضیحات'),
-          ),
-          if (widget.myRole == 'owner') ...[
-            const SizedBox(height: 12),
-            TextField(
-              controller: _usernameCtrl,
-              decoration: const InputDecoration(
-                labelText: 'یوزرنیم',
-                prefixText: '@',
-              ),
-            ),
-            const SizedBox(height: 8),
-            SwitchListTile(
-              title: const Text('عمومی'),
-              subtitle: const Text('هر کسی می‌تواند پیدا و عضو شود'),
-              value: _isPublic,
-              onChanged: (v) => setState(() => _isPublic = v),
-              contentPadding: EdgeInsets.zero,
-            ),
-          ],
-          const SizedBox(height: 16),
-          ElevatedButton(
-            onPressed: _saving ? null : _save,
-            child: _saving
-                ? const SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  )
-                : const Text('ذخیره'),
-          ),
-        ],
       ),
     );
   }

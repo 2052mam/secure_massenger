@@ -41,6 +41,11 @@ def create_app():
     from app.api.messages import messages_bp
     from app.api.media import media_bp
     from app.api.admin_api import admin_api_bp
+    from app.api.reports import reports_bp
+    from app.api.reactions import reactions_bp
+    from app.api.stickers import stickers_bp
+    from app.api.gifs import gifs_bp
+    from app.api.devices import devices_bp
     from app.admin.routes import admin_web_bp
 
     app.register_blueprint(auth_bp, url_prefix='/api/v1/auth')
@@ -49,7 +54,18 @@ def create_app():
     app.register_blueprint(messages_bp, url_prefix='/api/v1/messages')
     app.register_blueprint(media_bp, url_prefix='/api/v1/media')
     app.register_blueprint(admin_api_bp, url_prefix='/api/v1/admin')
+    app.register_blueprint(reports_bp, url_prefix='/api/v1/reports')
+    app.register_blueprint(reactions_bp, url_prefix='/api/v1/reactions')
+    app.register_blueprint(stickers_bp, url_prefix='/api/v1/stickers')
+    app.register_blueprint(gifs_bp, url_prefix='/api/v1/gifs')
+    app.register_blueprint(devices_bp, url_prefix='/api/v1/devices')
     app.register_blueprint(admin_web_bp)
+
+    @app.cli.command('upgrade-chat-schema')
+    def upgrade_chat_schema():
+        from app.services.schema_upgrade import upgrade_schema
+        upgrade_schema()
+        print('Chat/privacy schema is up to date.')
 
     @app.route('/health')
     def health():

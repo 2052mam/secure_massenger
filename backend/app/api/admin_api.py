@@ -1,3 +1,4 @@
+from app.services.timestamps import utc_iso
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
@@ -131,7 +132,7 @@ def list_messages():
             'message_type': m.message_type,
             'is_deleted': m.is_deleted,
             'is_deleted_for_all': m.is_deleted_for_all,
-            'created_at': m.created_at.isoformat(),
+            'created_at': utc_iso(m.created_at),
         })
     return jsonify({'messages': msgs, 'total': pagination.total, 'page': page}), 200
 
@@ -154,7 +155,7 @@ def list_audit():
         'entity_type': l.entity_type,
         'entity_id': l.entity_id,
         'ip_address': l.ip_address,
-        'created_at': l.created_at.isoformat(),
+        'created_at': utc_iso(l.created_at),
     } for l in pagination.items]
     return jsonify({'logs': logs, 'total': pagination.total}), 200
 
@@ -177,6 +178,6 @@ def list_chats_admin():
         'username': c.username,
         'created_by': c.created_by,
         'is_deleted': c.is_deleted,
-        'created_at': c.created_at.isoformat(),
+        'created_at': utc_iso(c.created_at),
     } for c in pagination.items]
     return jsonify({'chats': chats, 'total': pagination.total}), 200

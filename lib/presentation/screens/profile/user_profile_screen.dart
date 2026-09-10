@@ -5,6 +5,10 @@ import '../../../data/models/user_model.dart';
 import '../../../data/services/api_service.dart';
 import '../../providers/locale_provider.dart';
 import '../../../data/services/storage_service.dart';
+import '../../widgets/chat/chat_avatar.dart';
+import '../../widgets/chat/chat_labels.dart';
+import '../../widgets/chat/shared_media_tab.dart';
+import 'profile_photos_screen.dart';
 
 class UserProfileScreen extends ConsumerStatefulWidget {
   final String userId;
@@ -18,22 +22,35 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
   UserModel? _user;
   bool _loading = true;
   String? _error;
+  String? _chatId;
 
   @override
   void initState() {
     super.initState();
     _load();
     _checkBlocked();
+    _loadChatId();
+  }
+
+  Future<void> _loadChatId() async {
+    try {
+      final res = await ApiService().post('/chats/private', {'user_id': widget.userId});
+      if (mounted && res['chat_id'] != null) {
+        setState(() => _chatId = res['chat_id'] as String);
+      }
+    } catch (_) {}
   }
 
   Future<void> _load() async {
     try {
       final res = await ApiService().get('/users/${widget.userId}');
+      if (!mounted) return;
       setState(() {
         _user = UserModel.fromJson(res);
         _loading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -46,13 +63,15 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
       await ApiService().post('/users/block/${widget.userId}', {});
       if (mounted) {
         setState(() => _isBlocked = true);
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('ربراک کالب دش')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('ربراک کالب دش')));
       }
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -61,13 +80,15 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
       await ApiService().post('/users/unblock/${widget.userId}', {});
       if (mounted) {
         setState(() => _isBlocked = false);
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('کالبنآ دش')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('کالبنآ دش')));
       }
     } catch (e) {
       if (mounted)
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.toString())));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.toString())));
     }
   }
 
@@ -77,16 +98,32 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
     try {
       final res = await ApiService().get('/users/blocked');
       final users = res['users'] as List? ?? [];
+      if (!mounted) return;
       setState(() {
         _isBlocked = users.any((u) => u['id'] == widget.userId);
       });
     } catch (_) {}
   }
 
+  /// Telegram opens the person's photos full screen; several photos can be
+  /// swiped through when the user published more than one.
+  void _openPhotos() {
+    final user = _user;
+    if (user == null || !user.showProfilePhoto) return;
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ProfilePhotosScreen(
+          userId: widget.userId,
+          title: user.displayName,
+          initialUrl: user.avatarUrl,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isFa = ref.watch(localeProvider).languageCode == 'fa';
-    final theme = Theme.of(context);
 
     return Scaffold(
       appBar: AppBar(title: Text(isFa ? 'پروفایل' : 'Profile')),
@@ -102,33 +139,18 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
               padding: const EdgeInsets.all(24),
               children: [
                 Center(
-                  child: CircleAvatar(
-                    radius: 56,
-                    backgroundColor: theme.colorScheme.primary.withValues(
-                      alpha: 0.15,
+                  child: GestureDetector(
+                    key: const ValueKey('open-user-photos'),
+                    onTap: _user!.showProfilePhoto ? _openPhotos : null,
+                    child: Hero(
+                      tag: 'user-photo-${widget.userId}',
+                      child: ChatAvatar(
+                        title: _user!.displayName,
+                        url: _user!.showProfilePhoto ? _user!.avatarUrl : null,
+                        token: StorageService.getToken(),
+                        radius: 60,
+                      ),
                     ),
-                    backgroundImage: null,
-                    foregroundImage:
-                        _user!.avatarUrl != null && _user!.avatarUrl!.isNotEmpty
-                        ? NetworkImage(
-                            _user!.avatarUrl!,
-                            headers: {
-                              'Authorization':
-                                  'Bearer ${StorageService.getToken() ?? ""}',
-                            },
-                          )
-                        : null,
-                    child: _user!.avatarUrl == null || _user!.avatarUrl!.isEmpty
-                        ? Text(
-                            _user!.displayName.isNotEmpty
-                                ? _user!.displayName[0].toUpperCase()
-                                : '?',
-                            style: TextStyle(
-                              fontSize: 40,
-                              color: theme.colorScheme.primary,
-                            ),
-                          )
-                        : null,
                   ),
                 ),
                 const SizedBox(height: 20),
@@ -167,12 +189,12 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
                   title: Text(
                     _user!.isOnline
                         ? (isFa ? 'آنلاین' : 'Online')
-                        : (isFa ? 'آفلاین' : 'Offline'),
+                        : (!_user!.showLastSeen || _user!.lastSeen == null
+                              ? ChatLabels.of(context).lastSeenHidden
+                              : (isFa ? 'آفلاین' : 'Offline')),
                   ),
                   subtitle: _user!.lastSeen != null && !_user!.isOnline
-                      ? Text(
-                          '${isFa ? 'آخرین بازدید' : 'Last seen'}: ${_user!.lastSeen}',
-                        )
+                      ? Text(ChatLabels.of(context).lastSeen(_user!.lastSeen!))
                       : null,
                 ),
                 const Divider(),
@@ -187,6 +209,19 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
                   ),
                   onTap: _isBlocked ? _unblock : _block,
                 ),
+                if (_chatId != null) ...[
+                  const Divider(height: 32),
+                  Text(
+                    isFa ? 'رسانه‌ها و فایل‌های اشتراکی' : 'Shared Media & Files',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  ),
+                  const SizedBox(height: 8),
+                  SharedMediaSection(
+                    chatId: _chatId!,
+                    api: ApiService(),
+                    token: StorageService.getToken(),
+                  ),
+                ],
                 // ListTile(
                 //   leading: const Icon(Icons.block, color: Colors.red),
                 //   title: Text(isFa ? 'بلاک کردن' : 'Block', style: const TextStyle(color: Colors.red)),

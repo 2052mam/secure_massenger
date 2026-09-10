@@ -15,6 +15,20 @@ class Chat(db.Model):
     description = db.Column(db.Text, nullable=True)
     avatar_url = db.Column(db.String(500), nullable=True)
     
+    permissions = db.Column(db.JSON, nullable=True)
+    slow_mode_delay = db.Column(db.Integer, default=0, nullable=False)
+    # Telegram-like: admin can hide members list from non-admins
+    hide_members = db.Column(db.Boolean, default=False, nullable=False)
+
+    # Suspension / closure after reports (Telegram-like)
+    is_suspended = db.Column(db.Boolean, default=False, nullable=False)
+    suspension_reason = db.Column(db.Text, nullable=True)
+    suspended_at = db.Column(db.DateTime, nullable=True)
+    suspended_by = db.Column(db.String(36), nullable=True)
+    is_closed = db.Column(db.Boolean, default=False, nullable=False)
+    closed_reason = db.Column(db.Text, nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+
     created_by = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
     is_public = db.Column(db.Boolean, default=False)
     
@@ -41,9 +55,17 @@ class ChatMember(db.Model):
     # owner | admin | member | subscriber
     role = db.Column(db.String(20), default='member')
     
+    permissions = db.Column(db.JSON, nullable=True)
+
     # Notification & settings
     is_muted = db.Column(db.Boolean, default=False)
     is_pinned = db.Column(db.Boolean, default=False)
+    # Newest pin first, exactly like Telegram's pinned block.
+    pinned_at = db.Column(db.DateTime, nullable=True)
+    # Archived chats leave the main list and live behind the optional PIN.
+    is_archived = db.Column(db.Boolean, nullable=False, default=False,
+                            server_default=db.false())
+    archived_at = db.Column(db.DateTime, nullable=True)
     custom_background = db.Column(db.String(500), nullable=True)
     
     joined_at = db.Column(db.DateTime, default=datetime.utcnow)

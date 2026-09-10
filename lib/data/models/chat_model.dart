@@ -1,3 +1,4 @@
+import '../../core/utils/api_datetime.dart';
 import 'package:equatable/equatable.dart';
 
 import 'user_model.dart';
@@ -9,7 +10,10 @@ class ChatModel extends Equatable {
   final String? username;
   final String? avatarUrl;
   final bool isPinned;
+  final DateTime? pinnedAt;
+  final bool isArchived;
   final bool isMuted;
+  final int slowModeDelay;
   final int unreadCount;
   final LastMessageModel? lastMessage;
   final DateTime updatedAt;
@@ -22,7 +26,10 @@ class ChatModel extends Equatable {
     this.username,
     this.avatarUrl,
     this.isPinned = false,
+    this.pinnedAt,
+    this.isArchived = false,
     this.isMuted = false,
+    this.slowModeDelay = 0,
     this.unreadCount = 0,
     this.lastMessage,
     required this.updatedAt,
@@ -37,7 +44,10 @@ class ChatModel extends Equatable {
       username: json['username'] as String?,
       avatarUrl: json['avatar_url'] as String?,
       isPinned: json['is_pinned'] as bool? ?? false,
+      pinnedAt: parseApiDateTime(json['pinned_at'] as String?),
+      isArchived: json['is_archived'] as bool? ?? false,
       isMuted: json['is_muted'] as bool? ?? false,
+      slowModeDelay: json['slow_mode_delay'] as int? ?? 0,
       unreadCount: json['unread_count'] as int? ?? 0,
       lastMessage: json['last_message'] != null
           ? LastMessageModel.fromJson(
@@ -45,13 +55,16 @@ class ChatModel extends Equatable {
             )
           : null,
       updatedAt:
-          DateTime.tryParse(json['updated_at'] as String? ?? '') ??
-          DateTime.now(),
+          parseApiDateTime(json['updated_at'] as String?) ?? DateTime.now(),
       otherUser: json['other_user'] != null
           ? UserModel.fromJson(json['other_user'] as Map<String, dynamic>)
           : null,
     );
   }
+
+  /// Personal conversations for the default "Personal" folder (Telegram parity).
+  bool get isPersonal =>
+      chatType == 'private' || chatType == 'support' || chatType == 'saved';
 
   String get displayTitle {
     if (chatType == 'private' && otherUser != null) {
@@ -61,7 +74,22 @@ class ChatModel extends Equatable {
   }
 
   @override
-  List<Object?> get props => [id, chatType, title, unreadCount, updatedAt];
+  List<Object?> get props => [
+    id,
+    chatType,
+    title,
+    username,
+    avatarUrl,
+    isPinned,
+    pinnedAt,
+    isArchived,
+    isMuted,
+    slowModeDelay,
+    unreadCount,
+    lastMessage,
+    updatedAt,
+    otherUser,
+  ];
 }
 
 class LastMessageModel {
@@ -86,7 +114,7 @@ class LastMessageModel {
       messageType: json['message_type'] as String?,
       senderId: json['sender_id'] as String?,
       createdAt: json['created_at'] != null
-          ? DateTime.tryParse(json['created_at'] as String)?.toLocal()
+          ? parseApiDateTime(json['created_at'] as String?)
           : null,
     );
   }

@@ -17,3 +17,5 @@ backend/uploads/
 local.properties
 key.properties
 *.jks
+backend/.venv/
+.venv/

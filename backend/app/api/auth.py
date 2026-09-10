@@ -162,6 +162,7 @@ def login():
         user_id=user.id, device_fingerprint=fingerprint, is_deleted=False
     ).first()
 
+    is_new_device = False
     if not device:
         count = UserDevice.query.filter_by(user_id=user.id, is_deleted=False).count()
         if count >= current_app.config['MAX_ACCOUNTS_PER_DEVICE']:
@@ -178,6 +179,10 @@ def login():
             user_agent=request.headers.get('User-Agent'),
         )
         db.session.add(device)
+        is_new_device = True
+    # If device exists but hasn't been active for a while (>30 days), treat as reconnection warning
+    elif device.last_active and (datetime.utcnow() - device.last_active).total_seconds() > 30*24*3600:
+        is_new_device = True
 
     device.last_active = datetime.utcnow()
     user.is_online = True
@@ -201,15 +206,41 @@ def login():
         entity_type='user',
         entity_id=user.id,
         ip_address=get_client_ip(),
+        user_agent=request.headers.get('User-Agent'),
         device_fingerprint=fingerprint,
     )
     db.session.add(audit)
+    db.session.flush()
+    # Telegram-like warning: if new device logged in, notify user via saved messages + add notification
+    if is_new_device:
+        try:
+            from app.models.chat import Chat, ChatMember
+            from app.models.message import Message
+            # Find or create saved messages chat for this user
+            saved_chat = None
+            member = ChatMember.query.join(Chat).filter(
+                ChatMember.user_id==user.id, Chat.chat_type=='saved', Chat.is_deleted==False, ChatMember.is_deleted==False
+            ).first()
+            if member:
+                saved_chat = db.session.get(Chat, member.chat_id)
+            if saved_chat:
+                ip = get_client_ip()
+                dev_name = device_info.get('device_name') or device.device_name or 'دستگاه جدید'
+                model = device_info.get('model') or device.device_model or ''
+                warn_text = f'⚠️ ورود جدید به حساب شما\n\nدستگاه: {dev_name} ({model})\nIP: {ip}\nزمان: {datetime.utcnow().strftime("%Y/%m/%d %H:%M UTC")}\n\nاگر این شما نبودید، فوراً رمز عبور خود را تغییر دهید و دستگاه‌های ناشناس را از بخش مدیریت دستگاه‌ها حذف کنید. (همانند تلگرام، هشدار امنیتی)'
+                sys_msg = Message(chat_id=saved_chat.id, sender_id=user.id, message_type='text', content=warn_text)
+                db.session.add(sys_msg)
+                # Update chat updated_at so it appears on top
+                saved_chat.updated_at = datetime.utcnow()
+        except Exception:
+            pass
     db.session.commit()
 
     return jsonify({
         'access_token': access,
         'refresh_token': refresh,
         'user': user.to_dict(include_private=True),
+        'new_device': is_new_device,
     }), 200
 
 

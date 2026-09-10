@@ -1,4 +1,6 @@
-from flask import Blueprint, request, jsonify
+from app.services.request_validation import validate_object_body
+from app.services.timestamps import utc_iso
+from flask import Blueprint, request, jsonify, current_app, send_from_directory
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
 from app.models.user import User, BlockList
@@ -7,95 +9,115 @@ from app.models.message import Message, MessageStatus, MessageReaction, PinnedMe
 from app.models.media import MediaFile
 from app.models.audit import AuditLog
 from datetime import datetime
+from sqlalchemy import and_, or_
+from app.services.chat_permissions import can, can_send, can_delete
+import os
+
+from app.services.message_payloads import (
+    serialize_messages, user_in_chat, visible_messages,
+)
 
 messages_bp = Blueprint('messages', __name__)
+
+messages_bp.before_request(validate_object_body)
+
+# Telegram keeps a bounded pinned list per chat; the bar stays readable.
+MAX_PINNED_MESSAGES = 100
+
+
+def dispatch_scheduled_messages(chat_id=None):
+    """Automatically dispatch due scheduled messages."""
+    now = datetime.utcnow()
+    query = Message.query.filter(
+        Message.is_scheduled == True,
+        Message.scheduled_at <= now,
+        Message.is_deleted == False,
+        Message.is_deleted_for_all == False,
+    )
+    if chat_id:
+        query = query.filter(Message.chat_id == chat_id)
+    scheduled_msgs = query.all()
+    if not scheduled_msgs:
+        return
+    for msg in scheduled_msgs:
+        msg.is_scheduled = False
+        msg.created_at = now
+        members = ChatMember.query.filter_by(chat_id=msg.chat_id, is_deleted=False).all()
+        for m in members:
+            if m.user_id != msg.sender_id:
+                db.session.add(MessageStatus(
+                    message_id=msg.id, user_id=m.user_id, status='delivered',
+                    delivered_at=now
+                ))
+        chat = db.session.get(Chat, msg.chat_id)
+        if chat:
+            chat.updated_at = now
+    db.session.commit()
+
+
+def _pinned_count(chat_id):
+    return PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).count()
+
 
 def get_client_ip():
     return request.headers.get('X-Forwarded-For', request.remote_addr)
 
 
-def user_in_chat(user_id, chat_id):
-    return ChatMember.query.filter_by(
-        chat_id=chat_id, user_id=user_id, is_deleted=False
-    ).first() is not None
-
-
 @messages_bp.route('/<chat_id>', methods=['GET'])
 @jwt_required()
 def get_messages(chat_id):
-    """دریافت پیام‌ها + پشتیبانی از Polling با after_id یا since"""
+    """Chronological history, incremental polling and direct reply navigation."""
     user_id = get_jwt_identity()
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
+    dispatch_scheduled_messages(chat_id)
+
+    try:
+        limit = max(1, min(int(request.args.get('limit', 50)), 100))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'limit نامعتبر است'}), 400
+
     after_id = request.args.get('after_id')
     before_id = request.args.get('before_id')
-    limit = min(int(request.args.get('limit', 50)), 100)
-
-    hidden_ids = {h.message_id for h in MessageHide.query.filter_by(user_id=user_id).all()}
-    query = Message.query.filter(
-        Message.chat_id == chat_id,
-        Message.is_deleted_for_all == False,
-    )
-
-    if after_id:
-        after_msg = Message.query.get(after_id)
-        if after_msg:
-            query = query.filter(Message.created_at > after_msg.created_at)
-    elif before_id:
-        before_msg = Message.query.get(before_id)
-        if before_msg:
-            query = query.filter(Message.created_at < before_msg.created_at)
-
-    messages = query.order_by(Message.created_at.desc()).limit(limit * 2).all()
-    messages = [m for m in messages if m.id not in hidden_ids][:limit]
-    messages.reverse()  # قدیمی به جدید
-
-    result = []
-    for msg in messages:
-        # وضعیت خوانده شدن برای کاربر فعلی
-        sender = User.query.get(msg.sender_id)
-
-        # وضعیت تیک‌ها: برای پیام خودم، بالاترین وضعیت گیرندگان را نشان بده
-        if msg.sender_id == user_id:
-            statuses = MessageStatus.query.filter(
-                MessageStatus.message_id == msg.id,
-                MessageStatus.user_id != user_id,
-            ).all()
-            if any(s.status == 'read' for s in statuses):
-                msg_status = 'read'
-            elif any(s.status == 'delivered' for s in statuses):
-                msg_status = 'delivered'
-            else:
-                msg_status = 'sent'
+    from_id = request.args.get('from_id')
+    if sum(bool(v) for v in (after_id, before_id, from_id)) > 1:
+        return jsonify({'error': 'فقط یک نشانگر پیام مجاز است'}), 400
+    cursor_id = after_id or before_id or from_id
+    query = visible_messages(user_id).filter(Message.chat_id == chat_id)
+    if cursor_id:
+        # A cursor may have been deleted since the previous poll, but must
+        # always belong to this chat. A reply jump must still be visible.
+        cursor_query = query if from_id else Message.query.filter_by(chat_id=chat_id)
+        cursor = cursor_query.filter(Message.id == cursor_id).first()
+        if cursor is None:
+            return jsonify({'error': 'پیام یافت نشد'}), 404
+        if before_id:
+            query = query.filter(or_(
+                Message.created_at < cursor.created_at,
+                and_(Message.created_at == cursor.created_at, Message.id < cursor.id),
+            ))
         else:
-            st = MessageStatus.query.filter_by(message_id=msg.id, user_id=user_id).first()
-            msg_status = st.status if st else 'delivered'
+            query = query.filter(or_(
+                Message.created_at > cursor.created_at,
+                and_(Message.created_at == cursor.created_at,
+                     Message.id >= cursor.id if from_id else Message.id > cursor.id),
+            ))
 
-        media_url = None
-        if msg.media_id:
-            media_url = f'/api/v1/media/{msg.media_id}'
-
-        item = {
-            'id': msg.id,
-            'chat_id': msg.chat_id,
-            'sender_id': msg.sender_id,
-            'sender': sender.to_dict() if sender else None,
-            'message_type': msg.message_type,
-            'content': msg.content,
-            'media_id': msg.media_id,
-            'media_url': media_url,
-            'reply_to_id': msg.reply_to_id,
-            'forwarded_from_id': msg.forwarded_from_id,
-            'is_view_once': msg.is_view_once,
-            'viewed_at': msg.viewed_at.isoformat() if msg.viewed_at else None,
-            'is_edited': msg.is_edited,
-            'created_at': msg.created_at.isoformat(),
-            'status': msg_status,
-        }
-        result.append(item)
-
-    return jsonify({'messages': result, 'has_more': len(messages) == limit}), 200
+    # after_id must take the FIRST unseen page, not the last, or a busy chat
+    # silently loses messages. The UUID breaks equal-timestamp ties.
+    ascending = bool(after_id or from_id)
+    ordering = (Message.created_at.asc(), Message.id.asc()) if ascending else (
+        Message.created_at.desc(), Message.id.desc())
+    rows = query.order_by(*ordering).limit(limit + 1).all()
+    has_more = len(rows) > limit
+    messages = rows[:limit]
+    if not ascending:
+        messages.reverse()
+    return jsonify({
+        'messages': serialize_messages(messages, user_id),
+        'has_more': has_more,
+    }), 200
 
 
 @messages_bp.route('/', methods=['POST'])
@@ -110,6 +132,7 @@ def send_message():
     media_id = data.get('media_id')
     reply_to_id = data.get('reply_to_id')
     is_view_once = bool(data.get('is_view_once', False))
+    is_spoiler = bool(data.get('is_spoiler', False))
 
     if not chat_id:
         return jsonify({'error': 'chat_id الزامی است'}), 400
@@ -117,12 +140,72 @@ def send_message():
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
+    if message_type not in ('text', 'image', 'video', 'voice', 'file', 'sticker', 'gif', 'video_note', 'round_video'):
+        return jsonify({'error': 'Invalid message type'}), 400
+    if message_type != 'text' and not media_id:
+        # sticker may be sent via emoji without media in some clients; allow
+        if message_type not in ('sticker', 'gif'):
+            return jsonify({'error': 'Media is required'}), 400
+        if message_type in ('sticker', 'gif') and not media_id and not content:
+            return jsonify({'error': 'Media is required'}), 400
+    if message_type == 'text' and media_id:
+        return jsonify({'error': 'Text messages cannot contain media'}), 400
+
     if message_type == 'text' and not content:
         return jsonify({'error': 'متن پیام خالی است'}), 400
 
     chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
     if not chat:
         return jsonify({'error': 'دشن تفای تچ'}), 404
+    # Check if chat is suspended/closed (report action) - Telegram shows banner and blocks sending
+    if chat.is_suspended:
+        return jsonify({'error': f'این {"کانال" if chat.chat_type=="channel" else "گروه"} توسط مدیریت تعلیق شده است. دلیل: {chat.suspension_reason or "محتوای نامناسب"}'}), 403
+    if chat.is_closed:
+        # Only owner can send in closed chat? Actually closed means no one can send until reopened
+        member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+        if not member or member.role != 'owner':
+            return jsonify({'error': f'این چت بسته شده است. دلیل: {chat.closed_reason or ""}'}), 403
+    # Limited account check for group/channel spam? Allow but private already handled in create_private_chat
+    # For private chats, limited users can still send if already in chat (existing contact) - so pass
+    # No extra block here; creation already blocks new strangers.
+
+    if not can_send(chat, user_id, message_type, is_view_once):
+        return jsonify({'error': 'Sending this type of message is not permitted'}), 403
+
+    # Slow mode enforcement for groups
+    if chat.chat_type == 'group' and chat.slow_mode_delay > 0:
+        member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+        if member and member.role not in ('owner', 'admin'):
+            last_msg = Message.query.filter_by(
+                chat_id=chat_id, sender_id=user_id, is_deleted=False, is_scheduled=False
+            ).order_by(Message.created_at.desc()).first()
+            if last_msg:
+                elapsed = (datetime.utcnow() - last_msg.created_at).total_seconds()
+                if elapsed < chat.slow_mode_delay:
+                    remaining = int(chat.slow_mode_delay - elapsed) + 1
+                    return jsonify({
+                        'error': f'حالت ارسال کند فعال است. لطفا {remaining} ثانیه دیگر صبر کنید.',
+                        'remaining_seconds': remaining
+                    }), 429
+
+    scheduled_at_raw = data.get('scheduled_at')
+    scheduled_dt = None
+    if scheduled_at_raw:
+        try:
+            raw = str(scheduled_at_raw).strip()
+            # Support both ISO with Z and with explicit offset like +03:30 (Iran)
+            # Also handle format without T (space separated) for legacy clients
+            iso = raw.replace('Z', '+00:00').replace(' ', 'T')
+            scheduled_dt = datetime.fromisoformat(iso)
+            if scheduled_dt.tzinfo is not None:
+                import datetime as dt_module
+                scheduled_dt = scheduled_dt.astimezone(dt_module.timezone.utc).replace(tzinfo=None)
+            else:
+                # Naive datetime: treat as UTC (legacy). New Flutter clients send Z/offset,
+                # so Iran time is correctly converted to UTC before storage.
+                pass
+        except Exception:
+            return jsonify({'error': 'زمان‌بندی نامعتبر است'}), 400
 
     if chat.chat_type == 'private':
         other_member = ChatMember.query.filter(
@@ -139,6 +222,43 @@ def send_message():
             if is_blocked:
                 return jsonify({'error': 'امکان ارسال پیام وجود ندارد'}), 403
 
+    if reply_to_id:
+        original = visible_messages(user_id).filter_by(
+            id=reply_to_id, chat_id=chat_id
+        ).first()
+        if original is None:
+            return jsonify({'error': 'پیام مرجع در این چت در دسترس نیست'}), 400
+
+    if is_view_once and (message_type != 'image' or not media_id):
+        return jsonify({'error': 'مشاهده یک‌باره فقط برای عکس مجاز است'}), 400
+    if media_id:
+        media = MediaFile.query.filter_by(
+            id=media_id, uploader_id=user_id, is_deleted=False
+        ).first()
+        if media is None:
+            return jsonify({'error': 'فایل در دسترس نیست'}), 403
+        # Telegram allows sending images/videos/audio as generic files (document).
+        # So 'file' accepts any media_type; others must match strictly.
+        if message_type != 'file':
+            expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'sticker': 'image', 'gif': 'image', 'video_note': 'video', 'round_video': 'video'}
+            # gif may be image or video; sticker may be image/webp; be lenient
+            if message_type in ('gif', 'sticker'):
+                if media.media_type not in ('image', 'video', 'document'):
+                    return jsonify({'error': 'Media type does not match the message type'}), 400
+            elif media.media_type != expected.get(message_type):
+                # For video_note / round_video also allow 'video' only
+                return jsonify({'error': 'Media type does not match the message type'}), 400
+        # else file: accept any media_type (image, video, audio, document) like Telegram
+        if is_view_once and media.media_type != 'image':
+            return jsonify({'error': 'فایل باید عکس باشد'}), 400
+        # Reusing an ephemeral upload as a normal message bypasses view-once.
+        references = Message.query.filter_by(media_id=media_id)
+        if references.filter_by(is_view_once=True).first() or (
+            is_view_once and references.first()
+        ):
+            return jsonify({'error': 'این فایل قبلاً در پیام استفاده شده است'}), 400
+
+    is_scheduled = bool(scheduled_dt and scheduled_dt > datetime.utcnow())
     msg = Message(
         chat_id=chat_id,
         sender_id=user_id,
@@ -147,38 +267,35 @@ def send_message():
         media_id=media_id,
         reply_to_id=reply_to_id,
         is_view_once=is_view_once,
+        is_spoiler=is_spoiler,
+        is_scheduled=is_scheduled,
+        scheduled_at=scheduled_dt if is_scheduled else None,
     )
     db.session.add(msg)
     db.session.flush()
 
-    # وضعیت برای فرستنده
-    db.session.add(MessageStatus(message_id=msg.id, user_id=user_id, status='sent'))
+    if not is_scheduled:
+        # وضعیت برای فرستنده
+        db.session.add(MessageStatus(message_id=msg.id, user_id=user_id, status='sent'))
 
-    # وضعیت برای بقیه اعضا
-    members = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).all()
-    for m in members:
-        if m.user_id != user_id:
-            db.session.add(MessageStatus(
-                message_id=msg.id, user_id=m.user_id, status='delivered',
-                delivered_at=datetime.utcnow()
-            ))
+        # وضعیت برای بقیه اعضا
+        members = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).all()
+        for m in members:
+            if m.user_id != user_id:
+                db.session.add(MessageStatus(
+                    message_id=msg.id, user_id=m.user_id, status='delivered',
+                    delivered_at=datetime.utcnow()
+                ))
 
-    chat.updated_at = datetime.utcnow()
+        chat.updated_at = datetime.utcnow()
+
     db.session.add(AuditLog(
-        actor_id=user_id, action='send_message', entity_type='message', entity_id=msg.id,
+        actor_id=user_id, action='schedule_message' if is_scheduled else 'send_message', entity_type='message', entity_id=msg.id,
         ip_address=get_client_ip()
     ))
     db.session.commit()
 
-    return jsonify({
-        'id': msg.id,
-        'chat_id': msg.chat_id,
-        'sender_id': msg.sender_id,
-        'message_type': msg.message_type,
-        'content': msg.content,
-        'created_at': msg.created_at.isoformat(),
-        'status': 'sent',
-    }), 201
+    return jsonify(serialize_messages([msg], user_id, status_override='sent')[0]), 201
 
 
 @messages_bp.route('/<message_id>/read', methods=['POST'])
@@ -218,14 +335,17 @@ def delete_message(message_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
     if for_all:
-        if msg.sender_id != user_id:
-            member = ChatMember.query.filter_by(chat_id=msg.chat_id, user_id=user_id).first()
-            if not member or member.role not in ('owner', 'admin'):
-                return jsonify({'error': 'مجوز حذف برای همه را ندارید'}), 403
+        chat = db.session.get(Chat, msg.chat_id)
+        if not can_delete(chat, user_id, msg):
+            return jsonify({'error': 'Deleting for everyone is not permitted'}), 403
         msg.is_deleted_for_all = True
         msg.is_deleted = True
         msg.deleted_at = datetime.utcnow()
         msg.deleted_by = user_id
+        # A deleted message must not stay in the pinned bar for anyone.
+        PinnedMessage.query.filter_by(message_id=message_id, is_deleted=False).update({
+            'is_deleted': True, 'deleted_at': datetime.utcnow(),
+        }, synchronize_session=False)
     else:
         # حذف یک‌طرفه واقعی با MessageHide
         existing_hide = MessageHide.query.filter_by(message_id=message_id, user_id=user_id).first()
@@ -254,8 +374,38 @@ def forward_message(message_id):
     if not original:
         return jsonify({'error': 'پیام یافت نشد'}), 404
 
+    if not user_in_chat(user_id, original.chat_id) or not visible_messages(user_id).filter_by(id=message_id).first():
+        return jsonify({'error': 'دسترسی به پیام ندارید'}), 403
+    if original.is_view_once or (original.media_id and Message.query.filter_by(
+        media_id=original.media_id, is_view_once=True
+    ).first()):
+        return jsonify({'error': 'عکس یک‌بارمصرف قابل فوروارد نیست'}), 403
+
     if not user_in_chat(user_id, target_chat_id):
         return jsonify({'error': 'دسترسی به چت مقصد ندارید'}), 403
+
+    target_chat = db.session.get(Chat, target_chat_id)
+    if not can_send(target_chat, user_id, original.message_type):
+        return jsonify({'error': 'Forwarding this message type is not permitted'}), 403
+    if original.media_id:
+        media = db.session.get(MediaFile, original.media_id)
+        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'file': 'document', 'sticker': 'image', 'gif': 'image', 'video_note': 'video', 'round_video': 'video'}
+        # file accepts any, sticker/gif lenient
+        valid = False
+        if original.message_type == 'file':
+            valid = media and not media.is_deleted
+        elif original.message_type in ('sticker', 'gif'):
+            valid = media and not media.is_deleted and media.media_type in ('image','video','document')
+        else:
+            valid = media and not media.is_deleted and media.media_type == expected.get(original.message_type)
+        if not valid:
+            return jsonify({'error': 'Media is unavailable or has an invalid type'}), 400
+    if target_chat.chat_type == 'private':
+        peers = [m.user_id for m in ChatMember.query.filter_by(chat_id=target_chat_id, is_deleted=False).all() if m.user_id != user_id]
+        if BlockList.query.filter(BlockList.is_deleted.is_(False),
+            ((BlockList.blocker_id == user_id) & BlockList.blocked_id.in_(peers)) |
+            ((BlockList.blocked_id == user_id) & BlockList.blocker_id.in_(peers))).first():
+            return jsonify({'error': 'Cannot forward to a blocked user'}), 403
 
     new_msg = Message(
         chat_id=target_chat_id,
@@ -265,6 +415,7 @@ def forward_message(message_id):
         media_id=original.media_id,
         forwarded_from_id=original.id,
         forwarded_from_chat_id=original.chat_id,
+        is_spoiler=original.is_spoiler,
     )
     db.session.add(new_msg)
     db.session.flush()
@@ -284,18 +435,94 @@ def forward_message(message_id):
 @messages_bp.route('/<message_id>/pin', methods=['POST'])
 @jwt_required()
 def pin_message(message_id):
+    """Pin a message. Several messages can stay pinned at once, like Telegram."""
     user_id = get_jwt_identity()
-    msg = Message.query.filter_by(id=message_id, is_deleted=False).first()
+    msg = visible_messages(user_id).filter_by(id=message_id).first()
     if not msg or not user_in_chat(user_id, msg.chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
-    existing = PinnedMessage.query.filter_by(chat_id=msg.chat_id, message_id=message_id, is_deleted=False).first()
-    if existing:
-        return jsonify({'message': 'قبلاً پین شده'}), 200
+    if not can(db.session.get(Chat, msg.chat_id), user_id, 'pin_messages'):
+        return jsonify({'error': 'Pinning messages is not permitted'}), 403
 
-    db.session.add(PinnedMessage(chat_id=msg.chat_id, message_id=message_id, pinned_by=user_id))
+    existing = PinnedMessage.query.filter_by(chat_id=msg.chat_id, message_id=message_id).first()
+    if existing and not existing.is_deleted:
+        return jsonify({'ok': True, 'message': 'قبلاً پین شده',
+                        'pinned_count': _pinned_count(msg.chat_id)}), 200
+
+    if existing:
+        # Re-pin the same message by reviving its soft deleted row.
+        existing.is_deleted = False
+        existing.deleted_at = None
+        existing.pinned_by = user_id
+        existing.pinned_at = datetime.utcnow()
+    else:
+        if _pinned_count(msg.chat_id) >= MAX_PINNED_MESSAGES:
+            return jsonify({'error': f'حداکثر {MAX_PINNED_MESSAGES} پیام می‌تواند پین باشد'}), 400
+        db.session.add(PinnedMessage(chat_id=msg.chat_id, message_id=message_id, pinned_by=user_id))
+    db.session.add(AuditLog(actor_id=user_id, action='pin_message', entity_type='message',
+                            entity_id=message_id, ip_address=get_client_ip()))
     db.session.commit()
-    return jsonify({'ok': True}), 200
+    return jsonify({'ok': True, 'pinned_count': _pinned_count(msg.chat_id)}), 200
+
+
+@messages_bp.route('/<message_id>/unpin', methods=['POST'])
+@jwt_required()
+def unpin_message(message_id):
+    user_id = get_jwt_identity()
+    msg = Message.query.filter_by(id=message_id).first()
+    if not msg or not user_in_chat(user_id, msg.chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    if not can(db.session.get(Chat, msg.chat_id), user_id, 'pin_messages'):
+        return jsonify({'error': 'Pinning messages is not permitted'}), 403
+
+    pin = PinnedMessage.query.filter_by(chat_id=msg.chat_id, message_id=message_id,
+                                        is_deleted=False).first()
+    if pin:
+        pin.is_deleted = True
+        pin.deleted_at = datetime.utcnow()
+        db.session.add(AuditLog(actor_id=user_id, action='unpin_message', entity_type='message',
+                                entity_id=message_id, ip_address=get_client_ip()))
+        db.session.commit()
+    return jsonify({'ok': True, 'pinned_count': _pinned_count(msg.chat_id)}), 200
+
+
+@messages_bp.route('/chat/<chat_id>/pinned', methods=['GET'])
+@jwt_required()
+def list_pinned_messages(chat_id):
+    """Newest pin first, matching the pinned bar order used by Telegram."""
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    pins = PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).order_by(
+        PinnedMessage.pinned_at.desc()).all()
+    if not pins:
+        return jsonify({'messages': [], 'can_pin': can(db.session.get(Chat, chat_id), user_id, 'pin_messages')}), 200
+    order = {pin.message_id: index for index, pin in enumerate(pins)}
+    messages = visible_messages(user_id).filter(
+        Message.chat_id == chat_id, Message.id.in_(list(order))
+    ).all()
+    messages.sort(key=lambda m: order.get(m.id, len(order)))
+    return jsonify({
+        'messages': serialize_messages(messages, user_id),
+        'can_pin': can(db.session.get(Chat, chat_id), user_id, 'pin_messages'),
+    }), 200
+
+
+@messages_bp.route('/chat/<chat_id>/unpin-all', methods=['POST'])
+@jwt_required()
+def unpin_all_messages(chat_id):
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    if not can(db.session.get(Chat, chat_id), user_id, 'pin_messages'):
+        return jsonify({'error': 'Pinning messages is not permitted'}), 403
+    PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).update({
+        'is_deleted': True, 'deleted_at': datetime.utcnow(),
+    }, synchronize_session=False)
+    db.session.add(AuditLog(actor_id=user_id, action='unpin_all_messages', entity_type='chat',
+                            entity_id=chat_id, ip_address=get_client_ip()))
+    db.session.commit()
+    return jsonify({'ok': True, 'pinned_count': 0}), 200
 
 
 @messages_bp.route('/poll', methods=['GET'])
@@ -306,19 +533,20 @@ def poll_updates():
     کلاینت هر چند ثانیه این را صدا می‌زند و after timestamp یا last_event_id می‌دهد
     """
     user_id = get_jwt_identity()
+    dispatch_scheduled_messages()
     since = request.args.get('since')  # ISO datetime
     limit = min(int(request.args.get('limit', 50)), 100)
 
     # چت‌هایی که کاربر عضو است
-    chat_ids = [m.chat_id for m in ChatMember.query.filter_by(user_id=user_id, is_deleted=False).all()]
+    chat_ids = [m.chat_id for m in ChatMember.query.join(Chat).filter(
+        ChatMember.user_id == user_id, ChatMember.is_deleted.is_(False),
+        Chat.is_deleted.is_(False),
+    ).all()]
 
     if not chat_ids:
         return jsonify({'messages': [], 'chats_updated': []}), 200
 
-    query = Message.query.filter(
-        Message.chat_id.in_(chat_ids),
-        Message.is_deleted == False
-    )
+    query = visible_messages(user_id).filter(Message.chat_id.in_(chat_ids))
 
     if since:
         try:
@@ -329,21 +557,7 @@ def poll_updates():
 
     new_messages = query.order_by(Message.created_at.asc()).limit(limit).all()
 
-    result_msgs = []
-    for msg in new_messages:
-        sender = User.query.get(msg.sender_id)
-        result_msgs.append({
-            'id': msg.id,
-            'chat_id': msg.chat_id,
-            'sender_id': msg.sender_id,
-            'sender': sender.to_dict() if sender else None,
-            'message_type': msg.message_type,
-            'content': msg.content,
-            'media_id': msg.media_id,
-            'reply_to_id': msg.reply_to_id,
-            'is_view_once': msg.is_view_once,
-            'created_at': msg.created_at.isoformat(),
-        })
+    result_msgs = serialize_messages(new_messages, user_id)
 
     return jsonify({
         'messages': result_msgs,
@@ -363,25 +577,11 @@ def search_in_chat(chat_id):
     if len(q) < 2:
         return jsonify({'messages': []}), 200
 
-    messages = Message.query.filter(
-        Message.chat_id == chat_id,
-        Message.is_deleted == False,
-        Message.content.ilike(f'%{q}%')
+    messages = visible_messages(user_id).filter(
+        Message.chat_id == chat_id, Message.content.ilike(f'%{q}%')
     ).order_by(Message.created_at.desc()).limit(50).all()
 
-    result = []
-    for msg in messages:
-        sender = User.query.get(msg.sender_id)
-        result.append({
-            'id': msg.id,
-            'chat_id': msg.chat_id,
-            'sender_id': msg.sender_id,
-            'sender': sender.to_dict() if sender else None,
-            'message_type': msg.message_type,
-            'content': msg.content,
-            'created_at': msg.created_at.isoformat(),
-        })
-    return jsonify({'messages': result}), 200
+    return jsonify({'messages': serialize_messages(messages, user_id)}), 200
 
 
 @messages_bp.route('/chat/<chat_id>/clear', methods=['POST'])
@@ -396,18 +596,24 @@ def clear_chat_history(chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
     if for_all:
-        member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
-        chat = Chat.query.get(chat_id)
-        if chat and chat.chat_type == 'private':
-            pass  # در خصوصی هر طرف می‌تواند برای همه پاک کند (مثل تلگرام با محدودیت)
-        elif not member or member.role not in ('owner', 'admin'):
-            return jsonify({'error': 'مجوز حذف برای همه را ندارید'}), 403
+        chat = db.session.get(Chat, chat_id)
+        if not chat:
+            return jsonify({'error': 'چت یافت نشد'}), 404
+        # Private/saved/support: either side may wipe the thread. Group and
+        # channel: the OWNER always may (full control), delegated admins never.
+        if not can(chat, user_id, 'clear_history_for_all'):
+            return jsonify({'error': 'Clearing the shared history is not permitted'}), 403
 
         Message.query.filter_by(chat_id=chat_id).update({
             'is_deleted_for_all': True,
             'is_deleted': True,
             'deleted_at': datetime.utcnow(),
             'deleted_by': user_id,
+        }, synchronize_session=False)
+        # A wiped history keeps no pins pointing at unreachable messages.
+        PinnedMessage.query.filter_by(chat_id=chat_id, is_deleted=False).update({
+            'is_deleted': True,
+            'deleted_at': datetime.utcnow(),
         }, synchronize_session=False)
     else:
         # یک‌طرفه: فقط برای این کاربر با MessageHide
@@ -483,49 +689,186 @@ def mark_chat_read(chat_id):
     db.session.commit()
     return jsonify({'ok': True}), 200
 
+def view_once_message(message_id, user_id):
+    msg = visible_messages(user_id).filter_by(id=message_id).first()
+    if msg is None:
+        return None, (jsonify({'error': 'پیام یافت نشد'}), 404)
+    if not user_in_chat(user_id, msg.chat_id) or msg.sender_id == user_id:
+        return None, (jsonify({'error': 'فقط گیرنده می‌تواند عکس را باز کند'}), 403)
+    if not msg.is_view_once or msg.message_type != 'image':
+        return None, (jsonify({'error': 'این پیام عکس یک‌بارمصرف نیست'}), 400)
+    if msg.viewed_at is not None:
+        return None, (jsonify({'error': 'عکس قبلاً مشاهده شده است'}), 410)
+    return msg, None
+
+
+@messages_bp.route('/<message_id>/view-once/media', methods=['GET'])
+@jwt_required()
+def get_view_once_media(message_id):
+    """Load into memory first; failed downloads/decodes do not consume the photo.
+
+    Clients may reveal these bytes only after winning the atomic POST below.
+    The ordinary media URL never serves a view-once upload.
+    """
+    msg, error = view_once_message(message_id, get_jwt_identity())
+    if error is not None:
+        return error
+    media = MediaFile.query.filter_by(id=msg.media_id, is_deleted=False).first()
+    if media is None:
+        return jsonify({'error': 'فایل یافت نشد'}), 404
+    response = send_from_directory(
+        os.path.abspath(current_app.config['UPLOAD_FOLDER']), media.stored_name,
+        conditional=False, etag=False, max_age=0,
+    )
+    response.headers['Cache-Control'] = 'private, no-store, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    return response
+
+
 @messages_bp.route('/<message_id>/view-once', methods=['POST'])
 @jwt_required()
 def mark_view_once(message_id):
     user_id = get_jwt_identity()
-    msg = Message.query.filter_by(id=message_id, is_deleted=False).first()
-    if not msg:
-        return jsonify({'error': 'پیام یافت نشد'}), 404
-    if not msg.is_view_once:
-        return jsonify({'error': 'این پیام view once نیست'}), 400
-    msg.viewed_at = datetime.utcnow()
+    msg, error = view_once_message(message_id, user_id)
+    if error is not None:
+        return error
+    viewed_at = datetime.utcnow()
+    # A conditional UPDATE works on both MySQL and SQLite. Two devices cannot
+    # both win the claim, even when their preceding downloads overlap.
+    updated = Message.query.filter_by(
+        id=message_id, is_deleted=False, is_deleted_for_all=False,
+        is_view_once=True, viewed_at=None,
+    ).update({'viewed_at': viewed_at}, synchronize_session=False)
+    if updated != 1:
+        db.session.rollback()
+        return jsonify({'error': 'عکس قبلاً مشاهده شده است'}), 410
+    db.session.add(AuditLog(
+        actor_id=user_id, action='view_once_opened', entity_type='message',
+        entity_id=message_id, ip_address=get_client_ip(),
+    ))
     db.session.commit()
-    return jsonify({'ok': True}), 200
+    return jsonify({'ok': True, 'viewed_at': utc_iso(viewed_at)}), 200
+
 
 @messages_bp.route('/statuses', methods=['POST'])
 @jwt_required()
 def get_message_statuses():
-    """گرفتن وضعیت فعلی چند پیام (برای آپدیت تیک‌ها به صورت real-time/polling)"""
+    """Reconcile loaded messages over HTTP, including read and received ones.
+
+    Deletion is state, not a new message: after_id polling alone cannot deliver
+    it. Clients send bounded batches of loaded IDs (and quoted original IDs).
+    This also works after missed polls, without clocks or a schema migration.
+    The existing statuses/viewed_at fields remain backwards compatible.
+    """
     user_id = get_jwt_identity()
-    data = request.get_json() or {}
-    message_ids = data.get('message_ids') or []
-    if not message_ids:
-        return jsonify({'statuses': {}}), 200
+    data = request.get_json()
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'درخواست نامعتبر است'}), 400
+    message_ids = data.get('message_ids', [])
+    if (not isinstance(message_ids, list) or len(message_ids) > 100
+            or any(not isinstance(mid, str) or not mid or len(mid) > 36
+                   for mid in message_ids)):
+        return jsonify({'error': 'حداکثر ۱۰۰ شناسه پیام معتبر مجاز است'}), 400
 
-    result = {}
-    for mid in message_ids:
-        msg = Message.query.get(mid)
-        if not msg:
-            continue
-        # فقط اجازه چک کردن وضعیت پیام‌های خودمون رو می‌دیم
-        if msg.sender_id != user_id:
-            continue
-        if not user_in_chat(user_id, msg.chat_id):
-            continue
+    chat_id = data.get('chat_id')
+    if chat_id is not None:
+        if not isinstance(chat_id, str) or not user_in_chat(user_id, chat_id):
+            return jsonify({'error': 'دسترسی ندارید'}), 403
 
-        statuses = MessageStatus.query.filter(
-            MessageStatus.message_id == mid,
-            MessageStatus.user_id != user_id,
-        ).all()
-        if any(s.status == 'read' for s in statuses):
-            result[mid] = 'read'
-        elif any(s.status == 'delivered' for s in statuses):
-            result[mid] = 'delivered'
-        else:
-            result[mid] = 'sent'
+    # Membership is checked BEFORE exposing even a deleted ID. Never reveal
+    # existence, read receipts or view-once state from an unrelated chat.
+    query = Message.query.join(Chat, Message.chat_id == Chat.id).join(
+        ChatMember, ChatMember.chat_id == Chat.id
+    ).filter(
+        Message.id.in_(message_ids),
+        ChatMember.user_id == user_id,
+        ChatMember.is_deleted.is_(False),
+        Chat.is_deleted.is_(False),
+        Chat.is_deleted_for_all.is_(False),
+    )
+    if chat_id is not None:
+        query = query.filter(Message.chat_id == chat_id)
+    messages = query.all()
+    hidden_ids = {row.message_id for row in MessageHide.query.filter(
+        MessageHide.user_id == user_id,
+        MessageHide.message_id.in_([msg.id for msg in messages]),
+    ).all()}
+    deleted_ids = {msg.id for msg in messages
+                   if msg.is_deleted or msg.is_deleted_for_all
+                   or msg.id in hidden_ids}
+    visible = [msg for msg in messages if msg.id not in deleted_ids]
+    sent_ids = [msg.id for msg in visible if msg.sender_id == user_id]
+    statuses = {mid: 'sent' for mid in sent_ids}
+    rank = {'sent': 0, 'delivered': 1, 'read': 2}
+    for status in MessageStatus.query.filter(
+        MessageStatus.message_id.in_(sent_ids),
+        MessageStatus.user_id != user_id,
+    ).all():
+        previous = statuses[status.message_id]
+        if rank.get(status.status, 0) > rank[previous]:
+            statuses[status.message_id] = status.status
 
-    return jsonify({'statuses': result}), 200
+    return jsonify({
+        'statuses': statuses,
+        'viewed_at': {msg.id: utc_iso(msg.viewed_at) if msg.viewed_at else None
+                      for msg in visible if msg.is_view_once},
+        'deleted_ids': sorted(deleted_ids),
+        # Pin state is state, not a message: reconcile it with the same poll.
+        'pinned_ids': sorted({row.message_id for row in PinnedMessage.query.filter(
+            PinnedMessage.message_id.in_([msg.id for msg in visible]),
+            PinnedMessage.is_deleted.is_(False),
+        ).all()}),
+    }), 200
+
+
+@messages_bp.route('/chat/<chat_id>/scheduled', methods=['GET'])
+@jwt_required()
+def get_scheduled_messages(chat_id):
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    dispatch_scheduled_messages(chat_id)
+    messages = Message.query.filter_by(
+        chat_id=chat_id, sender_id=user_id, is_scheduled=True, is_deleted=False
+    ).order_by(Message.scheduled_at.asc()).all()
+    return jsonify({'messages': serialize_messages(messages, user_id)}), 200
+
+
+@messages_bp.route('/<message_id>/scheduled/send-now', methods=['POST'])
+@jwt_required()
+def send_scheduled_now(message_id):
+    user_id = get_jwt_identity()
+    msg = Message.query.filter_by(id=message_id, sender_id=user_id, is_scheduled=True, is_deleted=False).first()
+    if not msg:
+        return jsonify({'error': 'پیام زمان‌بندی‌شده یافت نشد'}), 404
+    now = datetime.utcnow()
+    msg.is_scheduled = False
+    msg.scheduled_at = None
+    msg.created_at = now
+    members = ChatMember.query.filter_by(chat_id=msg.chat_id, is_deleted=False).all()
+    for m in members:
+        if m.user_id != msg.sender_id:
+            db.session.add(MessageStatus(
+                message_id=msg.id, user_id=m.user_id, status='delivered', delivered_at=now
+            ))
+    chat = db.session.get(Chat, msg.chat_id)
+    if chat:
+        chat.updated_at = now
+    db.session.commit()
+    return jsonify(serialize_messages([msg], user_id)[0]), 200
+
+
+@messages_bp.route('/<message_id>/scheduled', methods=['DELETE', 'POST'])
+@jwt_required()
+def cancel_scheduled_message(message_id):
+    user_id = get_jwt_identity()
+    msg = Message.query.filter_by(id=message_id, sender_id=user_id, is_scheduled=True, is_deleted=False).first()
+    if not msg:
+        return jsonify({'error': 'پیام زمان‌بندی‌شده یافت نشد'}), 404
+    msg.is_deleted = True
+    msg.deleted_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'ok': True}), 200

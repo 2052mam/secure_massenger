@@ -26,7 +26,7 @@ class VoiceService {
     final dir = await getTemporaryDirectory();
     _currentPath = p.join(
       dir.path,
-      'voice_${DateTime.now().millisecondsSinceEpoch}.mp4',
+      'voice_${DateTime.now().millisecondsSinceEpoch}.m4a',
     );
     await _recorder.start(
       const RecordConfig(

@@ -25,6 +25,7 @@ class StorageService {
   static Future<void> clearTokens() async {
     await _prefs.remove('access_token');
     await _prefs.remove('refresh_token');
+    await _prefs.remove('user_id');
   }
 
   static Future<void> saveDeviceId(String id) async {

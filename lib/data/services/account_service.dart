@@ -22,24 +22,24 @@ class SavedAccount {
   });
 
   Map<String, dynamic> toJson() => {
-        'user_id': userId,
-        'email': email,
-        'username': username,
-        'display_name': displayName,
-        'avatar_url': avatarUrl,
-        'access_token': accessToken,
-        'refresh_token': refreshToken,
-      };
+    'user_id': userId,
+    'email': email,
+    'username': username,
+    'display_name': displayName,
+    'avatar_url': avatarUrl,
+    'access_token': accessToken,
+    'refresh_token': refreshToken,
+  };
 
   factory SavedAccount.fromJson(Map<String, dynamic> j) => SavedAccount(
-        userId: j['user_id'] as String,
-        email: j['email'] as String? ?? '',
-        username: j['username'] as String? ?? '',
-        displayName: j['display_name'] as String? ?? '',
-        avatarUrl: j['avatar_url'] as String?,
-        accessToken: j['access_token'] as String,
-        refreshToken: j['refresh_token'] as String? ?? '',
-      );
+    userId: j['user_id'] as String,
+    email: j['email'] as String? ?? '',
+    username: j['username'] as String? ?? '',
+    displayName: j['display_name'] as String? ?? '',
+    avatarUrl: j['avatar_url'] as String?,
+    accessToken: j['access_token'] as String,
+    refreshToken: j['refresh_token'] as String? ?? '',
+  );
 
   factory SavedAccount.fromUser(UserModel u, String access, String refresh) =>
       SavedAccount(
@@ -62,7 +62,9 @@ class AccountService {
     final raw = prefs.getString(_key);
     if (raw == null || raw.isEmpty) return [];
     final list = jsonDecode(raw) as List;
-    return list.map((e) => SavedAccount.fromJson(e as Map<String, dynamic>)).toList();
+    return list
+        .map((e) => SavedAccount.fromJson(e as Map<String, dynamic>))
+        .toList();
   }
 
   static Future<void> save(SavedAccount account) async {
@@ -74,7 +76,10 @@ class AccountService {
     while (accounts.length > 3) {
       accounts.removeAt(0);
     }
-    await prefs.setString(_key, jsonEncode(accounts.map((a) => a.toJson()).toList()));
+    await prefs.setString(
+      _key,
+      jsonEncode(accounts.map((a) => a.toJson()).toList()),
+    );
     await prefs.setString(_activeKey, account.userId);
   }
 
@@ -82,7 +87,16 @@ class AccountService {
     final prefs = await SharedPreferences.getInstance();
     final accounts = await list();
     accounts.removeWhere((a) => a.userId == userId);
-    await prefs.setString(_key, jsonEncode(accounts.map((a) => a.toJson()).toList()));
+    await prefs.setString(
+      _key,
+      jsonEncode(accounts.map((a) => a.toJson()).toList()),
+    );
+    if (prefs.getString(_activeKey) == userId) await prefs.remove(_activeKey);
+  }
+
+  static Future<void> clearActive() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_activeKey);
   }
 
   static Future<String?> activeId() async {

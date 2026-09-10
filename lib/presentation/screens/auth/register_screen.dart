@@ -32,7 +32,7 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   }
 
   Future<void> _submit() async {
-    if (!_formKey.currentState!.validate()) return;
+    if (_loading || !_formKey.currentState!.validate()) return;
     setState(() {
       _loading = true;
       _error = null;
@@ -60,9 +60,9 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
         ),
       );
     } on ApiException catch (e) {
-      setState(() => _error = e.message);
+      if (mounted) setState(() => _error = e.message);
     } catch (_) {
-      setState(() => _error = 'خطا در ارتباط با سرور');
+      if (mounted) setState(() => _error = 'خطا در ارتباط با سرور');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
@@ -96,7 +96,9 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                     labelText: 'نام نمایشی',
                     prefixIcon: Icon(Icons.person_outline),
                   ),
-                  validator: (v) => (v == null || v.trim().length < 2) ? 'حداقل ۲ کاراکتر' : null,
+                  validator: (v) => (v == null || v.trim().length < 2)
+                      ? 'حداقل ۲ کاراکتر'
+                      : null,
                 ),
                 const SizedBox(height: 16),
                 TextFormField(
@@ -108,7 +110,8 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   ),
                   validator: (v) {
                     if (v == null || v.length < 3) return 'حداقل ۳ کاراکتر';
-                    if (!RegExp(r'^[a-z0-9_]+$').hasMatch(v)) return 'فرمت نامعتبر';
+                    if (!RegExp(r'^[a-z0-9_]+$').hasMatch(v))
+                      return 'فرمت نامعتبر';
                     return null;
                   },
                 ),
@@ -133,11 +136,14 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                     labelText: 'رمز عبور',
                     prefixIcon: const Icon(Icons.lock_outline),
                     suffixIcon: IconButton(
-                      icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility),
+                      icon: Icon(
+                        _obscure ? Icons.visibility_off : Icons.visibility,
+                      ),
                       onPressed: () => setState(() => _obscure = !_obscure),
                     ),
                   ),
-                  validator: (v) => (v == null || v.length < 8) ? 'حداقل ۸ کاراکتر' : null,
+                  validator: (v) =>
+                      (v == null || v.length < 8) ? 'حداقل ۸ کاراکتر' : null,
                 ),
                 if (_error != null) ...[
                   const SizedBox(height: 16),
@@ -152,7 +158,10 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                         ? const SizedBox(
                             width: 24,
                             height: 24,
-                            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
                           )
                         : const Text('ثبت‌نام و ادامه'),
                   ),
