@@ -11,6 +11,8 @@ import '../chat/chat_screen.dart';
 import '../profile/profile_screen.dart';
 import 'account_switcher_screen.dart';
 import 'archive_lock_screen.dart';
+import 'device_management_screen.dart';
+import 'admin_reports_screen.dart';
 import '../home/archived_chats_screen.dart';
 import '../../widgets/chat/chat_labels.dart';
 
@@ -192,6 +194,18 @@ class SettingsScreen extends ConsumerWidget {
               leading: const Icon(Icons.archive_outlined),
               title: Text(ChatLabels.of(context).archivedChats),
               onTap: () => openArchivedChats(context, ref),
+            ),
+            ListTile(
+              leading: const Icon(Icons.devices_outlined),
+              title: Text(isFa ? 'دستگاه‌ها و نشست‌ها' : 'Devices & Sessions'),
+              subtitle: Text(isFa ? 'مدیریت ورود چنددستگاهی مانند تلگرام' : 'Manage multi-device logins like Telegram'),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const DeviceManagementScreen())),
+            ),
+            ListTile(
+              leading: const Icon(Icons.report_outlined, color: Colors.orange),
+              title: Text(isFa ? 'گزارش‌ها (مدیریت)' : 'Reports (Admin)'),
+              subtitle: Text(isFa ? 'بررسی گزارش کاربران و گروه‌ها/کانال‌ها' : 'Review user & chat reports'),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const AdminReportsScreen())),
             ),
             ListTile(
               leading: const Icon(Icons.photo_outlined),

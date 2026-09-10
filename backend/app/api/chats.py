@@ -308,6 +308,29 @@ def create_private_chat():
     if not target:
         return jsonify({'error': 'کاربر یافت نشد'}), 404
 
+    # Telegram-like limited account: cannot start new chats with strangers
+    requester = User.query.get(user_id)
+    if requester and requester.is_limited and requester.limited_until and requester.limited_until > datetime.utcnow():
+        # Check if they have prior chat history (any private/group chat where target has messaged them, or they share a chat)
+        from app.models.message import Message
+        # Look for any existing private chat between them with messages
+        existing_private = db.session.query(Chat).join(ChatMember).filter(
+            Chat.chat_type == 'private', Chat.is_deleted==False, ChatMember.user_id==user_id, ChatMember.is_deleted==False
+        ).all()
+        has_history = False
+        for ch in existing_private:
+            other = ChatMember.query.filter(ChatMember.chat_id==ch.id, ChatMember.user_id==target_id, ChatMember.is_deleted==False).first()
+            if other:
+                # check if there is at least one message in that chat, or target sent you a message before
+                if Message.query.filter_by(chat_id=ch.id, is_deleted=False).first():
+                    has_history = True
+                    break
+        # Also allow if target ever sent a message to requester in any chat (e.g., they contacted first)
+        if not has_history:
+            # Check if target has ever sent a message to requester in any common chat or direct?
+            # Simplified: if no prior private chat, block
+            return jsonify({'error': 'حساب شما محدود شده است. فقط می‌توانید به افرادی که قبلاً با شما چت کرده‌اند پیام دهید. مانند تلگرام، محدودیت موقت است.', 'limited': True, 'reason': requester.limited_reason, 'until': utc_iso(requester.limited_until)}), 403
+
     # چک بلاک
     blocked = BlockList.query.filter(
         ((BlockList.blocker_id == user_id) & (BlockList.blocked_id == target_id)) |
@@ -438,6 +461,9 @@ def get_members(chat_id):
         return jsonify({'error': 'Chat not found'}), 404
     if chat.chat_type == 'channel' and member.role not in ('owner', 'admin'):
         return jsonify({'error': 'Subscriber list is private'}), 403
+    # Telegram-like: admin can hide members list from regular members
+    if chat.chat_type == 'group' and chat.hide_members and member.role not in ('owner', 'admin'):
+        return jsonify({'error': 'Members list is hidden by administrator', 'hide_members': True, 'members': []}), 403
     members = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).all()
     result = []
     for m in members:
@@ -449,7 +475,7 @@ def get_members(chat_id):
                 d['permissions'] = admin_permissions(m)
             d['joined_at'] = utc_iso(m.joined_at)
             result.append(d)
-    return jsonify({'members': result}), 200
+    return jsonify({'members': result, 'hide_members': bool(chat.hide_members)}), 200
 
 
 @chats_bp.route('/<chat_id>/pin', methods=['POST'])
@@ -745,6 +771,7 @@ def get_chat_info(chat_id):
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
     if not member and not chat.is_public:
         return jsonify({'error': 'دسترسی ندارید'}), 403
+    # If suspended/closed, still return info but flag it for banner
     # The header must work before either participant has sent a message.
     # Use the same privacy-filtered user serializer as profiles and the list.
     other_user = None
@@ -756,6 +783,23 @@ def get_chat_info(chat_id):
             User.is_deleted.is_(False),
         ).first()
     members_count = ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).count()
+    # Online members count (Telegram-like) - count members where user is online (last_seen within 60s)
+    online_count = 0
+    if chat.chat_type in ('group', 'channel'):
+        try:
+            from datetime import timedelta
+            # Get member user_ids
+            member_user_ids = [m.user_id for m in ChatMember.query.filter_by(chat_id=chat_id, is_deleted=False).all()]
+            if member_user_ids:
+                online_users = User.query.filter(User.id.in_(member_user_ids), User.is_online==True, User.is_deleted==False).all()
+                # Apply privacy & heartbeat expiry like User.to_dict()
+                now = datetime.utcnow()
+                for u in online_users:
+                    if u.last_seen and timedelta(0) <= now - u.last_seen < timedelta(seconds=60):
+                        if u.show_last_seen:
+                            online_count += 1
+        except Exception:
+            online_count = 0
     my_role = member.role if member else None
     return jsonify({
         'id': chat.id,
@@ -767,6 +811,14 @@ def get_chat_info(chat_id):
         'is_public': chat.is_public,
         'created_by': chat.created_by,
         'members_count': members_count,
+        'online_count': online_count,
+        'hide_members': bool(chat.hide_members),
+        'is_suspended': bool(chat.is_suspended),
+        'suspension_reason': chat.suspension_reason,
+        'suspended_at': utc_iso(chat.suspended_at) if chat.suspended_at else None,
+        'is_closed': bool(chat.is_closed),
+        'closed_reason': chat.closed_reason,
+        'closed_at': utc_iso(chat.closed_at) if chat.closed_at else None,
         'my_role': my_role,
         'is_muted': member.is_muted if member else False,
         'slow_mode_delay': chat.slow_mode_delay or 0,
@@ -830,6 +882,44 @@ def update_chat(chat_id):
     db.session.add(AuditLog(actor_id=user_id, action='update_chat', entity_type='chat', entity_id=chat_id))
     db.session.commit()
     return jsonify({'ok': True}), 200
+
+
+@chats_bp.route('/<chat_id>/hide-members', methods=['POST'])
+@jwt_required()
+def toggle_hide_members(chat_id):
+    user_id = get_jwt_identity()
+    chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
+    if not chat:
+        return jsonify({'error': 'چت یافت نشد'}), 404
+    if chat.chat_type != 'group':
+        return jsonify({'error': 'فقط گروه‌ها این تنظیم را دارند'}), 400
+    member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+    if not member or member.role not in ('owner', 'admin'):
+        return jsonify({'error': 'فقط مدیر گروه می‌تواند این تنظیم را تغییر دهد'}), 403
+    # Check capability manage_permissions or restrict_members
+    if not can(chat, user_id, 'manage_permissions') and member.role != 'owner':
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    data = request.get_json() or {}
+    hide = data.get('hide_members')
+    if type(hide) is not bool:
+        return jsonify({'error': 'hide_members must be boolean'}), 400
+    chat.hide_members = hide
+    db.session.add(AuditLog(actor_id=user_id, action='toggle_hide_members', entity_type='chat', entity_id=chat_id, ip_address=get_client_ip()))
+    db.session.commit()
+    return jsonify({'ok': True, 'hide_members': chat.hide_members}), 200
+
+
+@chats_bp.route('/<chat_id>/visibility', methods=['GET'])
+@jwt_required()
+def get_visibility(chat_id):
+    user_id = get_jwt_identity()
+    chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
+    if not chat:
+        return jsonify({'error': 'چت یافت نشد'}), 404
+    member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+    if not member:
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    return jsonify({'hide_members': bool(chat.hide_members), 'is_suspended': bool(chat.is_suspended), 'is_closed': bool(chat.is_closed)}), 200
 
 
 @chats_bp.route('/<chat_id>/invite-link', methods=['GET'])

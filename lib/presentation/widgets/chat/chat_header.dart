@@ -12,6 +12,7 @@ class ChatHeader extends StatelessWidget {
     this.otherUser,
     this.avatarUrl,
     this.membersCount,
+    this.onlineCount,
     this.token,
     this.onTap,
   });
@@ -21,6 +22,7 @@ class ChatHeader extends StatelessWidget {
   final UserModel? otherUser;
   final String? avatarUrl;
   final int? membersCount;
+  final int? onlineCount;
   final String? token;
   final VoidCallback? onTap;
 
@@ -43,9 +45,19 @@ class ChatHeader extends StatelessWidget {
           ? labels.lastSeenHidden
           : labels.lastSeen(peer.lastSeen!);
     } else if (chatType == 'group' || chatType == 'channel') {
-      subtitle = membersCount == null
-          ? (chatType == 'channel' ? labels.channel : labels.group)
-          : labels.members(membersCount!, subscribers: chatType == 'channel');
+      if (membersCount == null) {
+        subtitle = (chatType == 'channel' ? labels.channel : labels.group);
+      } else {
+        // Telegram-like: show online count if available
+        final base = labels.members(membersCount!, subscribers: chatType == 'channel');
+        if (onlineCount != null && onlineCount! > 0 && chatType == 'group') {
+          subtitle = '$base، $onlineCount آنلاین';
+        } else if (onlineCount != null && onlineCount! > 0 && chatType == 'channel') {
+          subtitle = base;
+        } else {
+          subtitle = base;
+        }
+      }
     } else if (chatType == 'saved') {
       subtitle = labels.saved;
     } else {

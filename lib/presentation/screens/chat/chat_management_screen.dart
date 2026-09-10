@@ -346,9 +346,23 @@ class _ChatManagementState extends State<_ChatManagement> {
                         style: Theme.of(context).textTheme.headlineSmall,
                       ),
                       Text(
-                        '${_info!['members_count']} ${widget.channel ? _t(context, 'subscribers', 'مشترک') : _t(context, 'members', 'عضو')}',
+                        '${_info!['members_count']} ${widget.channel ? _t(context, 'subscribers', 'مشترک') : _t(context, 'members', 'عضو')} • ${_info!['online_count'] ?? 0} آنلاین',
                         textAlign: TextAlign.center,
                       ),
+                      if (_info?['is_suspended'] == true)
+                        Container(
+                          margin: const EdgeInsets.only(top: 8),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(color: Colors.red.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(8)),
+                          child: Row(children: [const Icon(Icons.block, color: Colors.red, size: 20), const SizedBox(width: 8), Expanded(child: Text(_t(context, 'Suspended: ${(_info?['suspension_reason'] as String?) ?? ''}', 'تعلیق شده: ${(_info?['suspension_reason'] as String?) ?? ''}'), style: const TextStyle(color: Colors.red, fontSize: 12)))]),
+                        ),
+                      if (_info?['is_closed'] == true)
+                        Container(
+                          margin: const EdgeInsets.only(top: 8),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(color: Colors.orange.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(8)),
+                          child: Row(children: [const Icon(Icons.lock, color: Colors.orange, size: 18), const SizedBox(width: 8), Expanded(child: Text(_t(context, 'Closed: ${(_info?['closed_reason'] as String?) ?? ''}', 'بسته شده: ${(_info?['closed_reason'] as String?) ?? ''}'), style: const TextStyle(color: Colors.orange, fontSize: 12)))]),
+                        ),
                       if (_info!['username'] != null)
                         SelectableText(
                           '@${_info!['username']}',
@@ -395,6 +409,19 @@ class _ChatManagementState extends State<_ChatManagement> {
                                 : _t(context, 'Off', 'غیرفعال'),
                           ),
                           onTap: _busy ? null : _setSlowMode,
+                        ),
+                      if (!widget.channel && _admin)
+                        SwitchListTile(
+                          key: const ValueKey('hide-members'),
+                          secondary: const Icon(Icons.visibility_off_outlined),
+                          title: Text(_t(context, 'Hide members list', 'مخفی کردن لیست اعضا (مانند تلگرام)')),
+                          subtitle: Text(_t(context, 'Only admins can see members', 'فقط مدیران لیست اعضا را می‌بینند')),
+                          value: (_info?['hide_members'] as bool? ?? false),
+                          onChanged: _busy ? null : (v) async {
+                            await _run(() async {
+                              await widget.api.post('$_base/hide-members', {'hide_members': v});
+                            });
+                          },
                         ),
                       if (_can('invite_users')) ...[
                         ListTile(

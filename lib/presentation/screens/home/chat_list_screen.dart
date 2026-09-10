@@ -156,38 +156,45 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
               );
             }
             final itemCount = chats.length + (showArchiveRow ? 1 : 0);
-            return RefreshIndicator(
-              onRefresh: () => ref.read(chatListProvider.notifier).refresh(),
-              child: ListView.separated(
-                physics: const AlwaysScrollableScrollPhysics(),
-                itemCount: itemCount,
-                separatorBuilder: (_, __) => Divider(
-                  height: 1,
-                  indent: 76,
-                  color: Colors.grey.withValues(alpha: 0.15),
+            return Column(
+              children: [
+                const _DeviceLoginBanner(),
+                Expanded(
+                  child: RefreshIndicator(
+                    onRefresh: () => ref.read(chatListProvider.notifier).refresh(),
+                    child: ListView.separated(
+                      physics: const AlwaysScrollableScrollPhysics(),
+                      itemCount: itemCount,
+                      separatorBuilder: (_, __) => Divider(
+                        height: 1,
+                        indent: 76,
+                        color: Colors.grey.withValues(alpha: 0.15),
+                      ),
+                      itemBuilder: (context, index) {
+                        if (showArchiveRow && index == 0) {
+                          return _ArchiveRow(
+                            state: data,
+                            labels: labels,
+                            onTap: _openArchive,
+                          );
+                        }
+                        final chat = chats[index - (showArchiveRow ? 1 : 0)];
+                        return ChatListTile(
+                              key: ValueKey(chat.id),
+                              chat: chat,
+                              isFa: isFa,
+                              onTap: () => _openChat(chat),
+                              onLongPress: () =>
+                                  showChatContextMenu(context, ref, chat),
+                            )
+                            .animate()
+                            .fadeIn(duration: 280.ms, delay: (20 * (index % 12)).ms)
+                            .slideX(begin: 0.05, curve: Curves.easeOut);
+                      },
+                    ),
+                  ),
                 ),
-                itemBuilder: (context, index) {
-                  if (showArchiveRow && index == 0) {
-                    return _ArchiveRow(
-                      state: data,
-                      labels: labels,
-                      onTap: _openArchive,
-                    );
-                  }
-                  final chat = chats[index - (showArchiveRow ? 1 : 0)];
-                  return ChatListTile(
-                        key: ValueKey(chat.id),
-                        chat: chat,
-                        isFa: isFa,
-                        onTap: () => _openChat(chat),
-                        onLongPress: () =>
-                            showChatContextMenu(context, ref, chat),
-                      )
-                      .animate()
-                      .fadeIn(duration: 280.ms, delay: (20 * (index % 12)).ms)
-                      .slideX(begin: 0.05, curve: Curves.easeOut);
-                },
-              ),
+              ],
             );
           },
           loading: () => const Center(child: CircularProgressIndicator()),
@@ -477,6 +484,49 @@ class _ArchiveRow extends StatelessWidget {
               ),
             )
           : const Icon(Icons.chevron_right_rounded),
+    );
+  }
+}
+
+
+class _DeviceLoginBanner extends StatefulWidget {
+  const _DeviceLoginBanner();
+  @override
+  State<_DeviceLoginBanner> createState() => _DeviceLoginBannerState();
+}
+class _DeviceLoginBannerState extends State<_DeviceLoginBanner> {
+  List<dynamic> _notifs = [];
+  bool _dismissed = false;
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+  Future<void> _load() async {
+    try {
+      final res = await ApiService().get('/devices/notifications');
+      final list = res['messages'] as List? ?? res['notifications'] as List? ?? [];
+      if (mounted && list.isNotEmpty) setState(()=> _notifs = list.take(1).toList());
+    } catch (_) {}
+  }
+  @override
+  Widget build(BuildContext context) {
+    if (_dismissed || _notifs.isEmpty) return const SizedBox.shrink();
+    final msg = _notifs.first as Map<String,dynamic>;
+    final content = (msg['content'] as String? ?? 'ورود جدید به حساب شما').split('\n').first;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(color: Colors.orange.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(12), border: Border.all(color: Colors.orange.withValues(alpha: 0.3))),
+      child: Row(children: [
+        const Icon(Icons.security, color: Colors.orange, size: 22),
+        const SizedBox(width: 10),
+        Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(content, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black87), maxLines: 2, overflow: TextOverflow.ellipsis),
+          const Text('این هشدار مانند تلگرام در «پیام‌های ذخیره‌شده» هم ذخیره شده است. اگر شما نبودید، فوراً رمز را تغییر دهید و نشست را ببندید.', style: TextStyle(fontSize: 11, color: Colors.grey)),
+        ])),
+        IconButton(icon: const Icon(Icons.close, size: 18), onPressed: ()=> setState(()=> _dismissed=true)),
+      ]),
     );
   }
 }

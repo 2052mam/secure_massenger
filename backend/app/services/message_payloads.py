@@ -59,6 +59,15 @@ def serialize_messages(messages, user_id, status_override=None):
         PinnedMessage.message_id.in_([m.id for m in messages]),
         PinnedMessage.is_deleted.is_(False),
     ).all()}
+    # Telegram-like reactions: batch load reactions per message
+    from app.models.message import MessageReaction
+    reaction_rows = MessageReaction.query.filter(
+        MessageReaction.message_id.in_([m.id for m in messages]),
+        MessageReaction.is_deleted.is_(False),
+    ).all()
+    reactions_by_msg = {}
+    for r in reaction_rows:
+        reactions_by_msg.setdefault(r.message_id, []).append(r)
     result = []
     for msg in messages:
         sender = senders.get(msg.sender_id)
@@ -103,6 +112,20 @@ def serialize_messages(messages, user_id, status_override=None):
             status = next((s.status for s in message_statuses
                            if s.user_id == user_id), 'delivered')
 
+        # Reactions summary for this message
+        reactions = reactions_by_msg.get(msg.id, [])
+        # group by emoji
+        emoji_counts = {}
+        me_emojis = set()
+        for rr in reactions:
+            emoji_counts[rr.emoji] = emoji_counts.get(rr.emoji, 0) + 1
+            if rr.user_id == user_id:
+                me_emojis.add(rr.emoji)
+        reactions_summary = [
+            {'emoji': e, 'count': c, 'me': e in me_emojis}
+            for e, c in sorted(emoji_counts.items(), key=lambda x: -x[1])
+        ]
+
         result.append({
             'id': msg.id,
             'chat_id': msg.chat_id,
@@ -125,5 +148,6 @@ def serialize_messages(messages, user_id, status_override=None):
             'is_edited': msg.is_edited,
             'created_at': utc_iso(msg.created_at),
             'status': status,
+            'reactions': reactions_summary,
         })
     return result

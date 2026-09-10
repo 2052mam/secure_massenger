@@ -7,7 +7,9 @@ import '../../../data/models/reply_preview_model.dart';
 import '../../../data/services/media_playback_coordinator.dart';
 import '../media/media_labels.dart';
 import '../media/video_message_player.dart';
+import '../media/video_note_player.dart';
 import '../media/voice_message_player.dart';
+import 'reaction_bar.dart';
 import 'reply_preview.dart';
 import 'message_text.dart';
 import 'spoiler_widget.dart';
@@ -27,6 +29,8 @@ class MessageBubble extends StatelessWidget {
   final MediaPlaybackCoordinator? coordinator;
   final bool highlighted;
   final bool showSender;
+  final ValueChanged<String>? onReactionTap;
+  final VoidCallback? onAddReaction;
 
   const MessageBubble({
     super.key,
@@ -43,6 +47,8 @@ class MessageBubble extends StatelessWidget {
     this.coordinator,
     this.highlighted = false,
     this.showSender = false,
+    this.onReactionTap,
+    this.onAddReaction,
   });
 
   @override
@@ -182,6 +188,69 @@ class MessageBubble extends StatelessWidget {
                   coordinator: coordinator,
                 ),
               )
+            else if (message.messageType == 'video_note' || message.messageType == 'round_video')
+              mediaUrl.isNotEmpty
+                  ? Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: VideoNotePlayer(url: mediaUrl, authToken: token, size: 180),
+                    )
+                  : SpoilerWidget(
+                      isSpoiler: message.isSpoiler,
+                      child: MessageText(
+                        text: 'ویدیو مسیج ${message.content ?? ''}'.trim(),
+                        style: TextStyle(color: fg, fontSize: 14),
+                        linkColor: isMine ? Colors.white : theme.colorScheme.primary,
+                        onInviteTap: onInviteTap,
+                      ),
+                    )
+            else if (message.messageType == 'sticker')
+              mediaUrl.isNotEmpty
+                  ? GestureDetector(
+                      onTap: onOpenPhoto,
+                      child: CachedNetworkImage(
+                        imageUrl: mediaUrl,
+                        httpHeaders: token == null ? null : {'Authorization': 'Bearer $token'},
+                        width: 140,
+                        height: 140,
+                        fit: BoxFit.contain,
+                        placeholder: (_, __) => const SizedBox(width: 80, height: 80, child: Center(child: CircularProgressIndicator(strokeWidth: 2))),
+                        errorWidget: (_, __, ___) => Text(message.content ?? 'استیکر', style: TextStyle(fontSize: 48)),
+                      ),
+                    )
+                  : Text(message.content ?? 'استیکر', style: TextStyle(fontSize: 48, color: fg))
+            else if (message.messageType == 'gif')
+              mediaUrl.isNotEmpty
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(10),
+                      child: Stack(
+                        children: [
+                          CachedNetworkImage(
+                            imageUrl: mediaUrl,
+                            httpHeaders: token == null ? null : {'Authorization': 'Bearer $token'},
+                            width: 220,
+                            height: 160,
+                            fit: BoxFit.cover,
+                            placeholder: (_, __) => Container(width: 220, height: 160, color: Colors.black12, child: const Center(child: CircularProgressIndicator(strokeWidth: 2))),
+                            errorWidget: (_, __, ___) => Container(width: 220, height: 120, color: Colors.black12, child: Icon(Icons.gif_box, color: fg, size: 32)),
+                          ),
+                          Positioned(
+                            bottom: 6,
+                            left: 6,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(4)),
+                              child: const Text('GIF', style: TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w700)),
+                            ),
+                          ),
+                        ],
+                      ),
+                    )
+                  : MessageText(
+                      text: message.content ?? 'GIF',
+                      style: TextStyle(color: fg),
+                      linkColor: isMine ? Colors.white : theme.colorScheme.primary,
+                      onInviteTap: onInviteTap,
+                    )
             else if (message.messageType == 'voice' ||
                 message.messageType == 'audio')
               VoiceMessagePlayer(
@@ -248,6 +317,12 @@ class MessageBubble extends StatelessWidget {
                 ],
               ),
             ),
+            if (message.reactions.isNotEmpty)
+              ReactionBar(
+                reactions: message.reactions,
+                onReactionTap: onReactionTap,
+                onAddReaction: onAddReaction,
+              ),
           ],
         ),
       ),

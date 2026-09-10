@@ -5,11 +5,15 @@ from app.models.message import Message, MessageStatus, MessageReaction, PinnedMe
 from app.models.media import MediaFile
 from app.models.profile import UserPhoto, SearchHistory
 from app.models.audit import AuditLog
+from app.models.report import Report
+from app.models.sticker import StickerPack, Sticker
+from app.models.gif import SavedGif
 
 __all__ = [
     'User', 'UserDevice', 'UserSession', 'BlockList',
     'Chat', 'ChatMember', 'ChatBackground',
     'ChatFolder', 'ChatFolderItem',
     'Message', 'MessageStatus', 'MessageReaction', 'PinnedMessage', 'MessageHide',
-    'MediaFile', 'UserPhoto', 'SearchHistory', 'AuditLog'
+    'MediaFile', 'UserPhoto', 'SearchHistory', 'AuditLog',
+    'Report', 'StickerPack', 'Sticker', 'SavedGif'
 ]

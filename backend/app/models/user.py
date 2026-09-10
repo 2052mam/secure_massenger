@@ -37,6 +37,12 @@ class User(db.Model):
     is_active = db.Column(db.Boolean, default=True)
     is_admin = db.Column(db.Boolean, default=False)
     is_support = db.Column(db.Boolean, default=False)
+
+    # Telegram-like restriction after reports (limited account)
+    is_limited = db.Column(db.Boolean, default=False, nullable=False)
+    limited_until = db.Column(db.DateTime, nullable=True)
+    limited_reason = db.Column(db.Text, nullable=True)
+    limited_by = db.Column(db.String(36), nullable=True)
     
     # Soft Delete
     is_deleted = db.Column(db.Boolean, default=False, index=True)

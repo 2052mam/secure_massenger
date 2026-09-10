@@ -140,10 +140,14 @@ def send_message():
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
-    if message_type not in ('text', 'image', 'video', 'voice', 'file'):
+    if message_type not in ('text', 'image', 'video', 'voice', 'file', 'sticker', 'gif', 'video_note', 'round_video'):
         return jsonify({'error': 'Invalid message type'}), 400
     if message_type != 'text' and not media_id:
-        return jsonify({'error': 'Media is required'}), 400
+        # sticker may be sent via emoji without media in some clients; allow
+        if message_type not in ('sticker', 'gif'):
+            return jsonify({'error': 'Media is required'}), 400
+        if message_type in ('sticker', 'gif') and not media_id and not content:
+            return jsonify({'error': 'Media is required'}), 400
     if message_type == 'text' and media_id:
         return jsonify({'error': 'Text messages cannot contain media'}), 400
 
@@ -153,6 +157,17 @@ def send_message():
     chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
     if not chat:
         return jsonify({'error': 'دشن تفای تچ'}), 404
+    # Check if chat is suspended/closed (report action) - Telegram shows banner and blocks sending
+    if chat.is_suspended:
+        return jsonify({'error': f'این {"کانال" if chat.chat_type=="channel" else "گروه"} توسط مدیریت تعلیق شده است. دلیل: {chat.suspension_reason or "محتوای نامناسب"}'}), 403
+    if chat.is_closed:
+        # Only owner can send in closed chat? Actually closed means no one can send until reopened
+        member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
+        if not member or member.role != 'owner':
+            return jsonify({'error': f'این چت بسته شده است. دلیل: {chat.closed_reason or ""}'}), 403
+    # Limited account check for group/channel spam? Allow but private already handled in create_private_chat
+    # For private chats, limited users can still send if already in chat (existing contact) - so pass
+    # No extra block here; creation already blocks new strangers.
 
     if not can_send(chat, user_id, message_type, is_view_once):
         return jsonify({'error': 'Sending this type of message is not permitted'}), 403
@@ -177,10 +192,18 @@ def send_message():
     scheduled_dt = None
     if scheduled_at_raw:
         try:
-            scheduled_dt = datetime.fromisoformat(str(scheduled_at_raw).replace('Z', '+00:00'))
+            raw = str(scheduled_at_raw).strip()
+            # Support both ISO with Z and with explicit offset like +03:30 (Iran)
+            # Also handle format without T (space separated) for legacy clients
+            iso = raw.replace('Z', '+00:00').replace(' ', 'T')
+            scheduled_dt = datetime.fromisoformat(iso)
             if scheduled_dt.tzinfo is not None:
                 import datetime as dt_module
                 scheduled_dt = scheduled_dt.astimezone(dt_module.timezone.utc).replace(tzinfo=None)
+            else:
+                # Naive datetime: treat as UTC (legacy). New Flutter clients send Z/offset,
+                # so Iran time is correctly converted to UTC before storage.
+                pass
         except Exception:
             return jsonify({'error': 'زمان‌بندی نامعتبر است'}), 400
 
@@ -214,9 +237,18 @@ def send_message():
         ).first()
         if media is None:
             return jsonify({'error': 'فایل در دسترس نیست'}), 403
-        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'file': 'document'}
-        if media.media_type != expected.get(message_type):
-            return jsonify({'error': 'Media type does not match the message type'}), 400
+        # Telegram allows sending images/videos/audio as generic files (document).
+        # So 'file' accepts any media_type; others must match strictly.
+        if message_type != 'file':
+            expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'sticker': 'image', 'gif': 'image', 'video_note': 'video', 'round_video': 'video'}
+            # gif may be image or video; sticker may be image/webp; be lenient
+            if message_type in ('gif', 'sticker'):
+                if media.media_type not in ('image', 'video', 'document'):
+                    return jsonify({'error': 'Media type does not match the message type'}), 400
+            elif media.media_type != expected.get(message_type):
+                # For video_note / round_video also allow 'video' only
+                return jsonify({'error': 'Media type does not match the message type'}), 400
+        # else file: accept any media_type (image, video, audio, document) like Telegram
         if is_view_once and media.media_type != 'image':
             return jsonify({'error': 'فایل باید عکس باشد'}), 400
         # Reusing an ephemeral upload as a normal message bypasses view-once.
@@ -357,8 +389,16 @@ def forward_message(message_id):
         return jsonify({'error': 'Forwarding this message type is not permitted'}), 403
     if original.media_id:
         media = db.session.get(MediaFile, original.media_id)
-        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'file': 'document'}
-        if not media or media.is_deleted or media.media_type != expected.get(original.message_type):
+        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'file': 'document', 'sticker': 'image', 'gif': 'image', 'video_note': 'video', 'round_video': 'video'}
+        # file accepts any, sticker/gif lenient
+        valid = False
+        if original.message_type == 'file':
+            valid = media and not media.is_deleted
+        elif original.message_type in ('sticker', 'gif'):
+            valid = media and not media.is_deleted and media.media_type in ('image','video','document')
+        else:
+            valid = media and not media.is_deleted and media.media_type == expected.get(original.message_type)
+        if not valid:
             return jsonify({'error': 'Media is unavailable or has an invalid type'}), 400
     if target_chat.chat_type == 'private':
         peers = [m.user_id for m in ChatMember.query.filter_by(chat_id=target_chat_id, is_deleted=False).all() if m.user_id != user_id]

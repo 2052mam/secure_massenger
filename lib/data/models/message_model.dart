@@ -3,6 +3,7 @@ import 'package:equatable/equatable.dart';
 
 import 'user_model.dart';
 import 'reply_preview_model.dart';
+import 'reaction_model.dart';
 
 class MessageModel extends Equatable {
   final String id;
@@ -27,6 +28,7 @@ class MessageModel extends Equatable {
   final bool isEdited;
   final DateTime createdAt;
   final String status; // sent | delivered | read
+  final List<ReactionModel> reactions;
 
   const MessageModel({
     required this.id,
@@ -51,6 +53,7 @@ class MessageModel extends Equatable {
     this.isEdited = false,
     required this.createdAt,
     this.status = 'sent',
+    this.reactions = const [],
   });
 
   factory MessageModel.fromJson(Map<String, dynamic> json) {
@@ -87,6 +90,7 @@ class MessageModel extends Equatable {
           ? parseApiDateTime(json['created_at'] as String?) ?? DateTime.now()
           : DateTime.now(),
       status: json['status'] as String? ?? 'sent',
+      reactions: (json['reactions'] as List?)?.map((e) => ReactionModel.fromJson(e as Map<String, dynamic>)).toList() ?? const [],
     );
   }
 
@@ -99,6 +103,7 @@ class MessageModel extends Equatable {
     bool? isPinned,
     DateTime? viewedAt,
     ReplyPreviewModel? replyTo,
+    List<ReactionModel>? reactions,
   }) {
     return MessageModel(
       id: id,
@@ -123,6 +128,7 @@ class MessageModel extends Equatable {
       isEdited: isEdited,
       createdAt: createdAt,
       status: status ?? this.status,
+      reactions: reactions ?? this.reactions,
     );
   }
 
@@ -166,5 +172,6 @@ class MessageModel extends Equatable {
     isPinned,
     viewedAt,
     isEdited,
+    reactions,
   ];
 }

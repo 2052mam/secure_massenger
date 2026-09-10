@@ -63,9 +63,24 @@ def can(chat, user_id, key):
 
 
 def can_send(chat, user_id, message_type, view_once=False):
-    key = {'text': 'send_messages', 'image': 'send_photos', 'video': 'send_videos',
-           'voice': 'send_voice', 'file': 'send_files'}.get(message_type)
+    mapping = {
+        'text': 'send_messages',
+        'image': 'send_photos',
+        'video': 'send_videos',
+        'voice': 'send_voice',
+        'file': 'send_files',
+        'sticker': 'send_messages',  # Telegram: stickers follow send_messages
+        'gif': 'send_messages',      # GIFs follow send_messages/photos
+        'video_note': 'send_videos',
+        'round_video': 'send_videos',
+    }
+    key = mapping.get(message_type)
+    # gif can be sent if either send_photos or send_messages is allowed (lenient like Telegram)
     rights = capabilities(chat, membership(chat, user_id))
+    if message_type == 'gif':
+        return bool(rights.get('send_messages') or rights.get('send_photos') or rights.get('send_files'))
+    if message_type == 'sticker':
+        return bool(rights.get('send_messages'))
     return bool(key and rights[key] and (not view_once or rights['send_view_once_photos']))
 
 

@@ -32,6 +32,11 @@ import '../../widgets/chat/chat_labels.dart';
 import '../../widgets/chat/chat_invite_dialog.dart';
 import '../../widgets/chat/message_actions_sheet.dart';
 import '../../widgets/chat/pinned_messages_bar.dart';
+import '../../widgets/chat/reaction_bar.dart';
+import '../../widgets/chat/sticker_picker.dart';
+import '../../widgets/chat/gif_picker.dart';
+import '../../widgets/chat/report_dialog.dart';
+import '../../widgets/media/video_note_player.dart';
 import 'pinned_messages_screen.dart';
 import '../../widgets/chat/reply_preview.dart';
 import '../../widgets/media/media_labels.dart';
@@ -132,6 +137,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   int _membersCount = 0;
+  int _onlineCount = 0;
+  bool _hideMembers = false;
+  bool _isSuspended = false;
+  String? _suspensionReason;
+  bool _isClosed = false;
+  String? _closedReason;
 
   String get _chatType => _loadedChatType ?? widget.chatType;
   String get _displayTitle =>
@@ -203,6 +214,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _isMuted = res['is_muted'] as bool? ?? false;
         _slowModeDelay = res['slow_mode_delay'] as int? ?? 0;
         _membersCount = res['members_count'] as int? ?? 0;
+        _onlineCount = res['online_count'] as int? ?? 0;
+        _hideMembers = res['hide_members'] as bool? ?? false;
+        _isSuspended = res['is_suspended'] as bool? ?? false;
+        _suspensionReason = res['suspension_reason'] as String?;
+        _isClosed = res['is_closed'] as bool? ?? false;
+        _closedReason = res['closed_reason'] as String?;
         _loadedChatType = res['chat_type'] as String?;
         _chatTitle = res['title'] as String?;
         _chatAvatarUrl = res['avatar_url'] as String?;
@@ -743,7 +760,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       };
       if (reply != null) body['reply_to_id'] = reply.id;
       if (scheduledAt != null) {
-        body['scheduled_at'] = scheduledAt.toIso8601String();
+        // Iran time fix: Flutter DateTime is local (e.g. Asia/Tehran +03:30).
+        // toUtc().toIso8601String() sends UTC with 'Z', so backend stores correct UTC
+        // and displays it back in local time via parseApiDateTime(...).toLocal().
+        body['scheduled_at'] = scheduledAt.toUtc().toIso8601String();
       }
       final res = await _api.post('/messages/', body);
       if (!mounted) return;
@@ -1104,6 +1124,250 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     setState(() => _isRecording = false);
   }
 
+  // --- Telegram-like reactions ---
+  Future<void> _toggleReaction(MessageModel msg, String emoji) async {
+    try {
+      await _api.post('/reactions/${msg.id}/reaction', {'emoji': emoji});
+      // Local optimistic toggle: update reactions list immediately, then refresh from server
+      // For simplicity, trigger a status refresh which will pull reactions via payloads
+      unawaited(_refreshMessageStatuses());
+      // Also poll messages to get updated reactions quickly
+      final res = await _api.get('/messages/${widget.chatId}', query: {'from_id': msg.id});
+      if (!mounted) return;
+      final list = (res['messages'] as List? ?? []).map((e) => MessageModel.fromJson(e as Map<String, dynamic>)).toList();
+      if (list.isNotEmpty) {
+        setState(() {
+          for (final updated in list) {
+            final idx = _messages.indexWhere((m) => m.id == updated.id);
+            if (idx != -1) _messages[idx] = updated;
+          }
+        });
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+    }
+  }
+
+  Future<void> _showReactionPicker(MessageModel msg) async {
+    final emoji = await showModalBottomSheet<String>(
+      context: context,
+      builder: (_) => const QuickReactionSheet(),
+    );
+    if (emoji != null && mounted) await _toggleReaction(msg, emoji);
+  }
+
+  // --- Telegram-like stickers ---
+  Future<void> _showStickerPicker() async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => StickerPicker(
+        api: _api,
+        onStickerSelected: (sticker) async {
+          Navigator.pop(ctx);
+          await _sendSticker(sticker);
+        },
+      ),
+    );
+  }
+
+  Future<void> _sendSticker(dynamic sticker) async {
+    if (_sending || !_can('send_messages')) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('امکان ارسال استیکر در این چت وجود ندارد')));
+      return;
+    }
+    final reply = _replyTo;
+    setState(() => _sending = true);
+    try {
+      // sticker is StickerModel or map with id/media
+      final stickerId = sticker is Map ? sticker['id'] : sticker.id;
+      final emoji = sticker is Map ? sticker['emoji'] : sticker.emoji;
+      // If sticker has media_id, use it; else send content emoji
+      String? mediaId;
+      if (sticker is Map && sticker['media_id'] != null) mediaId = sticker['media_id'] as String;
+      else if (sticker is! Map && sticker.mediaId != null) mediaId = sticker.mediaId;
+      else if (sticker is! Map && sticker.fileUrl != null) {
+        // For seeded packs we may have url only - send as sticker via content fallback
+      }
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'sticker',
+        'content': emoji ?? '🙂',
+      };
+      if (mediaId != null) body['media_id'] = mediaId;
+      // If no mediaId but fileUrl exists, we send without media and server will fallback to display emoji
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage(res, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  // --- Telegram-like GIFs ---
+  Future<void> _showGifPicker() async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => GifPicker(
+        api: _api,
+        onGifSelected: (gif) async {
+          Navigator.pop(ctx);
+          await _sendGif(gif);
+        },
+      ),
+    );
+  }
+
+  Future<void> _sendGif(dynamic gif) async {
+    if (_sending || !_can('send_messages')) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('امکان ارسال گیف وجود ندارد')));
+      return;
+    }
+    // Ensure can send gif: telegram allows if any media sending allowed
+    final canGif = _can('send_messages') || _can('send_photos') || _can('send_files') || _can('send_videos') || _can('send_gifs') || _capabilities['send_gifs'] == true;
+    // gif check lenient - backend already allows with send_messages fallback
+    final reply = _replyTo;
+    setState(() => _sending = true);
+    try {
+      final gifUrl = gif is Map ? gif['gif_url'] ?? gif['url'] : gif.gifUrl ?? gif.previewUrl;
+      final title = gif is Map ? gif['title'] : gif.title;
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'gif',
+        'content': title ?? gifUrl ?? 'GIF',
+        'media_id': gif is Map ? gif['media_id'] : gif.mediaId,
+      };
+      // If no mediaId, server may store via content url; we pass preview_url in content fallback
+      // Use direct url via content if media not uploaded
+      if (body['media_id'] == null && gifUrl != null) {
+        // For locally trending gifs we just send URL as content and media_url fallback;
+        // backend will treat as gif with media lookup by gif_url duplication.
+        // We'll try to send with gif_url passed as content and let backend map to media via make endpoint if needed.
+        // Simplified: send as gif with content = gifUrl so UI can render via mediaUrl
+        body['content'] = gifUrl;
+      }
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      // If backend returned gif without mediaUrl but we have gifUrl, hydrate
+      final msg = _sentMessage({
+        ...res,
+        if ((res['media_url'] == null || (res['media_url'] as String).isEmpty) && gifUrl != null) 'media_url': gifUrl,
+      }, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _makeGifFromVideo() async {
+    final picker = ImagePicker();
+    final video = await picker.pickVideo(source: ImageSource.gallery);
+    if (video == null || !mounted) return;
+    setState(() => _sending = true);
+    try {
+      final upload = await _api.uploadFile('/media/upload', File(video.path));
+      final mediaId = upload['id'] as String;
+      final res = await _api.post('/gifs/make', {'media_id': mediaId, 'title': 'Converted GIF'});
+      final gif = res['gif'] as Map<String, dynamic>?;
+      if (mounted && gif != null) {
+        await _sendGif(gif);
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  // --- Telegram-like round video messages (video_note) ---
+  Future<void> _recordVideoNote() async {
+    if (_sending || !_can('send_messages')) return;
+    // Telegram round videos are portrait, max 60s, circular. We reuse gallery/camera video picker and send as video_note.
+    final picker = ImagePicker();
+    final XFile? video = await picker.pickVideo(source: ImageSource.camera, maxDuration: const Duration(seconds: 60));
+    if (video == null || !mounted) return;
+    final file = File(video.path);
+    final reply = _replyTo;
+    setState(() => _sending = true);
+    try {
+      final upload = await _api.uploadFile('/media/upload', file);
+      final mediaId = upload['id'] as String;
+      final body = <String, dynamic>{
+        'chat_id': widget.chatId,
+        'message_type': 'video_note',
+        'media_id': mediaId,
+        'content': '',
+      };
+      if (reply != null) body['reply_to_id'] = reply.id;
+      final res = await _api.post('/messages/', body);
+      if (!mounted) return;
+      final msg = _sentMessage({...res, 'media_id': mediaId, 'media_url': '/api/v1/media/$mediaId', 'message_type': 'video_note'}, reply);
+      setState(() {
+        _mergeMessages([msg]);
+        _replyTo = null;
+        _sending = false;
+      });
+      _scrollToBottom();
+      if (mounted) ref.read(chatListProvider.notifier).refresh();
+    } catch (e) {
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
+      }
+    }
+  }
+
+  Future<void> _reportCurrentChat() async {
+    final targetType = _chatType == 'private' ? 'user' : 'chat';
+    final targetUserId = _chatType == 'private' ? _otherUser?.id : null;
+    await showDialog(
+      context: context,
+      builder: (_) => ReportDialog(
+        api: _api,
+        targetType: targetType == 'user' ? 'user' : 'group',
+        targetUserId: targetUserId,
+        targetChatId: widget.chatId,
+        title: _displayTitle,
+      ),
+    );
+  }
+
+  Future<void> _reportMessage(MessageModel msg) async {
+    await showDialog(
+      context: context,
+      builder: (_) => ReportDialog(
+        api: _api,
+        targetType: 'message',
+        targetMessageId: msg.id,
+        targetChatId: widget.chatId,
+        title: 'پیام',
+      ),
+    );
+  }
+
   Future<void> _deleteMessage(MessageModel msg, {required bool forAll}) async {
     try {
       await _api.post('/messages/${msg.id}/delete', {'for_all': forAll});
@@ -1273,20 +1537,62 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     if (_reconciler.isUnavailable(msg.id)) return;
     showModalBottomSheet<void>(
       context: context,
-      builder: (_) => MessageActionsSheet(
-        message: msg,
-        canDeleteForAll: _canDelete(msg),
-        canReply: _can('send_messages'),
-        canPin: _canPinMessages,
-        onTogglePin: (pin) => _togglePin(msg, pin),
-        onReply: () {
-          if (mounted &&
-              _can('send_messages') &&
-              !_reconciler.isUnavailable(msg.id))
-            setState(() => _replyTo = msg);
-        },
-        onForward: () => _forwardMessage(msg),
-        onDelete: (forAll) => _deleteMessage(msg, forAll: forAll),
+      builder: (sheetCtx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Quick reactions bar like Telegram
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: ['❤️', '👍', '😂', '😮', '😢', '🙏'].map((e) => InkWell(
+                  onTap: () {
+                    Navigator.pop(sheetCtx);
+                    _toggleReaction(msg, e);
+                  },
+                  borderRadius: BorderRadius.circular(24),
+                  child: Container(
+                    width: 44,
+                    height: 44,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(color: Colors.grey.withValues(alpha: 0.08), shape: BoxShape.circle),
+                    child: Text(e, style: const TextStyle(fontSize: 22)),
+                  ),
+                )).toList(),
+              ),
+            ),
+            const Divider(height: 1),
+            MessageActionsSheet(
+              message: msg,
+              canDeleteForAll: _canDelete(msg),
+              canReply: _can('send_messages'),
+              canPin: _canPinMessages,
+              onTogglePin: (pin) => _togglePin(msg, pin),
+              onReply: () {
+                if (mounted && _can('send_messages') && !_reconciler.isUnavailable(msg.id)) setState(() => _replyTo = msg);
+              },
+              onForward: () => _forwardMessage(msg),
+              onDelete: (forAll) => _deleteMessage(msg, forAll: forAll),
+            ),
+            ListTile(
+              leading: const Icon(Icons.add_reaction_outlined),
+              title: const Text('افزودن واکنش'),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _showReactionPicker(msg);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.report_outlined, color: Colors.orange),
+              title: const Text('گزارش پیام'),
+              onTap: () {
+                Navigator.pop(sheetCtx);
+                _reportMessage(msg);
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1387,12 +1693,48 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               if (_can('send_files'))
                 ListTile(
                   leading: const Icon(Icons.insert_drive_file),
-                  title: const Text('ارسال فایل (اسناد، PDF، ...)'),
+                  title: const Text('ارسال فایل (اسناد، PDF، ZIP، PNG، TXT، ...)'),
+                  subtitle: const Text('همه فرمت‌ها مانند تلگرام پشتیبانی می‌شوند', style: TextStyle(fontSize: 11, color: Colors.grey)),
                   onTap: () {
                     Navigator.pop(ctx);
                     _pickAndSendFile();
                   },
                 ),
+              ListTile(
+                leading: const Icon(Icons.emoji_emotions_outlined, color: Colors.orange),
+                title: const Text('استیکر'),
+                subtitle: const Text('انتخاب از پک‌های آماده', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showStickerPicker();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.gif_box_outlined, color: Colors.blue),
+                title: const Text('GIF'),
+                subtitle: const Text('جستجو، ذخیره و ساخت گیف مانند تلگرام', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _showGifPicker();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.video_library_outlined, color: Colors.red),
+                title: const Text('ساخت GIF از ویدیو'),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _makeGifFromVideo();
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.circle, color: Colors.teal),
+                title: const Text('پیام ویدیویی گرد'),
+                subtitle: const Text('ویدیو دایره‌ای مانند تلگرام (video_note)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                onTap: () {
+                  Navigator.pop(ctx);
+                  _recordVideoNote();
+                },
+              ),
               SwitchListTile(
                 secondary: const Icon(Icons.visibility_off_outlined, color: Colors.purple),
                 title: const Text('حالت اسپویلر (مخفی تا زمان لمس)'),
@@ -1509,6 +1851,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   _openManagement();
                 },
               ),
+            ListTile(
+              leading: const Icon(Icons.report_outlined, color: Colors.orange),
+              title: Text(_chatType == 'private' ? 'گزارش کاربر' : 'گزارش گروه/کانال'),
+              subtitle: const Text('ارسال گزارش به مدیریت (مانند تلگرام)', style: TextStyle(fontSize: 11, color: Colors.grey)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _reportCurrentChat();
+              },
+            ),
             ListTile(
               leading: const Icon(Icons.schedule),
               title: const Text('پیام‌های زمان‌بندی‌شده'),
@@ -1671,6 +2022,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 otherUser: _otherUser,
                 avatarUrl: _chatAvatarUrl,
                 membersCount: _hasChatInfo ? _membersCount : null,
+                onlineCount: _hasChatInfo ? _onlineCount : null,
                 token: _authToken,
                 onTap: _chatType == 'group' || _chatType == 'channel'
                     ? _openManagement
@@ -1725,6 +2077,34 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           child: Column(
             children: [
               if (_openingInvite) const LinearProgressIndicator(minHeight: 2),
+              if (_isSuspended)
+                Container(
+                  width: double.infinity,
+                  color: Colors.red.withValues(alpha: 0.12),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.block, color: Colors.red, size: 20),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text('این گروه/کانال تعلیق شده است${_suspensionReason != null ? ': $_suspensionReason' : ''}', style: const TextStyle(color: Colors.red, fontSize: 12, fontWeight: FontWeight.w600))),
+                      if (_myRole == 'owner')
+                        TextButton(onPressed: _loadChatInfo, child: const Text('به‌روزرسانی', style: TextStyle(fontSize: 12))),
+                    ],
+                  ),
+                ),
+              if (_isClosed)
+                Container(
+                  width: double.infinity,
+                  color: Colors.orange.withValues(alpha: 0.14),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.lock, color: Colors.orange, size: 18),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text('این گروه/کانال بسته شده است${_closedReason != null ? ': $_closedReason' : ' (فقط مالک می‌تواند ارسال کند)'}', style: const TextStyle(color: Colors.orange, fontSize: 12, fontWeight: FontWeight.w600))),
+                    ],
+                  ),
+                ),
               if (_pinned.isNotEmpty && !_searchMode)
                 PinnedMessagesBar(
                   pinned: _pinned,
@@ -1821,6 +2201,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               () => GlobalKey(),
                             ),
                             onLongPress: () => _showMessageActions(msg),
+                            onDoubleTap: () => _showReactionPicker(msg),
                             // Reply gestures do not own taps on media anymore.
                             onHorizontalDragEnd: (details) {
                               final velocity = details.primaryVelocity ?? 0;
@@ -1834,22 +2215,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               isMine: isMine,
                               currentUserId: _currentUserId,
                               reply: _replyPreviewFor(msg),
-                              onReplyTap: msg.replyToId == null
-                                  ? null
-                                  : () => _jumpToReply(msg.replyToId!),
-                              onOpenPhoto: () => _openPhoto(msg),
+                              onReplyTap: msg.replyToId == null ? null : () => _jumpToReply(msg.replyToId!),
+                              onOpenPhoto: () {
+                                // For sticker/gif/video_note also allow viewing
+                                if (msg.messageType == 'sticker' || msg.messageType == 'gif' || msg.messageType == 'video_note') return;
+                                _openPhoto(msg);
+                              },
                               onOpenViewOnce: () => _openViewOnce(msg),
                               onInviteTap: _openInvite,
                               coordinator: _playback,
                               highlighted: _highlightedMessageId == msg.id,
-                              showSender:
-                                  _chatType == 'group' ||
-                                  _chatType == 'channel',
-                              mediaUrl: _mediaFullUrl(
-                                msg.mediaId,
-                                existingUrl: msg.mediaUrl,
-                              ),
+                              showSender: _chatType == 'group' || _chatType == 'channel',
+                              mediaUrl: _mediaFullUrl(msg.mediaId, existingUrl: msg.mediaUrl),
                               token: _authToken,
+                              onReactionTap: (emoji) => _toggleReaction(msg, emoji),
+                              onAddReaction: () => _showReactionPicker(msg),
                             ),
                           );
                         },
@@ -1979,6 +2359,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       _sending || (!_can('send_photos') && !_can('send_videos') && !_can('send_files'))
                       ? null
                       : _showAttachMenu,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.emoji_emotions_outlined),
+                  tooltip: 'استیکر',
+                  onPressed: _sending ? null : _showStickerPicker,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.gif_box_outlined),
+                  tooltip: 'GIF',
+                  onPressed: _sending ? null : _showGifPicker,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.videocam_outlined),
+                  tooltip: 'ویدیو گرد',
+                  onPressed: _sending ? null : _recordVideoNote,
                 ),
                 if (_isSpoiler)
                   GestureDetector(

@@ -11,18 +11,47 @@ import uuid
 
 media_bp = Blueprint('media', __name__)
 
-ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'mp4', 'mov', 'webm', 'mp3', 'ogg', 'm4a', 'pdf', 'doc', 'docx', 'zip'}
+# Telegram-like: accept any common file type, not just a tiny whitelist.
+# Keep a set for mime mapping; but allow any file extension like Telegram does.
+ALLOWED_EXTENSIONS = {
+    # images
+    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'svg', 'heic', 'heif',
+    # videos
+    'mp4', 'mov', 'webm', 'mkv', 'avi', 'flv', 'm4v', '3gp', 'mpeg', 'mpg', 'ogv',
+    # audio
+    'mp3', 'ogg', 'm4a', 'wav', 'flac', 'aac', 'wma', 'opus', 'aiff', 'amr',
+    # documents & archives & executables (Telegram allows apk, zip, rar etc.)
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'csv', 'md',
+    'json', 'xml', 'html', 'htm', 'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz',
+    'apk', 'ipa', 'exe', 'dmg', 'iso', 'torrent', 'psd', 'ai', 'eps',
+}
 
 def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    # Telegram allows virtually any file. We only reject empty names or
+    # path traversal. If extension exists we check known list, but unknown
+    # extensions are still allowed as 'document' (e.g. .log, .dat, .bin, custom).
+    if not filename or filename.strip() == '':
+        return False
+    # secure_filename will have stripped path; just ensure we have a name
+    name = filename.strip()
+    if '/' in name or '\\' in name or '..' in name:
+        return False
+    if '.' not in name:
+        # allow extension-less files like Telegram (e.g. LICENSE, Dockerfile)
+        return len(name) <= 255
+    ext = name.rsplit('.', 1)[1].lower()
+    if not ext or len(ext) > 20:
+        return False
+    # Allow both known and unknown extensions; only block extremely long or empty
+    return True
 
 def get_media_type(ext):
     ext = ext.lower()
-    if ext in {'jpg', 'jpeg', 'png', 'gif', 'webp'}:
+    if ext in {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'svg', 'heic', 'heif'}:
         return 'image'
-    if ext in {'mp4', 'mov', 'webm'}:
+    if ext in {'mp4', 'mov', 'webm', 'mkv', 'avi', 'flv', 'm4v', '3gp', 'mpeg', 'mpg', 'ogv'}:
         return 'video'
-    if ext in {'mp3', 'ogg', 'm4a'}:
+    if ext in {'mp3', 'ogg', 'm4a', 'wav', 'flac', 'aac', 'wma', 'opus', 'aiff', 'amr'}:
         return 'audio'
     return 'document'
 
@@ -42,9 +71,13 @@ def upload_media():
     if not allowed_file(file.filename):
         return jsonify({'error': 'نوع فایل مجاز نیست'}), 400
 
-    original_name = secure_filename(file.filename)
-    ext = original_name.rsplit('.', 1)[1].lower()
-    stored_name = f"{uuid.uuid4().hex}.{ext}"
+    original_name = secure_filename(file.filename) or f"file_{uuid.uuid4().hex}"
+    if '.' in original_name:
+        ext = original_name.rsplit('.', 1)[1].lower()
+        stored_name = f"{uuid.uuid4().hex}.{ext}"
+    else:
+        ext = ''
+        stored_name = f"{uuid.uuid4().hex}"
     upload_folder = current_app.config['UPLOAD_FOLDER']
     os.makedirs(upload_folder, exist_ok=True)
     file_path = os.path.abspath(os.path.join(upload_folder, stored_name))
@@ -57,7 +90,7 @@ def upload_media():
         uploader_id=user_id,
         original_name=original_name,
         stored_name=stored_name,
-        mime_type=file.mimetype or f'application/{ext}',
+        mime_type=file.mimetype or (f'application/{ext}' if ext else 'application/octet-stream'),
         file_size=file_size,
         file_path=file_path,
         media_type=media_type,

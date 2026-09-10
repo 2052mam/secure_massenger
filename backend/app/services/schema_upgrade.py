@@ -12,10 +12,22 @@ def upgrade_schema():
             'allow_group_adds': 'BOOLEAN NOT NULL DEFAULT 1',
             'archive_pin_hash': 'VARCHAR(255) NULL',
             'archive_pin_updated_at': 'DATETIME NULL',
+            'is_limited': 'BOOLEAN NOT NULL DEFAULT 0',
+            'limited_until': 'DATETIME NULL',
+            'limited_reason': 'TEXT NULL',
+            'limited_by': 'VARCHAR(36) NULL',
         },
         'chats': {
             'permissions': 'JSON NULL',
             'slow_mode_delay': 'INTEGER NOT NULL DEFAULT 0',
+            'hide_members': 'BOOLEAN NOT NULL DEFAULT 0',
+            'is_suspended': 'BOOLEAN NOT NULL DEFAULT 0',
+            'suspension_reason': 'TEXT NULL',
+            'suspended_at': 'DATETIME NULL',
+            'suspended_by': 'VARCHAR(36) NULL',
+            'is_closed': 'BOOLEAN NOT NULL DEFAULT 0',
+            'closed_reason': 'TEXT NULL',
+            'closed_at': 'DATETIME NULL',
         },
         'chat_members': {
             'permissions': 'JSON NULL',
@@ -39,12 +51,20 @@ def upgrade_schema():
                 if column not in existing:
                     connection.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {definition}'))
 
-    # New, self contained tables (folders, profile albums, search history).
+    # New, self contained tables (folders, profile albums, search history, reports, stickers, gifs).
     # create_all only creates what is missing and never rewrites existing rows.
     from app.models.folder import ChatFolder, ChatFolderItem  # noqa: F401
     from app.models.profile import SearchHistory, UserPhoto  # noqa: F401
+    from app.models.report import Report  # noqa: F401
+    from app.models.sticker import StickerPack, Sticker  # noqa: F401
+    from app.models.gif import SavedGif  # noqa: F401
+    from app.models.message import MessageReaction  # ensure exists
 
+    db.metadata.create_all(bind=db.engine)
+    # Also ensure specific tables exist individually for older SQLAlchemy metadata
     db.metadata.create_all(bind=db.engine, tables=[
         ChatFolder.__table__, ChatFolderItem.__table__,
         UserPhoto.__table__, SearchHistory.__table__,
+        Report.__table__, StickerPack.__table__, Sticker.__table__, SavedGif.__table__,
+        MessageReaction.__table__,
     ])

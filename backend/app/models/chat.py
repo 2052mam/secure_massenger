@@ -17,6 +17,17 @@ class Chat(db.Model):
     
     permissions = db.Column(db.JSON, nullable=True)
     slow_mode_delay = db.Column(db.Integer, default=0, nullable=False)
+    # Telegram-like: admin can hide members list from non-admins
+    hide_members = db.Column(db.Boolean, default=False, nullable=False)
+
+    # Suspension / closure after reports (Telegram-like)
+    is_suspended = db.Column(db.Boolean, default=False, nullable=False)
+    suspension_reason = db.Column(db.Text, nullable=True)
+    suspended_at = db.Column(db.DateTime, nullable=True)
+    suspended_by = db.Column(db.String(36), nullable=True)
+    is_closed = db.Column(db.Boolean, default=False, nullable=False)
+    closed_reason = db.Column(db.Text, nullable=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
 
     created_by = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False)
     is_public = db.Column(db.Boolean, default=False)
