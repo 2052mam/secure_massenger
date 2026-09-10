@@ -63,7 +63,7 @@ class _StoryCreateScreenState extends ConsumerState<StoryCreateScreen> {
       });
       if (mounted) Navigator.pop(context, true);
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString(), _sending = false);
+      if (mounted) setState(() { _error = e.toString(); _sending = false; });
     }
   }
 

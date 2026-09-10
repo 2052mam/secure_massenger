@@ -50,7 +50,7 @@ class _LocationPickerScreenState extends State<LocationPickerScreen> {
         });
       }
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString(), _loadingGps = false);
+      if (mounted) setState(() { _error = e.toString(); _loadingGps = false; });
     }
   }
 

@@ -41,7 +41,7 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
     super.initState();
     final session = ref.read(authenticatedSessionProvider);
     _api = session.api;
-    _currentUserId = session.user.id;
+    _currentUserId = session.userId;
     _init();
   }
 
@@ -82,7 +82,7 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
       _scrollToBottom();
       _markRead();
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString(), _loading = false);
+      if (mounted) setState(() { _error = e.toString(); _loading = false; });
     }
   }
 
@@ -125,6 +125,7 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
     if (text.isEmpty) return;
     _inputCtrl.clear();
     try {
+      // POST /messages/ returns the created message object directly.
       final res = await _api.post('/messages/', {
         'chat_id': widget.chatId,
         'message_type': 'text',
@@ -132,10 +133,11 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
         'is_secure': true,
       });
       if (!mounted) return;
-      if (res['message'] != null) {
-        setState(() => _messages.add(MessageModel.fromJson(res['message'] as Map<String, dynamic>)));
+      try {
+        final msg = MessageModel.fromJson(res);
+        setState(() => _messages.add(msg));
         _scrollToBottom();
-      } else {
+      } catch (_) {
         await _poll();
       }
     } catch (e) {
@@ -314,7 +316,7 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
                               ),
               ),
               Container(
-                color: Colors.grey.shade950,
+                color: const Color(0xFF0A0A0A),
                 padding: const EdgeInsets.fromLTRB(8, 8, 8, 8),
                 child: Row(children: [
                   Expanded(
@@ -364,6 +366,9 @@ class _SecureBubble extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final bg = isMine ? const Color(0xFF1B5E20) : const Color(0xFF212121);
+    final text = message.content?.trim().isNotEmpty == true
+        ? message.content!.trim()
+        : _nonTextLabel(message);
     return GestureDetector(
       onLongPress: onLongPress,
       child: Align(
@@ -387,7 +392,7 @@ class _SecureBubble extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               MessageText(
-                text: message.displayText.isEmpty ? _nonTextLabel(message) : message.displayText,
+                text: text,
                 style: const TextStyle(color: Colors.white, fontSize: 14, height: 1.35),
               ),
               const SizedBox(height: 2),

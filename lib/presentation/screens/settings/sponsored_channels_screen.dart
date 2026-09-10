@@ -45,7 +45,7 @@ class _SponsoredChannelsScreenState extends ConsumerState<SponsoredChannelsScree
         _loading = false;
       });
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString(), _loading = false);
+      if (mounted) setState(() { _error = e.toString(); _loading = false; });
     }
   }
 

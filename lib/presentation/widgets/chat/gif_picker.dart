@@ -58,7 +58,7 @@ class _GifPickerState extends State<GifPicker> {
         });
       }
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString(), _loading = false);
+      if (mounted) setState(() { _error = e.toString(); _loading = false; });
     }
   }
 
