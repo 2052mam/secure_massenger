@@ -981,8 +981,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              ContaSize.min,
-            children: [
               Container(width: 40, height: 4, margin: const EdgeInsets.only(top: 12, bottom: 8), decoration: BoxDecoration(color: Colors.grey[300], borderRadius: BorderRadius.circular(2))),
               ListTile(
                 leading: const Icon(Icons.send),
