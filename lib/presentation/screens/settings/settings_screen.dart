@@ -13,6 +13,8 @@ import 'account_switcher_screen.dart';
 import 'archive_lock_screen.dart';
 import 'device_management_screen.dart';
 import 'admin_reports_screen.dart';
+import 'sponsored_channels_screen.dart';
+import 'terms_screen.dart';
 import '../home/archived_chats_screen.dart';
 import '../../widgets/chat/chat_labels.dart';
 
@@ -56,7 +58,7 @@ class SettingsScreen extends ConsumerWidget {
                   user.displayName,
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
-                subtitle: Text('@${user.username}'),
+                subtitle: Text(user.handle),
                 trailing: const Icon(Icons.chevron_left),
                 onTap: () {
                   Navigator.of(context).push(
@@ -206,6 +208,37 @@ class SettingsScreen extends ConsumerWidget {
               title: Text(isFa ? 'گزارش‌ها (مدیریت)' : 'Reports (Admin)'),
               subtitle: Text(isFa ? 'بررسی گزارش کاربران و گروه‌ها/کانال‌ها' : 'Review user & chat reports'),
               onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const AdminReportsScreen())),
+            ),
+            if (user?.isAdmin == true)
+              ListTile(
+                leading: const Icon(Icons.campaign_outlined, color: Colors.amber),
+                title: const Text('کانال‌های اسپانسرشده'),
+                subtitle: const Text('مدیریت کانال‌های تبلیغاتی (مدیر کل)', style: TextStyle(fontSize: 12)),
+                onTap: () => Navigator.of(context).push(
+                  MaterialPageRoute(builder: (_) => const SponsoredChannelsScreen()),
+                ),
+              ),
+            ListTile(
+              leading: const Icon(Icons.forward_outlined),
+              title: Text(isFa ? 'اجازه فوروارد پیام‌های من' : 'Allow forwarding my messages'),
+              subtitle: Text(isFa ? 'دیگران بتوانند پیام‌های شما را فوروارد کنند' : 'Others can forward your messages'),
+              trailing: Switch(
+                value: user?.allowForwarding ?? true,
+                onChanged: (v) async {
+                  try {
+                    await ApiService().put('/users/me', {'allow_forwarding': v});
+                    ref.read(authNotifierProvider.notifier).checkSession();
+                  } catch (_) {}
+                },
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.rule_outlined),
+              title: Text(isFa ? 'قوانین و مقررات' : 'Rules & Terms'),
+              subtitle: Text(isFa ? 'قوانین استفاده از پیام‌رسان' : 'Messenger rules of use'),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const TermsScreen()),
+              ),
             ),
             ListTile(
               leading: const Icon(Icons.photo_outlined),

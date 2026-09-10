@@ -21,6 +21,9 @@ class MediaFile(db.Model):
     height = db.Column(db.Integer, nullable=True)
     duration = db.Column(db.Float, nullable=True)  # seconds for audio/video
     thumbnail_path = db.Column(db.String(500), nullable=True)
+    # Music metadata (Telegram-like internal player)
+    title = db.Column(db.String(200), nullable=True)
+    artist = db.Column(db.String(200), nullable=True)
     
     # Soft Delete
     is_deleted = db.Column(db.Boolean, default=False)

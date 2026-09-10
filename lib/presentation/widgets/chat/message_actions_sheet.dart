@@ -12,10 +12,13 @@ class MessageActionsSheet extends StatelessWidget {
     required this.canDeleteForAll,
     this.canReply = true,
     this.canPin = false,
+    this.canForward = true,
+    this.canEdit = false,
     required this.onReply,
     required this.onForward,
     required this.onDelete,
     this.onTogglePin,
+    this.onEdit,
   });
 
   final MessageModel message;
@@ -25,10 +28,17 @@ class MessageActionsSheet extends StatelessWidget {
   /// Pinning is allowed for private chats and for group/channel members with
   /// the pin right. Several messages can stay pinned at the same time.
   final bool canPin;
+
+  /// False when forwarding is blocked (chat-level or user-level privacy).
+  final bool canForward;
+
+  /// True when the current user may edit this message (own text/caption).
+  final bool canEdit;
   final VoidCallback onReply;
   final VoidCallback onForward;
   final ValueChanged<bool> onDelete;
   final ValueChanged<bool>? onTogglePin;
+  final VoidCallback? onEdit;
 
   Future<void> _copy(BuildContext context) async {
     final text = message.copyableText;
@@ -120,12 +130,29 @@ class MessageActionsSheet extends StatelessWidget {
                 onTap: () =>
                     closeAndRun(() => onTogglePin!(!message.isPinned)),
               ),
-            if (!message.isViewOnce)
+            if (canEdit && onEdit != null)
               ListTile(
-                leading: const Icon(Icons.forward),
-                title: Text(labels.forward),
-                onTap: () => closeAndRun(onForward),
+                key: const ValueKey('edit-message'),
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('ویرایش'),
+                onTap: () => closeAndRun(onEdit!),
               ),
+            if (!message.isViewOnce)
+              if (canForward)
+                ListTile(
+                  leading: const Icon(Icons.forward),
+                  title: Text(labels.forward),
+                  onTap: () => closeAndRun(onForward),
+                )
+              else
+                const ListTile(
+                  leading: Icon(Icons.block_outlined, color: Colors.grey),
+                  title: Text('فوروارد غیرفعال است',
+                      style: TextStyle(color: Colors.grey)),
+                  subtitle: Text('مدیر فوروارد از این گفتگو را بسته است',
+                      style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  enabled: false,
+                ),
             ListTile(
               leading: const Icon(Icons.delete_outline),
               title: Text(labels.deleteForMe),

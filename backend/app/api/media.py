@@ -7,6 +7,8 @@ from app.models.message import Message
 from app.models.audit import AuditLog
 from datetime import datetime
 import os
+import shutil
+import subprocess
 import uuid
 
 media_bp = Blueprint('media', __name__)
@@ -83,8 +85,42 @@ def upload_media():
     file_path = os.path.abspath(os.path.join(upload_folder, stored_name))
     file.save(file_path)
 
+    # Optional video-editor trim (start/end in ms). Applied server-side with
+    # ffmpeg when available; otherwise the full video is kept (graceful).
+    try:
+        trim_start = request.form.get('trim_start_ms')
+        trim_end = request.form.get('trim_end_ms')
+        if (trim_start or trim_end) and get_media_type(ext) == 'video' and shutil.which('ffmpeg'):
+            start_s = max(0, int(trim_start or 0)) / 1000.0
+            end_s = int(trim_end) / 1000.0 if trim_end and int(trim_end) > 0 else None
+            if end_s is None or end_s > start_s:
+                tmp_path = file_path + '.trim.mp4'
+                cmd = ['ffmpeg', '-y', '-ss', str(start_s), '-i', file_path]
+                if end_s is not None:
+                    cmd += ['-t', str(end_s - start_s)]
+                cmd += ['-c', 'copy', tmp_path]
+                proc = subprocess.run(cmd, capture_output=True, timeout=120)
+                if proc.returncode == 0 and os.path.getsize(tmp_path) > 0:
+                    os.replace(tmp_path, file_path)
+                elif os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+    except Exception:
+        pass  # Never fail an upload because trimming is unavailable.
+
     file_size = os.path.getsize(file_path)
     media_type = get_media_type(ext)
+
+    # Optional music metadata sent by the client (Telegram-like player).
+    title = (request.form.get('title') or '').strip()[:200] or None
+    artist = (request.form.get('artist') or '').strip()[:200] or None
+    duration = None
+    if request.form.get('duration'):
+        try:
+            duration = float(request.form.get('duration'))
+            if duration < 0 or duration > 24 * 3600:
+                duration = None
+        except (TypeError, ValueError):
+            duration = None
 
     media = MediaFile(
         uploader_id=user_id,
@@ -94,6 +130,9 @@ def upload_media():
         file_size=file_size,
         file_path=file_path,
         media_type=media_type,
+        title=title,
+        artist=artist,
+        duration=duration,
     )
     db.session.add(media)
     db.session.add(AuditLog(
@@ -106,6 +145,9 @@ def upload_media():
         'original_name': media.original_name,
         'media_type': media.media_type,
         'file_size': media.file_size,
+        'title': media.title,
+        'artist': media.artist,
+        'duration': media.duration,
         'url': f'/api/v1/media/{media.id}',
     }), 201
 

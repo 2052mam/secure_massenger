@@ -423,6 +423,19 @@ class _ChatManagementState extends State<_ChatManagement> {
                             });
                           },
                         ),
+                      if (_admin)
+                        SwitchListTile(
+                          key: const ValueKey('allow-forwarding'),
+                          secondary: const Icon(Icons.forward_outlined),
+                          title: Text(_t(context, 'Allow forwarding', 'اجازه فوروارد از این ${widget.channel ? 'کانال' : 'گروه'}')),
+                          subtitle: Text(_t(context, 'Members can forward messages elsewhere', 'اعضا بتوانند پیام‌ها را به جاهای دیگر فوروارد کنند')),
+                          value: (_info?['allow_forwarding'] as bool? ?? true),
+                          onChanged: _busy ? null : (v) async {
+                            await _run(() async {
+                              await widget.api.post('$_base/forwarding', {'allow_forwarding': v});
+                            });
+                          },
+                        ),
                       if (_can('invite_users')) ...[
                         ListTile(
                           key: const ValueKey('add-members'),

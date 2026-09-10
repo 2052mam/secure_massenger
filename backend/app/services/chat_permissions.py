@@ -68,11 +68,15 @@ def can_send(chat, user_id, message_type, view_once=False):
         'image': 'send_photos',
         'video': 'send_videos',
         'voice': 'send_voice',
+        'audio': 'send_voice',   # music/songs follow voice right (Telegram)
+        'music': 'send_voice',
         'file': 'send_files',
         'sticker': 'send_messages',  # Telegram: stickers follow send_messages
         'gif': 'send_messages',      # GIFs follow send_messages/photos
         'video_note': 'send_videos',
         'round_video': 'send_videos',
+        'location': 'send_messages',  # locations follow text right
+        'live_location': 'send_messages',
     }
     key = mapping.get(message_type)
     # gif can be sent if either send_photos or send_messages is allowed (lenient like Telegram)

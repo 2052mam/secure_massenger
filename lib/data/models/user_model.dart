@@ -4,7 +4,8 @@ import 'package:equatable/equatable.dart';
 class UserModel extends Equatable {
   final String id;
   final String email;
-  final String username;
+  // Telegram-like: username (@id) is OPTIONAL and may be null.
+  final String? username;
   final String displayName;
   final String? bio;
   final String? avatarUrl;
@@ -14,11 +15,14 @@ class UserModel extends Equatable {
   final bool showProfilePhoto;
   final bool showBio;
   final bool allowGroupAdds;
+  final bool allowForwarding;
+  final int termsVersion;
+  final bool isAdmin;
 
   const UserModel({
     required this.id,
     required this.email,
-    required this.username,
+    this.username,
     required this.displayName,
     this.bio,
     this.avatarUrl,
@@ -28,13 +32,24 @@ class UserModel extends Equatable {
     this.showProfilePhoto = true,
     this.showBio = true,
     this.allowGroupAdds = true,
+    this.allowForwarding = true,
+    this.termsVersion = 0,
+    this.isAdmin = false,
   });
+
+  /// Backwards-compatible non-null username for legacy UI (empty when unset).
+  String get usernameOrEmpty => username ?? '';
+
+  /// Display handle: @username when set, otherwise display name.
+  String get handle => username != null && username!.isNotEmpty ? '@$username' : displayName;
+
+  bool get hasUsername => username != null && username!.isNotEmpty;
 
   factory UserModel.fromJson(Map<String, dynamic> json) {
     return UserModel(
       id: json['id'] as String,
       email: json['email'] as String? ?? '',
-      username: json['username'] as String,
+      username: json['username'] as String?,
       displayName: json['display_name'] as String,
       bio: json['bio'] as String?,
       avatarUrl: json['avatar_url'] as String?,
@@ -44,6 +59,9 @@ class UserModel extends Equatable {
       showProfilePhoto: json['show_profile_photo'] as bool? ?? true,
       showBio: json['show_bio'] as bool? ?? true,
       allowGroupAdds: json['allow_group_adds'] as bool? ?? true,
+      allowForwarding: json['allow_forwarding'] as bool? ?? true,
+      termsVersion: json['terms_version'] as int? ?? 0,
+      isAdmin: json['is_admin'] as bool? ?? false,
     );
   }
 
@@ -78,5 +96,8 @@ class UserModel extends Equatable {
     showProfilePhoto,
     showBio,
     allowGroupAdds,
+    allowForwarding,
+    termsVersion,
+    isAdmin,
   ];
 }

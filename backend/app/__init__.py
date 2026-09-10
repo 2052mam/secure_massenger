@@ -46,6 +46,7 @@ def create_app():
     from app.api.stickers import stickers_bp
     from app.api.gifs import gifs_bp
     from app.api.devices import devices_bp
+    from app.api.stories import stories_bp
     from app.admin.routes import admin_web_bp
 
     app.register_blueprint(auth_bp, url_prefix='/api/v1/auth')
@@ -59,6 +60,7 @@ def create_app():
     app.register_blueprint(stickers_bp, url_prefix='/api/v1/stickers')
     app.register_blueprint(gifs_bp, url_prefix='/api/v1/gifs')
     app.register_blueprint(devices_bp, url_prefix='/api/v1/devices')
+    app.register_blueprint(stories_bp, url_prefix='/api/v1/stories')
     app.register_blueprint(admin_web_bp)
 
     @app.cli.command('upgrade-chat-schema')

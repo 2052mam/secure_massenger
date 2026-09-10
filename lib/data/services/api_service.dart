@@ -106,10 +106,12 @@ class ApiService {
     String path,
     File file, {
     String fieldName = 'file',
+    Map<String, String>? fields,
   }) async {
     final uri = Uri.parse('${ApiConstants.baseUrl}$path');
     final request = http.MultipartRequest('POST', uri);
     request.headers.addAll(_headers);
+    if (fields != null) request.fields.addAll(fields);
 
     final ext = file.path.split('.').last.toLowerCase();
     String mime = 'application/octet-stream';

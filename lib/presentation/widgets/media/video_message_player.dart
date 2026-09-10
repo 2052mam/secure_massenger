@@ -16,6 +16,9 @@ class VideoMessagePlayer extends StatefulWidget {
   final VideoPlayerController Function(Uri, Map<String, String>)?
   controllerFactory;
 
+  /// Editor-muted videos play silently; the volume toggle stays locked off.
+  final bool muted;
+
   const VideoMessagePlayer({
     super.key,
     required this.url,
@@ -23,6 +26,7 @@ class VideoMessagePlayer extends StatefulWidget {
     this.isMine = false,
     this.coordinator,
     this.controllerFactory,
+    this.muted = false,
   });
 
   @override
@@ -85,6 +89,11 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
     try {
       await controller.initialize().timeout(const Duration(seconds: 30));
       if (!mounted || generation != _generation) return;
+      if (widget.muted) {
+        try {
+          await controller.setVolume(0);
+        } catch (_) {}
+      }
       setState(() => _ready = true);
     } catch (_) {
       if (mounted && generation == _generation) setState(() => _error = true);
@@ -238,6 +247,7 @@ class _VideoMessagePlayerState extends State<VideoMessagePlayer>
                           coordinator: widget.coordinator,
                           playbackOwner: this,
                           autoFullscreenOnPlay: true,
+                          volumeLocked: widget.muted,
                           onFullscreen: _openFullscreen,
                           onPlayFullscreen: () =>
                               _openFullscreen(autoplay: true),
@@ -266,7 +276,10 @@ class _FullscreenVideo extends StatefulWidget {
     required this.onRetry,
     this.coordinator,
     this.autoplay = false,
+    this.volumeLocked = false,
   });
+
+  final bool volumeLocked;
 
   @override
   State<_FullscreenVideo> createState() => _FullscreenVideoState();
@@ -329,6 +342,7 @@ class _FullscreenVideoState extends State<_FullscreenVideo>
             playbackOwner: widget.playbackOwner,
             fullscreen: true,
             autoPlay: widget.autoplay,
+            volumeLocked: widget.volumeLocked,
             onFullscreen: () => Navigator.of(context).pop(),
             onRetry: () {
               Navigator.of(context).pop();

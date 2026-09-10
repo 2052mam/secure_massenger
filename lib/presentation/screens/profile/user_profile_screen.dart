@@ -164,12 +164,13 @@ class _UserProfileScreenState extends ConsumerState<UserProfileScreen> {
                   ),
                 ),
                 const SizedBox(height: 6),
-                Center(
-                  child: Text(
-                    '@${_user!.username}',
-                    style: TextStyle(color: Colors.grey[600], fontSize: 15),
+                if (_user!.hasUsername)
+                  Center(
+                    child: Text(
+                      '@${_user!.username}',
+                      style: TextStyle(color: Colors.grey[600], fontSize: 15),
+                    ),
                   ),
-                ),
                 if (_user!.bio != null && _user!.bio!.isNotEmpty) ...[
                   const SizedBox(height: 16),
                   Card(

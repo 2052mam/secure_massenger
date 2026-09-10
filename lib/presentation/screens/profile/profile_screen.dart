@@ -40,7 +40,7 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     if (user == null || _seededUserId == user.id) return;
     _seededUserId = user.id;
     _nameCtrl.text = user.displayName;
-    _usernameCtrl.text = user.username;
+    _usernameCtrl.text = user.username ?? '';
     _bioCtrl.text = user.bio ?? '';
   }
 
@@ -153,13 +153,18 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
     }
     final name = _nameCtrl.text.trim();
     final username = _usernameCtrl.text.trim().toLowerCase();
-    // The bio is always sent (an empty value clears it); name and username
-    // only when they actually changed, so a blank field never wipes them.
+    // Telegram-like: @id is optional — clearing the field removes it.
+    if (username.isNotEmpty && !RegExp(r'^[a-z0-9_]{3,30}$').hasMatch(username)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(isFa ? 'آیدی باید ۳ تا ۳۰ کاراکتر (حروف انگلیسی، عدد، _) باشد' : 'Username must be 3-30 chars (a-z, 0-9, _)')),
+      );
+      return;
+    }
+    // The bio is always sent (an empty value clears it); name only when it
+    // changed. Username is sent when changed — empty string removes it.
     final body = <String, dynamic>{'bio': _bioCtrl.text.trim()};
     if (name.isNotEmpty && name != user.displayName) body['display_name'] = name;
-    if (username.isNotEmpty && username != user.username) {
-      body['username'] = username;
-    }
+    if (username != (user.username ?? '')) body['username'] = username;
     setState(() => _saving = true);
     try {
       await ref.read(authenticatedSessionProvider).api.put('/users/me', body);
@@ -294,8 +299,9 @@ class _ProfileScreenState extends ConsumerState<ProfileScreen> {
               TextField(
                 controller: _usernameCtrl,
                 decoration: InputDecoration(
-                  labelText: isFa ? 'نام کاربری' : 'Username',
+                  labelText: isFa ? 'آیدی (اختیاری)' : 'Username (optional)',
                   prefixText: '@',
+                  helperText: isFa ? 'خالی بگذارید تا آیدی حذف شود' : 'Leave empty to remove your @id',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),

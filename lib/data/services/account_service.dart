@@ -5,7 +5,7 @@ import '../models/user_model.dart';
 class SavedAccount {
   final String userId;
   final String email;
-  final String username;
+  final String? username;
   final String displayName;
   final String? avatarUrl;
   final String accessToken;
@@ -14,12 +14,15 @@ class SavedAccount {
   SavedAccount({
     required this.userId,
     required this.email,
-    required this.username,
+    this.username,
     required this.displayName,
     this.avatarUrl,
     required this.accessToken,
     required this.refreshToken,
   });
+
+  String get handle =>
+      username != null && username!.isNotEmpty ? '@$username' : email;
 
   Map<String, dynamic> toJson() => {
     'user_id': userId,
@@ -34,7 +37,7 @@ class SavedAccount {
   factory SavedAccount.fromJson(Map<String, dynamic> j) => SavedAccount(
     userId: j['user_id'] as String,
     email: j['email'] as String? ?? '',
-    username: j['username'] as String? ?? '',
+    username: (j['username'] as String?)?.isNotEmpty == true ? j['username'] as String : null,
     displayName: j['display_name'] as String? ?? '',
     avatarUrl: j['avatar_url'] as String?,
     accessToken: j['access_token'] as String,

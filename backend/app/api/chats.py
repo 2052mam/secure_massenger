@@ -107,6 +107,8 @@ def list_chats():
             'pinned_at': utc_iso(m.pinned_at) if m.pinned_at else None,
             'is_archived': bool(m.is_archived),
             'is_muted': m.is_muted,
+            'is_sponsored': bool(getattr(chat, 'is_sponsored', False)),
+            'allow_forwarding': bool(getattr(chat, 'allow_forwarding', True)) if getattr(chat, 'allow_forwarding', True) is not None else True,
             'unread_count': unread,
             'last_message': {
                 'id': last_msg.id if last_msg else None,
@@ -126,8 +128,26 @@ def list_chats():
         return (1 if item['is_pinned'] else 0, item['pinned_at'] or '', activity)
 
     result.sort(key=sort_key, reverse=True)
+    # Sponsored channels are visible to everyone (Telegram-like). They are
+    # returned separately so the app can render a banner/section on top.
+    sponsored = []
+    if not want_archived:
+        for c in Chat.query.filter_by(chat_type='channel', is_deleted=False,
+                                      is_sponsored=True).order_by(
+                Chat.sponsored_at.desc()).limit(20).all():
+            members_count = ChatMember.query.filter_by(chat_id=c.id,
+                                                       is_deleted=False).count()
+            sponsored.append({
+                'id': c.id, 'chat_type': c.chat_type, 'title': c.title,
+                'username': c.username, 'description': c.description,
+                'avatar_url': c.avatar_url, 'is_public': bool(c.is_public),
+                'is_sponsored': True,
+                'sponsored_at': utc_iso(c.sponsored_at) if c.sponsored_at else None,
+                'members_count': members_count,
+            })
     return jsonify({
         'chats': result,
+        'sponsored': sponsored,
         'archived': {
             'total': archived_total,
             'unread': archived_unread,
@@ -136,6 +156,60 @@ def list_chats():
         'archive_locked': bool(user.has_archive_pin) and not unlocked,
         'has_archive_pin': user.has_archive_pin,
     }), 200
+
+
+@chats_bp.route('/sponsored', methods=['GET'])
+@jwt_required()
+def list_sponsored():
+    """Sponsored channels visible to everyone (set by the general admin)."""
+    channels = Chat.query.filter_by(chat_type='channel', is_deleted=False,
+                                    is_sponsored=True).order_by(
+        Chat.sponsored_at.desc()).all()
+    out = []
+    for c in channels:
+        members_count = ChatMember.query.filter_by(chat_id=c.id,
+                                                   is_deleted=False).count()
+        out.append({
+            'id': c.id, 'chat_type': c.chat_type, 'title': c.title,
+            'username': c.username, 'description': c.description,
+            'avatar_url': c.avatar_url, 'is_public': bool(c.is_public),
+            'is_sponsored': True,
+            'sponsored_at': utc_iso(c.sponsored_at) if c.sponsored_at else None,
+            'members_count': members_count,
+        })
+    return jsonify({'channels': out}), 200
+
+
+@chats_bp.route('/<chat_id>/forwarding', methods=['POST'])
+@jwt_required()
+def toggle_forwarding(chat_id):
+    """Block / allow forwarding from a group/channel (Telegram-like).
+
+    Owner or admin with manage rights can toggle. Private chats use the
+    per-user privacy switch instead (see /users/me allow_forwarding).
+    """
+    user_id = get_jwt_identity()
+    chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
+    if not chat:
+        return jsonify({'error': 'چت یافت نشد'}), 404
+    if chat.chat_type not in ('group', 'channel'):
+        return jsonify({'error': 'فقط گروه و کانال این تنظیم را دارند'}), 400
+    member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id,
+                                        is_deleted=False).first()
+    if not member or member.role not in ('owner', 'admin'):
+        return jsonify({'error': 'فقط مدیر می‌تواند این تنظیم را تغییر دهد'}), 403
+    if member.role != 'owner' and not can(chat, user_id, 'manage_permissions'):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    data = request.get_json() or {}
+    value = data.get('allow_forwarding')
+    if type(value) is not bool:
+        return jsonify({'error': 'allow_forwarding must be boolean'}), 400
+    chat.allow_forwarding = value
+    db.session.add(AuditLog(actor_id=user_id, action='toggle_forwarding',
+                            entity_type='chat', entity_id=chat_id,
+                            ip_address=get_client_ip()))
+    db.session.commit()
+    return jsonify({'ok': True, 'allow_forwarding': chat.allow_forwarding}), 200
 
 
 @chats_bp.route('/<chat_id>/archive', methods=['POST'])
@@ -813,6 +887,8 @@ def get_chat_info(chat_id):
         'members_count': members_count,
         'online_count': online_count,
         'hide_members': bool(chat.hide_members),
+        'allow_forwarding': bool(getattr(chat, 'allow_forwarding', True)) if getattr(chat, 'allow_forwarding', True) is not None else True,
+        'is_sponsored': bool(getattr(chat, 'is_sponsored', False)),
         'is_suspended': bool(chat.is_suspended),
         'suspension_reason': chat.suspension_reason,
         'suspended_at': utc_iso(chat.suspended_at) if chat.suspended_at else None,
@@ -919,7 +995,9 @@ def get_visibility(chat_id):
     member = ChatMember.query.filter_by(chat_id=chat_id, user_id=user_id, is_deleted=False).first()
     if not member:
         return jsonify({'error': 'دسترسی ندارید'}), 403
-    return jsonify({'hide_members': bool(chat.hide_members), 'is_suspended': bool(chat.is_suspended), 'is_closed': bool(chat.is_closed)}), 200
+    return jsonify({'hide_members': bool(chat.hide_members), 'is_suspended': bool(chat.is_suspended), 'is_closed': bool(chat.is_closed),
+                    'allow_forwarding': bool(getattr(chat, 'allow_forwarding', True)) if getattr(chat, 'allow_forwarding', True) is not None else True,
+                    'is_sponsored': bool(getattr(chat, 'is_sponsored', False))}), 200
 
 
 @chats_bp.route('/<chat_id>/invite-link', methods=['GET'])
@@ -1090,10 +1168,13 @@ def get_shared_media(chat_id):
         elif m_type == 'files':
             query = query.filter(Message.message_type == 'file')
         elif m_type == 'voice':
-            query = query.filter(Message.message_type.in_(['voice', 'audio']))
+            query = query.filter(Message.message_type.in_(['voice', 'audio', 'music']))
+        elif m_type == 'music':
+            query = query.filter(Message.message_type.in_(['audio', 'music']))
         else:
             query = query.filter(Message.message_type == m_type)
 
+    # Location messages have no media; include them when type=all via second query.
     messages = query.order_by(Message.created_at.desc()).limit(200).all()
     serialized = serialize_messages(messages, user_id)
 
@@ -1108,15 +1189,24 @@ def get_shared_media(chat_id):
             item['original_name'] = mf.original_name
             item['file_size'] = mf.file_size
             item['mime_type'] = mf.mime_type
+            item['duration'] = mf.duration
+            if not item.get('audio_title') and getattr(mf, 'title', None):
+                item['audio_title'] = mf.title
+            if not item.get('audio_artist') and getattr(mf, 'artist', None):
+                item['audio_artist'] = mf.artist
+            if not item.get('audio_duration') and mf.duration:
+                item['audio_duration'] = mf.duration
 
     media_items = [m for m in serialized if m['message_type'] in ('image', 'video')]
     file_items = [m for m in serialized if m['message_type'] == 'file']
-    voice_items = [m for m in serialized if m['message_type'] in ('voice', 'audio')]
+    voice_items = [m for m in serialized if m['message_type'] in ('voice', 'audio', 'music')]
+    music_items = [m for m in serialized if m['message_type'] in ('audio', 'music')]
 
     return jsonify({
         'media': media_items,
         'files': file_items,
         'voice': voice_items,
+        'music': music_items,
         'all': serialized,
     }), 200
 

@@ -30,6 +30,28 @@ class Message(db.Model):
     # Scheduled Message
     is_scheduled = db.Column(db.Boolean, default=False, nullable=False, index=True)
     scheduled_at = db.Column(db.DateTime, nullable=True, index=True)
+
+    # --- Encrypted message mode (password-protected, spoiler-like) ---
+    # content stores ciphertext (client-side encrypted); server never sees plaintext.
+    is_encrypted = db.Column(db.Boolean, default=False, nullable=False, server_default=db.false())
+    encryption_hint = db.Column(db.String(200), nullable=True)
+
+    # --- Secure (secret) chat mode: separate black-theme page, no forward/download ---
+    is_secure = db.Column(db.Boolean, default=False, nullable=False, server_default=db.false(), index=True)
+
+    # --- Location messages (static + live via polling) ---
+    latitude = db.Column(db.Float, nullable=True)
+    longitude = db.Column(db.Float, nullable=True)
+    location_title = db.Column(db.String(200), nullable=True)
+    live_until = db.Column(db.DateTime, nullable=True)
+
+    # --- Music / audio messages (internal player like Telegram) ---
+    audio_title = db.Column(db.String(200), nullable=True)
+    audio_artist = db.Column(db.String(200), nullable=True)
+    audio_duration = db.Column(db.Float, nullable=True)
+
+    # --- Video editor: muted videos play silently on every client ---
+    is_muted = db.Column(db.Boolean, default=False, nullable=False, server_default=db.false())
     
     # Soft Delete
     is_deleted = db.Column(db.Boolean, default=False, index=True)

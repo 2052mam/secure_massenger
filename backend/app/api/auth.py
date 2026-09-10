@@ -21,11 +21,19 @@ def register():
     data = request.get_json() or {}
     email = (data.get('email') or '').strip().lower()
     password = data.get('password') or ''
-    username = (data.get('username') or '').strip().lower()
+    # Telegram-like: username (@id) is OPTIONAL at registration and can be
+    # set / changed / removed later from profile settings.
+    username_raw = (data.get('username') or '').strip().lower()
+    username = username_raw or None
     display_name = (data.get('display_name') or '').strip()
     device_info = data.get('device_info') or {}
+    terms_version = data.get('terms_version', 0)
+    try:
+        terms_version = int(terms_version or 0)
+    except (TypeError, ValueError):
+        terms_version = 0
 
-    if not email or not password or not username or not display_name:
+    if not email or not password or not display_name:
         return jsonify({'error': 'تمام فیلدها الزامی هستند'}), 400
 
     if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email):
@@ -34,14 +42,19 @@ def register():
     if len(password) < 8:
         return jsonify({'error': 'رمز عبور باید حداقل ۸ کاراکتر باشد'}), 400
 
-    if not re.match(r'^[a-z0-9_]{3,30}$', username):
-        return jsonify({'error': 'نام کاربری فقط حروف کوچک، عدد و _ (۳ تا ۳۰ کاراکتر)'}), 400
+    if username is not None:
+        if not re.match(r'^[a-z0-9_]{3,30}$', username):
+            return jsonify({'error': 'نام کاربری فقط حروف کوچک، عدد و _ (۳ تا ۳۰ کاراکتر)'}), 400
 
     if User.query.filter_by(email=email, is_deleted=False).first():
         return jsonify({'error': 'این ایمیل قبلاً ثبت شده'}), 409
 
-    if User.query.filter_by(username=username, is_deleted=False).first():
+    if username is not None and User.query.filter_by(username=username, is_deleted=False).first():
         return jsonify({'error': 'این نام کاربری قبلاً گرفته شده'}), 409
+
+    # Rules acceptance is enforced in the app UI (scroll-to-accept dialog).
+    # The API records it when provided but stays compatible with old clients.
+    terms_accepted = bool(data.get('terms_accepted'))
 
     fingerprint = create_device_fingerprint(device_info)
     mac = device_info.get('mac_address')
@@ -59,6 +72,8 @@ def register():
         email=email,
         username=username,
         display_name=display_name,
+        terms_version=(terms_version or 1) if terms_accepted else 0,
+        terms_accepted_at=datetime.utcnow() if terms_accepted else None,
     )
     user.set_password(password)
     secret = user.generate_totp_secret()

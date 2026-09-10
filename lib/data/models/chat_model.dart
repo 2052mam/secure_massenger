@@ -13,6 +13,8 @@ class ChatModel extends Equatable {
   final DateTime? pinnedAt;
   final bool isArchived;
   final bool isMuted;
+  final bool isSponsored;
+  final bool allowForwarding;
   final int slowModeDelay;
   final int unreadCount;
   final LastMessageModel? lastMessage;
@@ -29,6 +31,8 @@ class ChatModel extends Equatable {
     this.pinnedAt,
     this.isArchived = false,
     this.isMuted = false,
+    this.isSponsored = false,
+    this.allowForwarding = true,
     this.slowModeDelay = 0,
     this.unreadCount = 0,
     this.lastMessage,
@@ -47,6 +51,8 @@ class ChatModel extends Equatable {
       pinnedAt: parseApiDateTime(json['pinned_at'] as String?),
       isArchived: json['is_archived'] as bool? ?? false,
       isMuted: json['is_muted'] as bool? ?? false,
+      isSponsored: json['is_sponsored'] as bool? ?? false,
+      allowForwarding: json['allow_forwarding'] as bool? ?? true,
       slowModeDelay: json['slow_mode_delay'] as int? ?? 0,
       unreadCount: json['unread_count'] as int? ?? 0,
       lastMessage: json['last_message'] != null
@@ -84,6 +90,8 @@ class ChatModel extends Equatable {
     pinnedAt,
     isArchived,
     isMuted,
+    isSponsored,
+    allowForwarding,
     slowModeDelay,
     unreadCount,
     lastMessage,

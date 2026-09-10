@@ -17,6 +17,8 @@ import '../chat/chat_screen.dart';
 import '../../widgets/chat/chat_labels.dart';
 import '../../widgets/chat/chat_list_actions.dart';
 import '../../widgets/chat/chat_list_tile.dart';
+import '../../widgets/chat/sponsored_banner.dart';
+import '../../widgets/stories/story_bar.dart';
 
 class ChatListScreen extends ConsumerStatefulWidget {
   const ChatListScreen({super.key});
@@ -159,6 +161,8 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
             return Column(
               children: [
                 const _DeviceLoginBanner(),
+                const StoryBar(),
+                if (_selectedFolderId == null) const _SponsoredStrip(),
                 Expanded(
                   child: RefreshIndicator(
                     onRefresh: () => ref.read(chatListProvider.notifier).refresh(),
@@ -531,6 +535,38 @@ class _DeviceLoginBannerState extends State<_DeviceLoginBanner> {
   }
 }
 
+/// Sponsored channels strip (visible to everyone, set by the general admin).
+class _SponsoredStrip extends StatefulWidget {
+  const _SponsoredStrip();
+  @override
+  State<_SponsoredStrip> createState() => _SponsoredStripState();
+}
+
+class _SponsoredStripState extends State<_SponsoredStrip> {
+  List<ChatModel> _channels = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final res = await ApiService().get('/chats/sponsored');
+      if (!mounted) return;
+      final list = (res['channels'] as List? ?? [])
+          .whereType<Map<String, dynamic>>()
+          .map(ChatModel.fromJson)
+          .toList();
+      setState(() => _channels = list);
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) => SponsoredBanner(channels: _channels);
+}
+
 class _EmptyState extends StatelessWidget {
   const _EmptyState({required this.isFa, required this.inFolder});
 
@@ -568,5 +604,8 @@ class _EmptyState extends StatelessWidget {
         ],
       ),
     );
+  }
+}
+;
   }
 }

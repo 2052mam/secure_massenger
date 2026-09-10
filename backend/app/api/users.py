@@ -45,6 +45,10 @@ def update_me():
         if type(data['allow_group_adds']) is not bool:
             return jsonify({'error': 'allow_group_adds must be boolean'}), 400
         user.allow_group_adds = data['allow_group_adds']
+    if 'allow_forwarding' in data:
+        if type(data['allow_forwarding']) is not bool:
+            return jsonify({'error': 'allow_forwarding must be boolean'}), 400
+        user.allow_forwarding = data['allow_forwarding']
     if 'display_name' in data:
         display_name = (data['display_name'] or '').strip()[:100]
         if not display_name:
@@ -59,15 +63,22 @@ def update_me():
         bio = (raw_bio or '').strip()[:500]
         user.bio = bio or None
     if 'username' in data:
-        new_username = (data['username'] or '').strip().lower()
+        # Telegram-like: username is OPTIONAL. Empty string / null removes it.
+        raw = data['username']
+        new_username = (raw or '').strip().lower() if isinstance(raw, str) else ''
+        new_username = new_username or None
+        current = (user.username or '').lower() or None
         # Resending the unchanged username must not fail the whole update.
-        if new_username != (user.username or '').lower():
-            if not re.match(r'^[a-z0-9_]{3,30}$', new_username):
-                return jsonify({'error': 'نام کاربری نامعتبر'}), 400
-            existing = User.query.filter(User.username == new_username, User.id != user.id, User.is_deleted == False).first()
-            if existing:
-                return jsonify({'error': 'نام کاربری قبلاً گرفته شده'}), 409
-            user.username = new_username
+        if new_username != current:
+            if new_username is None:
+                user.username = None
+            else:
+                if not re.match(r'^[a-z0-9_]{3,30}$', new_username):
+                    return jsonify({'error': 'نام کاربری نامعتبر'}), 400
+                existing = User.query.filter(User.username == new_username, User.id != user.id, User.is_deleted == False).first()
+                if existing:
+                    return jsonify({'error': 'نام کاربری قبلاً گرفته شده'}), 409
+                user.username = new_username
     if 'show_last_seen' in data:
         user.show_last_seen = bool(data['show_last_seen'])
     if 'show_profile_photo' in data:
@@ -432,6 +443,42 @@ def search_users():
     } for c in chats]
 
     return jsonify({'users': result_users, 'chats': result_chats}), 200
+
+
+@users_bp.route('/by-username/<username>', methods=['GET'])
+@jwt_required()
+def get_user_by_username(username):
+    """Resolve an @id mention to a user (tap @username in chat → profile/chat)."""
+    handle = (username or '').strip().lstrip('@').lower()
+    if not handle or not re.match(r'^[a-z0-9_]{3,30}$', handle):
+        return jsonify({'error': 'شناسه نامعتبر است'}), 400
+    user = User.query.filter_by(username=handle, is_deleted=False).first()
+    if not user or not user.is_active:
+        return jsonify({'error': 'کاربر یافت نشد'}), 404
+    return jsonify(user.to_dict()), 200
+
+
+@users_bp.route('/me/terms', methods=['POST'])
+@jwt_required()
+def accept_terms():
+    """Record rules acceptance (registration dialog + settings page)."""
+    user_id = get_jwt_identity()
+    user = User.query.filter_by(id=user_id, is_deleted=False).first()
+    if not user:
+        return jsonify({'error': 'کاربر یافت نشد'}), 404
+    data = request.get_json() or {}
+    try:
+        version = int(data.get('terms_version', 1) or 1)
+    except (TypeError, ValueError):
+        version = 1
+    user.terms_version = version
+    user.terms_accepted_at = datetime.utcnow()
+    db.session.add(AuditLog(actor_id=user_id, action='accept_terms',
+                            entity_type='user', entity_id=user_id,
+                            ip_address=get_client_ip()))
+    db.session.commit()
+    return jsonify({'ok': True, 'terms_version': version,
+                    'terms_accepted_at': utc_iso(user.terms_accepted_at)}), 200
 
 
 @users_bp.route('/<user_id>', methods=['GET'])

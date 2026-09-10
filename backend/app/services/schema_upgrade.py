@@ -16,6 +16,9 @@ def upgrade_schema():
             'limited_until': 'DATETIME NULL',
             'limited_reason': 'TEXT NULL',
             'limited_by': 'VARCHAR(36) NULL',
+            'allow_forwarding': 'BOOLEAN NOT NULL DEFAULT 1',
+            'terms_version': 'INTEGER NOT NULL DEFAULT 0',
+            'terms_accepted_at': 'DATETIME NULL',
         },
         'chats': {
             'permissions': 'JSON NULL',
@@ -28,6 +31,10 @@ def upgrade_schema():
             'is_closed': 'BOOLEAN NOT NULL DEFAULT 0',
             'closed_reason': 'TEXT NULL',
             'closed_at': 'DATETIME NULL',
+            'allow_forwarding': 'BOOLEAN NOT NULL DEFAULT 1',
+            'is_sponsored': 'BOOLEAN NOT NULL DEFAULT 0',
+            'sponsored_at': 'DATETIME NULL',
+            'sponsored_by': 'VARCHAR(36) NULL',
         },
         'chat_members': {
             'permissions': 'JSON NULL',
@@ -39,6 +46,20 @@ def upgrade_schema():
             'is_spoiler': 'BOOLEAN NOT NULL DEFAULT 0',
             'is_scheduled': 'BOOLEAN NOT NULL DEFAULT 0',
             'scheduled_at': 'DATETIME NULL',
+            'is_encrypted': 'BOOLEAN NOT NULL DEFAULT 0',
+            'encryption_hint': 'VARCHAR(200) NULL',
+            'is_secure': 'BOOLEAN NOT NULL DEFAULT 0',
+            'latitude': 'FLOAT NULL',
+            'longitude': 'FLOAT NULL',
+            'location_title': 'VARCHAR(200) NULL',
+            'live_until': 'DATETIME NULL',
+            'audio_title': 'VARCHAR(200) NULL',
+            'audio_artist': 'VARCHAR(200) NULL',
+            'audio_duration': 'FLOAT NULL',
+        },
+        'media_files': {
+            'title': 'VARCHAR(200) NULL',
+            'artist': 'VARCHAR(200) NULL',
         },
     }
     with db.engine.begin() as connection:
@@ -59,6 +80,7 @@ def upgrade_schema():
     from app.models.sticker import StickerPack, Sticker  # noqa: F401
     from app.models.gif import SavedGif  # noqa: F401
     from app.models.message import MessageReaction  # ensure exists
+    from app.models.story import Story, StoryView  # noqa: F401
 
     db.metadata.create_all(bind=db.engine)
     # Also ensure specific tables exist individually for older SQLAlchemy metadata
@@ -67,4 +89,5 @@ def upgrade_schema():
         UserPhoto.__table__, SearchHistory.__table__,
         Report.__table__, StickerPack.__table__, Sticker.__table__, SavedGif.__table__,
         MessageReaction.__table__,
+        Story.__table__, StoryView.__table__,
     ])

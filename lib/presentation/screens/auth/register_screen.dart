@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/device_service.dart';
+import '../../../data/services/terms_service.dart';
+import '../../widgets/chat/terms_dialog.dart';
 import 'two_factor_setup_screen.dart';
 
 class RegisterScreen extends ConsumerStatefulWidget {
@@ -21,6 +23,7 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   bool _loading = false;
   bool _obscure = true;
   String? _error;
+  bool _termsAccepted = false;
 
   @override
   void dispose() {
@@ -31,8 +34,17 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
     super.dispose();
   }
 
+  Future<void> _showTerms() async {
+    final accepted = await TermsDialog.show(context, requireAccept: true);
+    if (accepted == true && mounted) setState(() => _termsAccepted = true);
+  }
+
   Future<void> _submit() async {
     if (_loading || !_formKey.currentState!.validate()) return;
+    if (!_termsAccepted) {
+      setState(() => _error = 'برای ثبت‌نام باید قوانین را بخوانید و بپذیرید');
+      return;
+    }
     setState(() {
       _loading = true;
       _error = null;
@@ -40,12 +52,15 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
 
     try {
       final deviceInfo = await DeviceService.getDeviceInfo();
+      final username = _usernameCtrl.text.trim().toLowerCase();
       final res = await ApiService().post('/auth/register', {
         'email': _emailCtrl.text.trim().toLowerCase(),
         'password': _passwordCtrl.text,
-        'username': _usernameCtrl.text.trim().toLowerCase(),
+        if (username.isNotEmpty) 'username': username,
         'display_name': _displayNameCtrl.text.trim(),
         'device_info': deviceInfo,
+        'terms_accepted': true,
+        'terms_version': TermsService.currentVersion,
       });
 
       if (!mounted) return;
@@ -104,13 +119,15 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                 TextFormField(
                   controller: _usernameCtrl,
                   decoration: const InputDecoration(
-                    labelText: 'نام کاربری',
+                    labelText: 'آیدی (اختیاری)',
                     prefixIcon: Icon(Icons.alternate_email),
-                    helperText: 'فقط حروف کوچک، عدد و _',
+                    helperText: 'فقط حروف کوچک، عدد و _ — بعداً هم می‌توانید بسازید',
                   ),
                   validator: (v) {
-                    if (v == null || v.length < 3) return 'حداقل ۳ کاراکتر';
-                    if (!RegExp(r'^[a-z0-9_]+$').hasMatch(v))
+                    final t = (v ?? '').trim();
+                    if (t.isEmpty) return null;
+                    if (t.length < 3 || t.length > 30) return '۳ تا ۳۰ کاراکتر';
+                    if (!RegExp(r'^[a-z0-9_]+$').hasMatch(t))
                       return 'فرمت نامعتبر';
                     return null;
                   },
@@ -144,6 +161,45 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   ),
                   validator: (v) =>
                       (v == null || v.length < 8) ? 'حداقل ۸ کاراکتر' : null,
+                ),
+                const SizedBox(height: 12),
+                InkWell(
+                  onTap: _showTerms,
+                  borderRadius: BorderRadius.circular(12),
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                          color: _termsAccepted ? Colors.green : Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(12),
+                      color: _termsAccepted
+                          ? Colors.green.withValues(alpha: 0.06)
+                          : null,
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          _termsAccepted ? Icons.check_circle : Icons.rule_outlined,
+                          color: _termsAccepted ? Colors.green : Colors.grey,
+                        ),
+                        const SizedBox(width: 10),
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('قوانین و مقررات',
+                                  style: TextStyle(fontWeight: FontWeight.w700)),
+                              Text('برای مطالعه و پذیرش لمس کنید (اسکرول تا انتها)',
+                                  style: TextStyle(fontSize: 11, color: Colors.grey)),
+                            ],
+                          ),
+                        ),
+                        if (_termsAccepted)
+                          const Text('پذیرفته شد',
+                              style: TextStyle(color: Colors.green, fontSize: 12)),
+                      ],
+                    ),
+                  ),
                 ),
                 if (_error != null) ...[
                   const SizedBox(height: 16),

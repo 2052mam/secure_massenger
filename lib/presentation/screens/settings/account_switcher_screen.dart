@@ -122,7 +122,7 @@ class _AccountSwitcherScreenState extends ConsumerState<AccountSwitcherScreen> {
                       token: a.accessToken,
                     ),
                     title: Text(a.displayName),
-                    subtitle: Text('@${a.username}'),
+                    subtitle: Text(a.handle),
                     trailing: IconButton(
                       icon: const Icon(Icons.logout, size: 20),
                       onPressed: _busy ? null : () => _removeAccount(a),

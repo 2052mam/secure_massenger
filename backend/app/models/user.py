@@ -11,7 +11,9 @@ class User(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     password_hash = db.Column(db.String(255), nullable=False)
-    username = db.Column(db.String(50), unique=True, nullable=False, index=True)
+    # Telegram-like: username (@id) is OPTIONAL. NULL means the user has no
+    # public id. Unique only when set (NULLs never collide in MySQL/SQLite).
+    username = db.Column(db.String(50), unique=True, nullable=True, index=True)
     display_name = db.Column(db.String(100), nullable=False)
     bio = db.Column(db.Text, nullable=True)
     avatar_url = db.Column(db.String(500), nullable=True)
@@ -28,6 +30,13 @@ class User(db.Model):
     show_bio = db.Column(db.Boolean, default=True)
     
     allow_group_adds = db.Column(db.Boolean, nullable=False, default=True, server_default=db.true())
+
+    # Telegram-like: block forwarding of my messages (privacy).
+    allow_forwarding = db.Column(db.Boolean, nullable=False, default=True, server_default=db.true())
+
+    # Rules / Terms acceptance (shown during registration + settings).
+    terms_version = db.Column(db.Integer, nullable=False, default=0, server_default='0')
+    terms_accepted_at = db.Column(db.DateTime, nullable=True)
 
     # Optional 4 digit lock for the archived chats folder (hashed, never stored raw)
     archive_pin_hash = db.Column(db.String(255), nullable=True)
@@ -116,11 +125,15 @@ class User(db.Model):
                 'avatar_url': self.avatar_url,
                 'bio': self.bio,
                 'allow_group_adds': self.allow_group_adds,
+                'allow_forwarding': bool(self.allow_forwarding) if self.allow_forwarding is not None else True,
+                'terms_version': self.terms_version or 0,
+                'terms_accepted_at': utc_iso(self.terms_accepted_at) if self.terms_accepted_at else None,
                 'show_last_seen': self.show_last_seen,
                 'show_profile_photo': self.show_profile_photo,
                 'show_bio': self.show_bio,
                 'is_2fa_enabled': self.is_2fa_enabled,
                 'has_archive_pin': self.has_archive_pin,
+                'is_admin': bool(self.is_admin),
             })
         return data
 

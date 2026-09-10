@@ -46,7 +46,7 @@ class SearchHistoryItem extends Equatable {
       user?.displayName ?? chat?.title ?? query ?? '';
 
   String? get subtitle {
-    if (user != null) return '@${user!.username}';
+    if (user != null) return user!.handle;
     if (chat?.username != null) return '@${chat!.username}';
     return query;
   }

@@ -6,6 +6,7 @@ import '../../../data/services/presence_service.dart';
 import 'chat_list_screen.dart';
 import '../search/search_screen.dart';
 import '../settings/settings_screen.dart';
+import '../../widgets/music/mini_music_player.dart';
 
 final shellIndexProvider = StateProvider.autoDispose<int>((ref) {
   ref.watch(authNotifierProvider.select((auth) => auth.valueOrNull?.id));
@@ -59,25 +60,31 @@ class _MainShellState extends ConsumerState<MainShell> {
 
     return Scaffold(
       body: IndexedStack(index: index, children: pages),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: index,
-        onDestinationSelected: (i) =>
-            ref.read(shellIndexProvider.notifier).state = i,
-        destinations: [
-          NavigationDestination(
-            icon: const Icon(Icons.chat_bubble_outline),
-            selectedIcon: const Icon(Icons.chat_bubble),
-            label: isFa ? 'چت‌ها' : 'Chats',
-          ),
-          NavigationDestination(
-            icon: const Icon(Icons.search),
-            selectedIcon: const Icon(Icons.search),
-            label: isFa ? 'جستجو' : 'Search',
-          ),
-          NavigationDestination(
-            icon: const Icon(Icons.settings_outlined),
-            selectedIcon: const Icon(Icons.settings),
-            label: isFa ? 'تنظیمات' : 'Settings',
+      bottomNavigationBar: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const MiniMusicPlayer(),
+          NavigationBar(
+            selectedIndex: index,
+            onDestinationSelected: (i) =>
+                ref.read(shellIndexProvider.notifier).state = i,
+            destinations: [
+              NavigationDestination(
+                icon: const Icon(Icons.chat_bubble_outline),
+                selectedIcon: const Icon(Icons.chat_bubble),
+                label: isFa ? 'چت‌ها' : 'Chats',
+              ),
+              NavigationDestination(
+                icon: const Icon(Icons.search),
+                selectedIcon: const Icon(Icons.search),
+                label: isFa ? 'جستجو' : 'Search',
+              ),
+              NavigationDestination(
+                icon: const Icon(Icons.settings_outlined),
+                selectedIcon: const Icon(Icons.settings),
+                label: isFa ? 'تنظیمات' : 'Settings',
+              ),
+            ],
           ),
         ],
       ),

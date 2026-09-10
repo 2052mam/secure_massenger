@@ -327,7 +327,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
                           token: StorageService.getToken(),
                         ),
                         title: Text(u.displayName),
-                        subtitle: Text('@${u.username}'),
+                        subtitle: Text(u.handle),
                         trailing: const Icon(Icons.chat_bubble_outline),
                         onTap: () => _startChat(u),
                       ),

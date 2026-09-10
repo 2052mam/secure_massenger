@@ -15,6 +15,7 @@ import os
 
 from app.services.message_payloads import (
     serialize_messages, user_in_chat, visible_messages,
+    can_forward_message,
 )
 
 messages_bp = Blueprint('messages', __name__)
@@ -66,12 +67,18 @@ def get_client_ip():
 @messages_bp.route('/<chat_id>', methods=['GET'])
 @jwt_required()
 def get_messages(chat_id):
-    """Chronological history, incremental polling and direct reply navigation."""
+    """Chronological history, incremental polling and direct reply navigation.
+
+    ``?secure=1`` returns ONLY the secure-mode (black theme) history, which is
+    kept fully separate from the normal history.
+    """
     user_id = get_jwt_identity()
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
-    dispatch_scheduled_messages(chat_id)
+    secure_only = (request.args.get('secure') or '').strip().lower() in ('1', 'true', 'yes', 'on')
+    if not secure_only:
+        dispatch_scheduled_messages(chat_id)
 
     try:
         limit = max(1, min(int(request.args.get('limit', 50)), 100))
@@ -84,7 +91,7 @@ def get_messages(chat_id):
     if sum(bool(v) for v in (after_id, before_id, from_id)) > 1:
         return jsonify({'error': 'فقط یک نشانگر پیام مجاز است'}), 400
     cursor_id = after_id or before_id or from_id
-    query = visible_messages(user_id).filter(Message.chat_id == chat_id)
+    query = visible_messages(user_id, include_secure=secure_only).filter(Message.chat_id == chat_id)
     if cursor_id:
         # A cursor may have been deleted since the previous poll, but must
         # always belong to this chat. A reply jump must still be visible.
@@ -133,6 +140,13 @@ def send_message():
     reply_to_id = data.get('reply_to_id')
     is_view_once = bool(data.get('is_view_once', False))
     is_spoiler = bool(data.get('is_spoiler', False))
+    # Encrypted (password-protected) messages: content is ciphertext.
+    is_encrypted = bool(data.get('is_encrypted', False))
+    encryption_hint = (data.get('encryption_hint') or '').strip()[:200] or None
+    # Secure-mode messages live in the separate black-theme page.
+    is_secure = bool(data.get('is_secure', False))
+    # Video editor mute flag (plays silently on every client).
+    is_muted = bool(data.get('is_muted', False)) if message_type == 'video' else False
 
     if not chat_id:
         return jsonify({'error': 'chat_id الزامی است'}), 400
@@ -140,19 +154,36 @@ def send_message():
     if not user_in_chat(user_id, chat_id):
         return jsonify({'error': 'دسترسی ندارید'}), 403
 
-    if message_type not in ('text', 'image', 'video', 'voice', 'file', 'sticker', 'gif', 'video_note', 'round_video'):
+    if message_type not in ('text', 'image', 'video', 'voice', 'audio', 'music', 'file',
+                            'sticker', 'gif', 'video_note', 'round_video',
+                            'location', 'live_location'):
         return jsonify({'error': 'Invalid message type'}), 400
+    # Secure + view-once + scheduled never mix (Telegram-like: secure is ephemeral).
+    if is_secure and (is_view_once or data.get('scheduled_at')):
+        return jsonify({'error': 'پیام امن نمی‌تواند زمان‌بندی یا یک‌بارمصرف باشد'}), 400
+    if is_encrypted and is_view_once:
+        return jsonify({'error': 'پیام رمزدار نمی‌تواند یک‌بارمصرف باشد'}), 400
+    if message_type in ('location', 'live_location'):
+        try:
+            lat = float(data.get('latitude'))
+            lng = float(data.get('longitude'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'مختصات لوکیشن نامعتبر است'}), 400
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return jsonify({'error': 'مختصات لوکیشن نامعتبر است'}), 400
     if message_type != 'text' and not media_id:
-        # sticker may be sent via emoji without media in some clients; allow
-        if message_type not in ('sticker', 'gif'):
+        # sticker/gif may be emoji/URL-only; locations need no media.
+        if message_type not in ('sticker', 'gif', 'location', 'live_location'):
             return jsonify({'error': 'Media is required'}), 400
         if message_type in ('sticker', 'gif') and not media_id and not content:
             return jsonify({'error': 'Media is required'}), 400
-    if message_type == 'text' and media_id:
+    if message_type == 'text' and media_id and not is_encrypted:
         return jsonify({'error': 'Text messages cannot contain media'}), 400
 
     if message_type == 'text' and not content:
         return jsonify({'error': 'متن پیام خالی است'}), 400
+    if message_type in ('location', 'live_location') and media_id:
+        return jsonify({'error': 'Location messages cannot contain media'}), 400
 
     chat = Chat.query.filter_by(id=chat_id, is_deleted=False).first()
     if not chat:
@@ -223,7 +254,7 @@ def send_message():
                 return jsonify({'error': 'امکان ارسال پیام وجود ندارد'}), 403
 
     if reply_to_id:
-        original = visible_messages(user_id).filter_by(
+        original = visible_messages(user_id, include_secure=is_secure).filter_by(
             id=reply_to_id, chat_id=chat_id
         ).first()
         if original is None:
@@ -231,6 +262,33 @@ def send_message():
 
     if is_view_once and (message_type != 'image' or not media_id):
         return jsonify({'error': 'مشاهده یک‌باره فقط برای عکس مجاز است'}), 400
+    # Location payload
+    latitude = longitude = None
+    location_title = None
+    live_until = None
+    if message_type in ('location', 'live_location'):
+        latitude = float(data.get('latitude'))
+        longitude = float(data.get('longitude'))
+        location_title = (data.get('location_title') or data.get('title') or '').strip()[:200] or None
+        if message_type == 'live_location':
+            try:
+                minutes = int(data.get('live_minutes', 15))
+            except (TypeError, ValueError):
+                minutes = 15
+            minutes = max(1, min(minutes, 8 * 60))
+            from datetime import timedelta as _td
+            live_until = datetime.utcnow() + _td(minutes=minutes)
+    # Music / audio metadata (Telegram-like internal player)
+    audio_title = (data.get('audio_title') or data.get('title') or '').strip()[:200] or None
+    audio_artist = (data.get('audio_artist') or data.get('artist') or '').strip()[:200] or None
+    audio_duration = None
+    if data.get('audio_duration') is not None:
+        try:
+            audio_duration = float(data.get('audio_duration'))
+            if audio_duration < 0 or audio_duration > 24 * 3600:
+                audio_duration = None
+        except (TypeError, ValueError):
+            audio_duration = None
     if media_id:
         media = MediaFile.query.filter_by(
             id=media_id, uploader_id=user_id, is_deleted=False
@@ -240,14 +298,29 @@ def send_message():
         # Telegram allows sending images/videos/audio as generic files (document).
         # So 'file' accepts any media_type; others must match strictly.
         if message_type != 'file':
-            expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'sticker': 'image', 'gif': 'image', 'video_note': 'video', 'round_video': 'video'}
+            expected = {'image': 'image', 'video': 'video', 'voice': 'audio',
+                        'audio': 'audio', 'music': 'audio',
+                        'sticker': 'image', 'gif': 'image',
+                        'video_note': 'video', 'round_video': 'video'}
             # gif may be image or video; sticker may be image/webp; be lenient
             if message_type in ('gif', 'sticker'):
                 if media.media_type not in ('image', 'video', 'document'):
                     return jsonify({'error': 'Media type does not match the message type'}), 400
+            elif message_type in ('location', 'live_location'):
+                return jsonify({'error': 'Location messages cannot contain media'}), 400
             elif media.media_type != expected.get(message_type):
                 # For video_note / round_video also allow 'video' only
                 return jsonify({'error': 'Media type does not match the message type'}), 400
+            # Backfill music metadata from the uploaded file when missing.
+            if message_type in ('audio', 'music'):
+                if audio_duration is None and media.duration:
+                    audio_duration = media.duration
+                if audio_title is None and getattr(media, 'title', None):
+                    audio_title = media.title
+                if audio_artist is None and getattr(media, 'artist', None):
+                    audio_artist = media.artist
+                if audio_title is None and media.original_name:
+                    audio_title = media.original_name.rsplit('.', 1)[0][:200]
         # else file: accept any media_type (image, video, audio, document) like Telegram
         if is_view_once and media.media_type != 'image':
             return jsonify({'error': 'فایل باید عکس باشد'}), 400
@@ -258,7 +331,7 @@ def send_message():
         ):
             return jsonify({'error': 'این فایل قبلاً در پیام استفاده شده است'}), 400
 
-    is_scheduled = bool(scheduled_dt and scheduled_dt > datetime.utcnow())
+    is_scheduled = bool(scheduled_dt and scheduled_dt > datetime.utcnow() and not is_secure)
     msg = Message(
         chat_id=chat_id,
         sender_id=user_id,
@@ -270,6 +343,17 @@ def send_message():
         is_spoiler=is_spoiler,
         is_scheduled=is_scheduled,
         scheduled_at=scheduled_dt if is_scheduled else None,
+        is_encrypted=is_encrypted,
+        encryption_hint=encryption_hint,
+        is_secure=is_secure,
+        latitude=latitude,
+        longitude=longitude,
+        location_title=location_title,
+        live_until=live_until,
+        audio_title=audio_title,
+        audio_artist=audio_artist,
+        audio_duration=audio_duration,
+        is_muted=is_muted,
     )
     db.session.add(msg)
     db.session.flush()
@@ -375,11 +459,20 @@ def forward_message(message_id):
         return jsonify({'error': 'پیام یافت نشد'}), 404
 
     if not user_in_chat(user_id, original.chat_id) or not visible_messages(user_id).filter_by(id=message_id).first():
-        return jsonify({'error': 'دسترسی به پیام ندارید'}), 403
+        # Secure messages are never visible to the normal forward flow.
+        if original.is_secure or not visible_messages(user_id, include_secure=True).filter_by(id=message_id).first():
+            return jsonify({'error': 'دسترسی به پیام ندارید'}), 403
+        return jsonify({'error': 'پیام امن قابل فوروارد نیست'}), 403
     if original.is_view_once or (original.media_id and Message.query.filter_by(
         media_id=original.media_id, is_view_once=True
     ).first()):
         return jsonify({'error': 'عکس یک‌بارمصرف قابل فوروارد نیست'}), 403
+    # Telegram-like forward restriction (chat-level + user-level + secure).
+    allowed, reason = can_forward_message(original, user_id)
+    if not allowed:
+        return jsonify({'error': reason or 'فوروارد این پیام مجاز نیست'}), 403
+    if original.is_encrypted:
+        return jsonify({'error': 'پیام رمزدار قابل فوروارد نیست (ابتدا رمزگشایی کنید)'}), 403
 
     if not user_in_chat(user_id, target_chat_id):
         return jsonify({'error': 'دسترسی به چت مقصد ندارید'}), 403
@@ -389,7 +482,8 @@ def forward_message(message_id):
         return jsonify({'error': 'Forwarding this message type is not permitted'}), 403
     if original.media_id:
         media = db.session.get(MediaFile, original.media_id)
-        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'file': 'document', 'sticker': 'image', 'gif': 'image', 'video_note': 'video', 'round_video': 'video'}
+        expected = {'image': 'image', 'video': 'video', 'voice': 'audio', 'audio': 'audio', 'music': 'audio',
+                    'file': 'document', 'sticker': 'image', 'gif': 'image', 'video_note': 'video', 'round_video': 'video'}
         # file accepts any, sticker/gif lenient
         valid = False
         if original.message_type == 'file':
@@ -416,6 +510,13 @@ def forward_message(message_id):
         forwarded_from_id=original.id,
         forwarded_from_chat_id=original.chat_id,
         is_spoiler=original.is_spoiler,
+        latitude=original.latitude,
+        longitude=original.longitude,
+        location_title=original.location_title,
+        audio_title=original.audio_title,
+        audio_artist=original.audio_artist,
+        audio_duration=original.audio_duration,
+        is_muted=bool(getattr(original, 'is_muted', False)),
     )
     db.session.add(new_msg)
     db.session.flush()
@@ -811,7 +912,24 @@ def get_message_statuses():
         if rank.get(status.status, 0) > rank[previous]:
             statuses[status.message_id] = status.status
 
-    return jsonify({
+    # Edited + live-location state must also reconcile via polling (edits do
+    # not change created_at, so after_id polling alone would miss them).
+    # 'updated' is only present when non-empty to keep old clients/tests exact-match safe.
+    updated = []
+    for msg in visible:
+        if msg.is_edited or msg.message_type == 'live_location':
+            updated.append({
+                'id': msg.id,
+                'content': msg.content,
+                'is_edited': bool(msg.is_edited),
+                'edited_at': utc_iso(msg.edited_at) if msg.edited_at else None,
+                'is_encrypted': bool(getattr(msg, 'is_encrypted', False)),
+                'encryption_hint': getattr(msg, 'encryption_hint', None),
+                'latitude': getattr(msg, 'latitude', None),
+                'longitude': getattr(msg, 'longitude', None),
+                'live_until': utc_iso(getattr(msg, 'live_until', None)) if getattr(msg, 'live_until', None) else None,
+            })
+    payload = {
         'statuses': statuses,
         'viewed_at': {msg.id: utc_iso(msg.viewed_at) if msg.viewed_at else None
                       for msg in visible if msg.is_view_once},
@@ -821,7 +939,10 @@ def get_message_statuses():
             PinnedMessage.message_id.in_([msg.id for msg in visible]),
             PinnedMessage.is_deleted.is_(False),
         ).all()}),
-    }), 200
+    }
+    if updated:
+        payload['updated'] = updated
+    return jsonify(payload), 200
 
 
 @messages_bp.route('/chat/<chat_id>/scheduled', methods=['GET'])
@@ -870,5 +991,112 @@ def cancel_scheduled_message(message_id):
         return jsonify({'error': 'پیام زمان‌بندی‌شده یافت نشد'}), 404
     msg.is_deleted = True
     msg.deleted_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'ok': True}), 200
+
+
+@messages_bp.route('/<message_id>/edit', methods=['POST', 'PUT'])
+@jwt_required()
+def edit_message(message_id):
+    """Telegram-like message editing (private, group, channel, support).
+
+    Only the sender can edit their own message (channel/group admins edit
+    their own posts). Text + captions are editable; media cannot be swapped.
+    Encrypted messages can be re-sent as new ciphertext with the same flag.
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    msg = Message.query.filter_by(id=message_id, is_deleted=False,
+                                  is_deleted_for_all=False).first()
+    if not msg:
+        return jsonify({'error': 'پیام یافت نشد'}), 404
+    if not user_in_chat(user_id, msg.chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    if msg.sender_id != user_id:
+        return jsonify({'error': 'فقط فرستنده می‌تواند پیام را ویرایش کند'}), 403
+    if msg.is_view_once:
+        return jsonify({'error': 'پیام یک‌بارمصرف قابل ویرایش نیست'}), 400
+    if msg.is_scheduled:
+        return jsonify({'error': 'پیام زمان‌بندی‌شده را لغو و دوباره ارسال کنید'}), 400
+    new_content = data.get('content')
+    if new_content is not None and not isinstance(new_content, str):
+        return jsonify({'error': 'متن نامعتبر است'}), 400
+    if msg.message_type == 'text' and not (new_content or '').strip():
+        return jsonify({'error': 'متن پیام خالی است'}), 400
+    if new_content is not None:
+        msg.content = new_content
+    # Encrypted flag can be refreshed (re-encrypted ciphertext).
+    if 'is_encrypted' in data:
+        msg.is_encrypted = bool(data.get('is_encrypted'))
+    if 'encryption_hint' in data:
+        hint = data.get('encryption_hint')
+        msg.encryption_hint = (hint or '').strip()[:200] or None if isinstance(hint, str) else None
+    msg.is_edited = True
+    msg.edited_at = datetime.utcnow()
+    db.session.add(AuditLog(actor_id=user_id, action='edit_message',
+                            entity_type='message', entity_id=message_id,
+                            ip_address=get_client_ip()))
+    db.session.commit()
+    return jsonify(serialize_messages([msg], user_id)[0]), 200
+
+
+@messages_bp.route('/<message_id>/live-location', methods=['POST'])
+@jwt_required()
+def update_live_location(message_id):
+    """Update a live-location share (polling-based, Telegram-like).
+
+    Only the sender can update while live_until is in the future. Viewers
+    poll the chat history / statuses to see movement.
+    """
+    user_id = get_jwt_identity()
+    data = request.get_json() or {}
+    msg = Message.query.filter_by(id=message_id, is_deleted=False,
+                                  is_deleted_for_all=False).first()
+    if not msg or msg.message_type != 'live_location':
+        return jsonify({'error': 'لوکیشن زنده یافت نشد'}), 404
+    if not user_in_chat(user_id, msg.chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    if msg.sender_id != user_id:
+        return jsonify({'error': 'فقط فرستنده می‌تواند لوکیشن زنده را به‌روزرسانی کند'}), 403
+    if msg.live_until and msg.live_until <= datetime.utcnow():
+        return jsonify({'error': 'اشتراک لوکیشن زنده به پایان رسیده است'}), 410
+    try:
+        lat = float(data.get('latitude'))
+        lng = float(data.get('longitude'))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'مختصات نامعتبر است'}), 400
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return jsonify({'error': 'مختصات نامعتبر است'}), 400
+    msg.latitude = lat
+    msg.longitude = lng
+    if data.get('stop'):
+        from datetime import timedelta as _td
+        msg.live_until = datetime.utcnow() - _td(seconds=1)
+    db.session.commit()
+    return jsonify(serialize_messages([msg], user_id)[0]), 200
+
+
+@messages_bp.route('/chat/<chat_id>/secure/clear', methods=['POST'])
+@jwt_required()
+def clear_secure_history(chat_id):
+    """Erase the secure-mode history (Telegram secret-chat-like).
+
+    Any member can end the secure session: secure messages are soft-deleted
+    for everyone and both sides return to the normal chat page.
+    """
+    user_id = get_jwt_identity()
+    if not user_in_chat(user_id, chat_id):
+        return jsonify({'error': 'دسترسی ندارید'}), 403
+    now = datetime.utcnow()
+    Message.query.filter_by(chat_id=chat_id, is_secure=True,
+                            is_deleted=False).update({
+        'is_deleted': True,
+        'is_deleted_for_all': True,
+        'deleted_at': now,
+        'deleted_by': user_id,
+    }, synchronize_session=False)
+    db.session.add(AuditLog(actor_id=user_id, action='clear_secure_history',
+                            entity_type='chat', entity_id=chat_id,
+                            ip_address=get_client_ip()))
     db.session.commit()
     return jsonify({'ok': True}), 200

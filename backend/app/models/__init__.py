@@ -8,6 +8,7 @@ from app.models.audit import AuditLog
 from app.models.report import Report
 from app.models.sticker import StickerPack, Sticker
 from app.models.gif import SavedGif
+from app.models.story import Story, StoryView
 
 __all__ = [
     'User', 'UserDevice', 'UserSession', 'BlockList',
@@ -15,5 +16,6 @@ __all__ = [
     'ChatFolder', 'ChatFolderItem',
     'Message', 'MessageStatus', 'MessageReaction', 'PinnedMessage', 'MessageHide',
     'MediaFile', 'UserPhoto', 'SearchHistory', 'AuditLog',
-    'Report', 'StickerPack', 'Sticker', 'SavedGif'
+    'Report', 'StickerPack', 'Sticker', 'SavedGif',
+    'Story', 'StoryView'
 ]

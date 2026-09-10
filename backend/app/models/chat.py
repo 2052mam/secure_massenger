@@ -20,6 +20,14 @@ class Chat(db.Model):
     # Telegram-like: admin can hide members list from non-admins
     hide_members = db.Column(db.Boolean, default=False, nullable=False)
 
+    # Telegram-like: block forwarding from this chat (group/channel).
+    allow_forwarding = db.Column(db.Boolean, default=True, nullable=False, server_default=db.true())
+
+    # Sponsored channels (set by the general app admin, visible to everyone).
+    is_sponsored = db.Column(db.Boolean, default=False, nullable=False, server_default=db.false(), index=True)
+    sponsored_at = db.Column(db.DateTime, nullable=True)
+    sponsored_by = db.Column(db.String(36), nullable=True)
+
     # Suspension / closure after reports (Telegram-like)
     is_suspended = db.Column(db.Boolean, default=False, nullable=False)
     suspension_reason = db.Column(db.Text, nullable=True)

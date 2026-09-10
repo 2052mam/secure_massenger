@@ -28,6 +28,9 @@ class VideoPlaybackControls extends StatefulWidget {
   /// pressing play, so the opened route can start playback immediately.
   final VoidCallback? onPlayFullscreen;
 
+  /// Editor-muted videos: volume stays locked at 0 (sender's choice).
+  final bool volumeLocked;
+
   const VideoPlaybackControls({
     super.key,
     required this.controller,
@@ -39,6 +42,7 @@ class VideoPlaybackControls extends StatefulWidget {
     this.autoFullscreenOnPlay = false,
     this.autoPlay = false,
     this.onPlayFullscreen,
+    this.volumeLocked = false,
   });
 
   @override
@@ -188,6 +192,12 @@ class _VideoPlaybackControlsState extends State<VideoPlaybackControls> {
   }
 
   Future<void> _volume() async {
+    if (widget.volumeLocked) {
+      try {
+        await widget.controller.setVolume(0);
+      } catch (_) {}
+      return;
+    }
     try {
       await widget.controller.setVolume(
         widget.controller.value.volume == 0 ? 1 : 0,
