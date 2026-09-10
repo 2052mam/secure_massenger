@@ -22,6 +22,7 @@ import '../../../core/utils/media_utils.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/storage_service.dart';
 import '../../../data/services/voice_service.dart';
+import '../../../data/services/location_service.dart';
 import '../../../core/constants/api_constants.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/chat_list_provider.dart';
@@ -126,6 +127,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   int _slowModeDelay = 0;
   int _slowModeRemaining = 0;
   Timer? _slowModeTimer;
+  // True while this chat has an ongoing (non-erased) secure conversation.
+  bool _hasSecureSession = false;
+  // Live location: id of the message currently being broadcast + its ticker.
+  String? _liveLocationMessageId;
+  DateTime? _liveLocationUntil;
+  Timer? _liveLocationTimer;
 
   bool _can(String right) {
     if (_chatUnavailable) return false;
@@ -181,6 +188,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _loadBackground();
     _loadChatInfo();
     _loadPinned();
+    _checkSecureSession();
   }
 
   Future<void> _loadBackground() async {
@@ -275,6 +283,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     _pollTimer?.cancel();
     _highlightTimer?.cancel();
     _slowModeTimer?.cancel();
+    _liveLocationTimer?.cancel();
     unawaited(_playback.pause());
     _textCtrl.dispose();
     _scrollCtrl.dispose();
@@ -1820,6 +1829,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         _replyTo = null;
         _sending = false;
       });
+      if (picked['is_live'] == true) {
+        _startLiveLocation(
+          msg.id,
+          Duration(minutes: (picked['live_minutes'] as int?) ?? 15),
+        );
+      }
       if (_historyMode) await _loadMessages();
       _scrollToBottom();
       if (mounted) ref.read(chatListProvider.notifier).refresh();
@@ -1828,6 +1843,56 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       setState(() => _sending = false);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(e.toString())));
     }
+  }
+
+  /// Polling-based live location: push our position every 20s until the
+  /// sharing window ends (Telegram behaviour without a realtime socket).
+  void _startLiveLocation(String messageId, Duration duration) {
+    _liveLocationTimer?.cancel();
+    _liveLocationMessageId = messageId;
+    _liveLocationUntil = DateTime.now().add(duration);
+    if (mounted) setState(() {});
+    _liveLocationTimer =
+        Timer.periodic(const Duration(seconds: 20), (_) => _pushLiveLocation());
+    _pushLiveLocation();
+  }
+
+  Future<void> _pushLiveLocation() async {
+    final id = _liveLocationMessageId;
+    final until = _liveLocationUntil;
+    if (id == null || until == null) return;
+    if (DateTime.now().isAfter(until)) {
+      _stopLiveLocation();
+      return;
+    }
+    final result = await LocationService.current(
+      timeout: const Duration(seconds: 12),
+    );
+    if (!mounted || !result.isSuccess || _liveLocationMessageId != id) return;
+    try {
+      final res = await _api.post('/messages/$id/live-location', {
+        'latitude': result.position!.latitude,
+        'longitude': result.position!.longitude,
+      });
+      if (!mounted) return;
+      setState(() => _mergeMessages([MessageModel.fromJson(res)]));
+    } catch (_) {
+      // A transient failure must not kill the share; the next tick retries.
+    }
+  }
+
+  Future<void> _stopLiveLocation({bool notifyServer = true}) async {
+    final id = _liveLocationMessageId;
+    _liveLocationTimer?.cancel();
+    _liveLocationTimer = null;
+    _liveLocationMessageId = null;
+    _liveLocationUntil = null;
+    if (mounted) setState(() {});
+    if (id == null || !notifyServer) return;
+    try {
+      final res = await _api.post('/messages/$id/live-location', {'stop': true});
+      if (mounted) setState(() => _mergeMessages([MessageModel.fromJson(res)]));
+    } catch (_) {}
   }
 
   Future<void> _sendEncryptedText() async {
@@ -1884,6 +1949,22 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
+  /// Whether this chat currently has a live secure conversation, so the menu
+  /// can offer "continue" instead of "start". Leaving the secure page no
+  /// longer erases it, so it can be resumed at any time.
+  Future<void> _checkSecureSession() async {
+    try {
+      final res = await _api.get(
+        '/messages/${widget.chatId}',
+        query: const {'secure': '1', 'limit': '1'},
+      );
+      final has = (res['messages'] as List? ?? []).isNotEmpty;
+      if (mounted && has != _hasSecureSession) {
+        setState(() => _hasSecureSession = has);
+      }
+    } catch (_) {}
+  }
+
   Future<void> _openSecureChat() async {
     await _playback.pause();
     if (!mounted) return;
@@ -1892,7 +1973,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         builder: (_) => SecureChatScreen(chatId: widget.chatId, title: _chatTitle ?? widget.title),
       ),
     );
-    if (mounted) _refreshMessageStatuses();
+    if (!mounted) return;
+    _refreshMessageStatuses();
+    // The secure session may have been erased while we were inside it.
+    _checkSecureSession();
   }
 
   void _showAttachMenu() {
@@ -2224,8 +2308,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 ),
                 ListTile(
                   leading: const Icon(Icons.shield_outlined, color: Colors.green),
-                  title: const Text('گفتگوی امن'),
-                  subtitle: const Text('صفحه مشکی جدا • ضد اسکرین‌شات • بدون فوروارد و دانلود', style: TextStyle(fontSize: 11, color: Colors.grey)),
+                  title: Text(_hasSecureSession ? 'ادامه گفتگوی امن' : 'گفتگوی امن'),
+                  subtitle: Text(
+                    _hasSecureSession
+                        ? 'گفتگوی امن باز است • برای ادامه ضربه بزنید'
+                        : 'صفحه مشکی جدا • ضد اسکرین‌شات • بدون فوروارد و دانلود',
+                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
                   onTap: () { Navigator.pop(ctx); _openSecureChat(); },
                 ),
                 ListTile(leading: const Icon(Icons.schedule), title: const Text('پیام‌های زمان‌بندی‌شده'), onTap: () { Navigator.pop(ctx); _openScheduledSheet(); }),
@@ -2436,6 +2525,28 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           false,
                         )
                       : null,
+                ),
+              if (_liveLocationMessageId != null)
+                Container(
+                  width: double.infinity,
+                  color: Colors.green.withValues(alpha: 0.12),
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  child: Row(children: [
+                    const Icon(Icons.share_location, color: Colors.green, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _liveLocationUntil != null
+                            ? 'موقعیت زنده تا ${_liveLocationUntil!.hour.toString().padLeft(2, '0')}:${_liveLocationUntil!.minute.toString().padLeft(2, '0')} به‌اشتراک گذاشته می‌شود'
+                            : 'موقعیت زنده در حال اشتراک است',
+                        style: const TextStyle(color: Colors.green, fontSize: 11, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _stopLiveLocation,
+                      child: const Text('توقف', style: TextStyle(color: Colors.red, fontSize: 12)),
+                    ),
+                  ]),
                 ),
               Expanded(
                 child: _loading

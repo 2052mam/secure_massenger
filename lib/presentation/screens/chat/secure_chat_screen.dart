@@ -4,7 +4,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../data/models/message_model.dart';
 import '../../../data/services/api_service.dart';
 import '../../../data/services/screen_privacy_service.dart';
-import '../../../data/services/storage_service.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/chat_list_provider.dart';
 import '../../widgets/chat/message_text.dart';
@@ -14,8 +13,14 @@ import '../../widgets/chat/message_text.dart';
 ///  - FLAG_SECURE blocks screenshots / screen recording (Android).
 ///  - No forward, download/save, copy or share actions exist.
 ///  - Media is rendered from memory only (no disk cache).
-/// On exit the in-memory session is erased and the previous (old) chat
-/// screen underneath is restored untouched.
+///
+/// Leaving is NOT the same as ending the session (Telegram secret-chat
+/// behaviour):
+///  - Back / "minimise" simply returns to the normal chat. The secure
+///    conversation stays alive, so you can talk to other people normally and
+///    come back to it whenever you want.
+///  - "End & erase" is an explicit, destructive action that wipes the secure
+///    history for both sides.
 class SecureChatScreen extends ConsumerStatefulWidget {
   final String chatId;
   final String title;
@@ -31,10 +36,14 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
   final _scrollCtrl = ScrollController();
   final _inputCtrl = TextEditingController();
   bool _loading = true;
+  bool _sending = false;
   String? _error;
   String? _currentUserId;
   Timer? _pollTimer;
   Future<void> Function()? _releasePrivacy;
+
+  /// Secure history is a separate stream on the backend (`?secure=1`).
+  static const _secureQuery = {'secure': '1'};
 
   @override
   void initState() {
@@ -58,26 +67,30 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
     _pollTimer?.cancel();
     _scrollCtrl.dispose();
     _inputCtrl.dispose();
-    // Erase the secure session from memory; releasing the privacy lease
-    // restores the previous screen state (the old chat underneath).
+    // Drop the decrypted copy from memory and release FLAG_SECURE. The
+    // conversation itself is untouched — only this page's cache is cleared.
     _messages.clear();
     _releasePrivacy?.call();
     super.dispose();
   }
 
-  Future<void> _load() async {
-    try {
-      final res = await _api.get('/messages/${widget.chatId}');
-      if (!mounted) return;
-      final list = (res['messages'] as List? ?? [])
+  List<MessageModel> _parse(Map<String, dynamic> res) =>
+      (res['messages'] as List? ?? [])
           .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
           .toList()
         ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+
+  Future<void> _load() async {
+    try {
+      final res = await _api.get('/messages/${widget.chatId}', query: _secureQuery);
+      if (!mounted) return;
+      final list = _parse(res);
       setState(() {
         _messages
           ..clear()
           ..addAll(list);
         _loading = false;
+        _error = null;
       });
       _scrollToBottom();
       _markRead();
@@ -89,14 +102,25 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
   Future<void> _poll() async {
     if (!mounted || _loading) return;
     try {
-      final res = await _api.get('/messages/${widget.chatId}');
+      final res = await _api.get('/messages/${widget.chatId}', query: _secureQuery);
       if (!mounted) return;
-      final list = (res['messages'] as List? ?? [])
-          .map((e) => MessageModel.fromJson(e as Map<String, dynamic>))
-          .toList()
-        ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+      final list = _parse(res);
       final known = _messages.map((m) => m.id).toSet();
       final fresh = list.where((m) => !known.contains(m.id)).toList();
+      // The peer may have ended the session. Detect that only from an EMPTY
+      // response: the endpoint returns a limited page, so "missing from this
+      // page" does not mean "deleted" once history grows past one page.
+      final erasedRemotely = list.isEmpty && _messages.isNotEmpty;
+      if (erasedRemotely) {
+        setState(_messages.clear);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+                content: Text('گفتگوی امن توسط طرف مقابل پاک شد')),
+          );
+        }
+        return;
+      }
       if (fresh.isNotEmpty) {
         setState(() => _messages.addAll(fresh));
         _scrollToBottom();
@@ -122,8 +146,9 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
 
   Future<void> _send() async {
     final text = _inputCtrl.text.trim();
-    if (text.isEmpty) return;
+    if (text.isEmpty || _sending) return;
     _inputCtrl.clear();
+    setState(() => _sending = true);
     try {
       // POST /messages/ returns the created message object directly.
       final res = await _api.post('/messages/', {
@@ -135,13 +160,20 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
       if (!mounted) return;
       try {
         final msg = MessageModel.fromJson(res);
-        setState(() => _messages.add(msg));
+        setState(() {
+          _messages.add(msg);
+          _sending = false;
+        });
         _scrollToBottom();
       } catch (_) {
+        setState(() => _sending = false);
         await _poll();
       }
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      if (mounted) {
+        setState(() => _sending = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      }
     }
   }
 
@@ -184,8 +216,10 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
               child: Row(children: [
                 Icon(Icons.shield_outlined, color: Colors.greenAccent, size: 18),
                 SizedBox(width: 8),
-                Text('حالت امن: فوروارد، کپی و دانلود غیرفعال است',
-                    style: TextStyle(color: Colors.white70, fontSize: 12)),
+                Expanded(
+                  child: Text('حالت امن: فوروارد، کپی و دانلود غیرفعال است',
+                      style: TextStyle(color: Colors.white70, fontSize: 12)),
+                ),
               ]),
             ),
             ListTile(
@@ -202,18 +236,26 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
     );
   }
 
-  Future<void> _endSession() async {
+  /// Leave without destroying anything (the common case).
+  void _minimise() {
+    if (mounted) Navigator.pop(context);
+  }
+
+  /// Explicitly end the secure session and erase it for both sides.
+  Future<void> _endAndErase() async {
     final erase = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: Colors.grey.shade900,
-        title: const Text('پایان گفتگوی امن', style: TextStyle(color: Colors.white)),
+        title: const Text('پایان و پاک‌سازی گفتگوی امن',
+            style: TextStyle(color: Colors.white)),
         content: const Text(
-          'نشست امن از حافظه پاک می‌شود و به گفتگوی عادی برمی‌گردید. گفتگوی قبلی دست‌نخورده باقی می‌ماند.',
+          'تمام پیام‌های این گفتگوی امن برای هر دو طرف حذف می‌شود و قابل بازیابی نیست. '
+          'گفتگوی عادی شما دست‌نخورده باقی می‌ماند.',
           style: TextStyle(color: Colors.white70),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('ماندن')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('لغو')),
           FilledButton(
             style: FilledButton.styleFrom(backgroundColor: Colors.red),
             onPressed: () => Navigator.pop(ctx, true),
@@ -222,11 +264,74 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
         ],
       ),
     );
-    if (erase == true && mounted) {
-      // Erase in-memory session, release FLAG_SECURE, restore old chat.
-      setState(_messages.clear);
-      Navigator.pop(context);
+    if (erase != true || !mounted) return;
+    try {
+      await _api.post('/messages/chat/${widget.chatId}/secure/clear', {});
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('پاک‌سازی ناموفق: $e')));
+      }
+      return;
     }
+    if (!mounted) return;
+    setState(_messages.clear);
+    if (mounted) ref.read(chatListProvider.notifier).refresh();
+    if (mounted) Navigator.pop(context);
+  }
+
+  /// Back button: leave the session running, exactly like closing a tab.
+  Future<void> _onBack() async {
+    if (_messages.isEmpty) {
+      _minimise();
+      return;
+    }
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.grey.shade900,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+              child: Text(
+                'از گفتگوی امن خارج می‌شوید',
+                style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.chevron_left, color: Colors.greenAccent),
+              title: const Text('بازگشت به گفتگوی عادی',
+                  style: TextStyle(color: Colors.white)),
+              subtitle: const Text(
+                'گفتگوی امن باز می‌ماند و هر وقت خواستید برمی‌گردید',
+                style: TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+              onTap: () => Navigator.pop(ctx, 'keep'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_forever, color: Colors.red),
+              title: const Text('پایان و پاک‌سازی کامل',
+                  style: TextStyle(color: Colors.white)),
+              subtitle: const Text(
+                'همه پیام‌های امن برای هر دو طرف حذف می‌شود',
+                style: TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+              onTap: () => Navigator.pop(ctx, 'erase'),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'erase') {
+      await _endAndErase();
+    } else if (action == 'keep') {
+      _minimise();
+    }
+    // Dismissing the sheet keeps the user in the secure chat.
   }
 
   @override
@@ -234,7 +339,7 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _endSession();
+        if (!didPop) _onBack();
       },
       child: Scaffold(
         backgroundColor: Colors.black,
@@ -243,7 +348,8 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
           foregroundColor: Colors.white,
           leading: IconButton(
             icon: const Icon(Icons.arrow_back),
-            onPressed: _endSession,
+            tooltip: 'بازگشت به گفتگوی عادی',
+            onPressed: _onBack,
           ),
           title: Row(children: [
             const Icon(Icons.lock, color: Colors.greenAccent, size: 18),
@@ -264,9 +370,9 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
           ]),
           actions: [
             IconButton(
-              tooltip: 'پایان گفتگوی امن',
-              icon: const Icon(Icons.exit_to_app, color: Colors.redAccent),
-              onPressed: _endSession,
+              tooltip: 'پایان و پاک‌سازی گفتگوی امن',
+              icon: const Icon(Icons.delete_forever, color: Colors.redAccent),
+              onPressed: _endAndErase,
             ),
           ],
         ),
@@ -301,8 +407,14 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
                           )
                         : _messages.isEmpty
                             ? const Center(
-                                child: Text('پیامی نیست',
-                                    style: TextStyle(color: Colors.white38)),
+                                child: Padding(
+                                  padding: EdgeInsets.all(24),
+                                  child: Text(
+                                    'گفتگوی امن خالی است.\nپیام‌های اینجا جدا از گفتگوی عادی ذخیره می‌شوند.',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(color: Colors.white38),
+                                  ),
+                                ),
                               )
                             : ListView.builder(
                                 controller: _scrollCtrl,
@@ -343,8 +455,15 @@ class _SecureChatScreenState extends ConsumerState<SecureChatScreen> {
                   CircleAvatar(
                     backgroundColor: Colors.greenAccent,
                     child: IconButton(
-                      icon: const Icon(Icons.send, color: Colors.black),
-                      onPressed: _send,
+                      icon: _sending
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.black),
+                            )
+                          : const Icon(Icons.send, color: Colors.black),
+                      onPressed: _sending ? null : _send,
                     ),
                   ),
                 ]),

@@ -50,8 +50,36 @@ class AuthNotifier extends StateNotifier<AsyncValue<UserModel?>> {
   Future<void> checkSession() async {
     final generation = ++_sessionGeneration;
     final previous = state.valueOrNull;
-    final token = StorageService.getToken();
+    var token = StorageService.getToken();
     if (token == null || token.isEmpty) {
+      // No active token, but the device may still hold a valid saved account
+      // (e.g. after an "add account" flow was cancelled). Restoring it keeps
+      // the user out of the login screen they already passed once.
+      var saved = await AccountService.getActive();
+      if (saved == null) {
+        final all = await AccountService.list();
+        if (all.isNotEmpty) saved = all.last;
+      }
+      if (saved != null) {
+        try {
+          final session = await _loadSession(
+            saved.accessToken,
+            saved.refreshToken,
+          );
+          if (!_isCurrent(generation)) return;
+          await _saveSession(
+            session.user,
+            session.accessToken,
+            saved.refreshToken,
+            generation,
+          );
+          return;
+        } catch (_) {
+          // Saved session is dead — drop it and fall through to signed-out.
+          await AccountService.remove(saved.userId);
+        }
+      }
+      if (!_isCurrent(generation)) return;
       ApiService().setToken(null);
       state = const AsyncValue.data(null);
       return;
@@ -160,7 +188,7 @@ class AuthNotifier extends StateNotifier<AsyncValue<UserModel?>> {
 
   Future<void> logout() => _logout(keepAccounts: false);
 
-  /// Add-account returns to the app's auth-aware root, without removing saved
-  /// accounts or pushing a standalone LoginScreen over/replacing that root.
+  /// Sign out of the active account but keep it in the saved-accounts list, so
+  /// it can be resumed from the login screen without retyping credentials.
   Future<void> logoutKeepAccounts() => _logout(keepAccounts: true);
 }

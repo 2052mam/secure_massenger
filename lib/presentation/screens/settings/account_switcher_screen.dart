@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../data/services/account_service.dart';
 import '../../providers/auth_provider.dart';
 import '../../providers/locale_provider.dart';
+import '../auth/login_screen.dart';
 import '../home/main_shell.dart';
 import '../../widgets/chat/chat_avatar.dart';
 
@@ -61,19 +62,16 @@ class _AccountSwitcherScreenState extends ConsumerState<AccountSwitcherScreen> {
 
   Future<void> _addAccount() async {
     if (_busy) return;
-    setState(() => _busy = true);
-    try {
-      // Do not replace the root route with a standalone LoginScreen. The app
-      // observes this identity change and owns login -> register/2FA -> chats.
-      await ref.read(authNotifierProvider.notifier).logoutKeepAccounts();
-    } catch (error) {
-      if (mounted)
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(error.toString())));
-    } finally {
-      if (mounted) setState(() => _busy = false);
-    }
+    // Adding an account must NOT sign the current one out: previously this
+    // called logoutKeepAccounts(), which destroyed the session and left the
+    // login screen as the only route — so "back" had nowhere to return to.
+    // Now it is an ordinary pushed route that can simply be popped.
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => const LoginScreen(isAddAccount: true),
+      ),
+    );
+    if (mounted) await _load();
   }
 
   Future<void> _removeAccount(SavedAccount account) async {

@@ -3,14 +3,21 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/theme/app_theme.dart';
 import '../../../data/services/api_service.dart';
+import '../../../data/services/account_service.dart';
 import '../../../data/services/device_service.dart';
 import '../../../data/models/user_model.dart';
 import '../../providers/auth_provider.dart';
+import '../../widgets/chat/chat_avatar.dart';
 import 'register_screen.dart';
 import 'two_factor_screen.dart';
 
 class LoginScreen extends ConsumerStatefulWidget {
-  const LoginScreen({super.key});
+  /// True when this screen was pushed by "Add account" while another account
+  /// is still signed in. In that mode the screen is a normal, dismissible
+  /// route: backing out keeps the current account exactly as it was.
+  final bool isAddAccount;
+
+  const LoginScreen({super.key, this.isAddAccount = false});
 
   @override
   ConsumerState<LoginScreen> createState() => _LoginScreenState();
@@ -24,11 +31,31 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
   bool _obscure = true;
   String? _error;
 
+  /// Accounts already stored on the device. Shown when the user lands here
+  /// signed-out so a previous session is always one tap away.
+  List<SavedAccount> _saved = [];
+  bool _switching = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSavedAccounts();
+  }
+
   @override
   void dispose() {
     _emailCtrl.dispose();
     _passwordCtrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadSavedAccounts() async {
+    final list = await AccountService.list();
+    if (!mounted) return;
+    final currentId = ref.read(authNotifierProvider).valueOrNull?.id;
+    setState(() {
+      _saved = list.where((a) => a.userId != currentId).toList();
+    });
   }
 
   Future<void> _submit() async {
@@ -88,9 +115,44 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     // app.dart resets the auth route stack after the identity changes.
   }
 
+  /// Resume a previously signed-in account without retyping credentials.
+  Future<void> _useSavedAccount(SavedAccount account) async {
+    if (_switching) return;
+    setState(() {
+      _switching = true;
+      _error = null;
+    });
+    try {
+      await ref.read(authNotifierProvider.notifier).switchAccount(account);
+      // Identity change rebuilds the app at its chat list; nothing to pop.
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _switching = false;
+        _error = 'ورود با این حساب ممکن نشد. رمز عبور را وارد کنید.';
+      });
+      // A stale saved session should not linger in the list.
+      await AccountService.remove(account.userId);
+      await _loadSavedAccounts();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final canPop = widget.isAddAccount && Navigator.of(context).canPop();
     return Scaffold(
+      appBar: widget.isAddAccount
+          ? AppBar(
+              title: const Text('افزودن حساب'),
+              leading: canPop
+                  ? IconButton(
+                      icon: const Icon(Icons.arrow_back),
+                      tooltip: 'بازگشت به حساب فعلی',
+                      onPressed: () => Navigator.of(context).pop(),
+                    )
+                  : null,
+            )
+          : null,
       body: SafeArea(
         child: Center(
           child: SingleChildScrollView(
@@ -107,10 +169,13 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                   ),
                   const SizedBox(height: 16),
                   Text(
-                    'ورود به SecureMessenger',
+                    widget.isAddAccount
+                        ? 'افزودن حساب جدید'
+                        : 'ورود به SecureMessenger',
                     style: Theme.of(context).textTheme.headlineSmall?.copyWith(
                       fontWeight: FontWeight.bold,
                     ),
+                    textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 8),
                   Text(
@@ -119,7 +184,58 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                       context,
                     ).textTheme.bodyMedium?.copyWith(color: Colors.grey),
                   ),
-                  const SizedBox(height: 32),
+                  const SizedBox(height: 24),
+                  // Signed-out users with saved accounts get a one-tap way
+                  // back into a session they already had.
+                  if (_saved.isNotEmpty) ...[
+                    Align(
+                      alignment: AlignmentDirectional.centerStart,
+                      child: Text(
+                        'ادامه با حساب‌های ذخیره‌شده',
+                        style: Theme.of(context).textTheme.labelLarge,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    ..._saved.map(
+                      (a) => Card(
+                        margin: const EdgeInsets.only(bottom: 8),
+                        child: ListTile(
+                          leading: ChatAvatar(
+                            title: a.displayName,
+                            url: a.avatarUrl,
+                            token: a.accessToken,
+                          ),
+                          title: Text(a.displayName),
+                          subtitle: Text(a.handle),
+                          trailing: _switching
+                              ? const SizedBox(
+                                  width: 18,
+                                  height: 18,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.login, size: 20),
+                          onTap: _switching ? null : () => _useSavedAccount(a),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Expanded(child: Divider()),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Text(
+                            'یا',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ),
+                        const Expanded(child: Divider()),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                  ],
                   TextFormField(
                     controller: _emailCtrl,
                     keyboardType: TextInputType.emailAddress,
@@ -185,6 +301,12 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
                     },
                     child: const Text('حساب ندارید؟ ثبت‌نام کنید'),
                   ),
+                  if (canPop)
+                    TextButton.icon(
+                      onPressed: () => Navigator.of(context).pop(),
+                      icon: const Icon(Icons.arrow_back, size: 18),
+                      label: const Text('انصراف و بازگشت به حساب فعلی'),
+                    ),
                 ],
               ),
             ),

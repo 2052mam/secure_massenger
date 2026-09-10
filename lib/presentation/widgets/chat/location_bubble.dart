@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../../data/models/message_model.dart';
+import '../map/osm_map.dart';
 
-/// Telegram-like location bubble: static preview + open-in-maps.
+/// Telegram-like location bubble: live map preview + open-in-maps.
 /// Live locations show remaining time and update via polling.
 class LocationBubble extends StatelessWidget {
   final MessageModel message;
@@ -16,13 +17,6 @@ class LocationBubble extends StatelessWidget {
     final lat = _lat ?? 0;
     final lng = _lng ?? 0;
     return 'https://www.google.com/maps/search/?api=1&query=$lat,$lng';
-  }
-
-  String get _osmImage {
-    final lat = _lat ?? 0;
-    final lng = _lng ?? 0;
-    // Free OpenStreetMap static preview (no API key needed).
-    return 'https://staticmap.openstreetmap.de/staticmap.php?center=$lat,$lng&zoom=15&size=400x220&maptype=mapnik&markers=$lat,$lng,red-pushpin';
   }
 
   Future<void> _openMaps(BuildContext context) async {
@@ -42,6 +36,7 @@ class LocationBubble extends StatelessWidget {
     final fg = isMine ? Colors.white : theme.colorScheme.onSurface;
     final live = message.isLiveLocation;
     final active = message.isLiveActive;
+    final point = GeoPoint(_lat ?? 0, _lng ?? 0);
     return GestureDetector(
       onTap: () => _openMaps(context),
       child: Container(
@@ -57,49 +52,63 @@ class LocationBubble extends StatelessWidget {
           children: [
             ClipRRect(
               borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
-              child: Stack(
-                children: [
-                  Image.network(
-                    _osmImage,
-                    height: 140,
-                    width: 240,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => Container(
-                      height: 140,
-                      color: Colors.grey.withValues(alpha: 0.2),
-                      child: const Center(child: Icon(Icons.map_outlined, size: 40, color: Colors.grey)),
-                    ),
-                  ),
-                  Positioned.fill(
-                    child: Center(
-                      child: Container(
-                        padding: const EdgeInsets.all(6),
-                        decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                        child: const Icon(Icons.location_on, color: Colors.white, size: 22),
+              child: SizedBox(
+                height: 140,
+                width: 240,
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      // A non-interactive tile map: the bubble itself handles
+                      // the tap, so the map must not swallow gestures.
+                      child: OsmMap(
+                        key: ValueKey('map-${message.id}-${point.latitude}-${point.longitude}'),
+                        initialCenter: point,
+                        initialZoom: 15,
+                        interactive: false,
+                        showZoomButtons: false,
+                        showAttribution: false,
                       ),
                     ),
-                  ),
-                  if (live)
-                    Positioned(
-                      top: 6,
-                      left: 6,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                        decoration: BoxDecoration(
-                          color: active ? Colors.green : Colors.grey,
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          Icon(active ? Icons.live_tv : Icons.timer_off_outlined, size: 12, color: Colors.white),
-                          const SizedBox(width: 4),
-                          Text(
-                            active ? 'زنده' : 'پایان یافته',
-                            style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.w700),
+                    Positioned.fill(
+                      child: Center(
+                        child: Transform.translate(
+                          offset: const Offset(0, -10),
+                          child: Container(
+                            padding: const EdgeInsets.all(6),
+                            decoration: const BoxDecoration(
+                                color: Colors.red, shape: BoxShape.circle),
+                            child: const Icon(Icons.location_on,
+                                color: Colors.white, size: 22),
                           ),
-                        ]),
+                        ),
                       ),
                     ),
-                ],
+                    if (live)
+                      Positioned(
+                        top: 6,
+                        left: 6,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                          decoration: BoxDecoration(
+                            color: active ? Colors.green : Colors.grey,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            Icon(active ? Icons.live_tv : Icons.timer_off_outlined,
+                                size: 12, color: Colors.white),
+                            const SizedBox(width: 4),
+                            Text(
+                              active ? 'زنده' : 'پایان یافته',
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w700),
+                            ),
+                          ]),
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
             Padding(

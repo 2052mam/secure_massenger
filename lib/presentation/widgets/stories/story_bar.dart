@@ -21,6 +21,8 @@ class StoryFeedNotifier extends StateNotifier<AsyncValue<List<StoryGroup>>> {
     if (enabled) {
       refresh();
       _timer = Timer.periodic(const Duration(seconds: 30), (_) => refresh(silent: true));
+    } else {
+      state = const AsyncValue.data([]);
     }
   }
 
@@ -51,54 +53,83 @@ class StoryFeedNotifier extends StateNotifier<AsyncValue<List<StoryGroup>>> {
 }
 
 /// Telegram-like story tray shown on top of the chat list.
+///
+/// Every state (loading / empty / data / error) renders at exactly
+/// [_trayHeight] so the chat list never jumps, and the avatar column is
+/// height-bounded so a large system font cannot overflow the row.
 class StoryBar extends ConsumerWidget {
   const StoryBar({super.key});
+
+  static const double _trayHeight = 104;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final feed = ref.watch(storyFeedProvider);
     final myId = ref.watch(authNotifierProvider).valueOrNull?.id;
-    return feed.when(
-      loading: () => const SizedBox(height: 86, child: Center(child: SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)))),
-      error: (_, __) => const SizedBox.shrink(),
-      data: (groups) {
-        if (groups.isEmpty) {
-          return _EmptyTray(onAdd: () => _openCreate(context, ref));
-        }
-        return Container(
-          height: 96,
-          padding: const EdgeInsets.symmetric(vertical: 8),
-          child: ListView.separated(
-            scrollDirection: Axis.horizontal,
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            itemCount: groups.length + 1,
-            separatorBuilder: (_, __) => const SizedBox(width: 12),
-            itemBuilder: (context, i) {
-              if (i == 0) {
-                final mine = groups.where((g) => g.user.id == myId).toList();
-                final hasMine = mine.isNotEmpty;
-                return _StoryAvatar(
-                  label: 'استوری من',
-                  imageUrl: hasMine ? mine.first.user.avatarUrl : null,
-                  displayName: hasMine ? mine.first.user.displayName : '',
-                  hasUnseen: false,
-                  isMine: true,
-                  onTap: () => _openCreate(context, ref),
-                  onView: hasMine ? () => _openViewer(context, ref, groups, 0) : null,
-                );
-              }
-              final g = groups[i - 1];
-              if (g.user.id == myId) return const SizedBox.shrink();
-              return _StoryAvatar(
-                label: g.user.displayName,
-                imageUrl: g.user.avatarUrl,
-                displayName: g.user.displayName,
-                hasUnseen: g.hasUnseen,
-                onTap: () => _openViewer(context, ref, groups, i - 1),
-              );
-            },
+    final theme = Theme.of(context);
+
+    Widget shell(Widget child) => Container(
+          height: _trayHeight,
+          decoration: BoxDecoration(
+            border: Border(
+              bottom: BorderSide(
+                color: theme.dividerColor.withValues(alpha: 0.4),
+                width: 0.5,
+              ),
+            ),
           ),
+          child: child,
         );
+
+    return feed.when(
+      loading: () => shell(
+        const Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      ),
+      // An error must not remove the tray: the user still needs "add story".
+      error: (_, __) => shell(
+        _StoryStrip(
+          entries: [
+            _StoryEntry.mine(onTap: () => _openCreate(context, ref)),
+          ],
+        ),
+      ),
+      data: (groups) {
+        final mine = groups.where((g) => g.user.id == myId && g.stories.isNotEmpty).toList();
+        final others = groups.where((g) => g.user.id != myId && g.stories.isNotEmpty).toList();
+        final ordered = [...mine, ...others];
+
+        final entries = <_StoryEntry>[
+          _StoryEntry.mine(
+            avatarUrl: mine.isNotEmpty ? mine.first.user.avatarUrl : null,
+            displayName: mine.isNotEmpty ? mine.first.user.displayName : '',
+            hasStory: mine.isNotEmpty,
+            onTap: () => _openCreate(context, ref),
+            onView: mine.isNotEmpty
+                ? () => _openViewer(context, ref, ordered, 0)
+                : null,
+          ),
+          for (var i = 0; i < others.length; i++)
+            _StoryEntry(
+              label: others[i].user.displayName,
+              avatarUrl: others[i].user.avatarUrl,
+              displayName: others[i].user.displayName,
+              hasUnseen: others[i].hasUnseen,
+              onTap: () => _openViewer(
+                context,
+                ref,
+                ordered,
+                mine.isNotEmpty ? i + 1 : i,
+              ),
+            ),
+        ];
+
+        return shell(_StoryStrip(entries: entries));
       },
     );
   }
@@ -110,108 +141,175 @@ class StoryBar extends ConsumerWidget {
     if (created == true) ref.read(storyFeedProvider.notifier).refresh();
   }
 
-  Future<void> _openViewer(BuildContext context, WidgetRef ref, List<StoryGroup> groups, int index) async {
+  Future<void> _openViewer(
+    BuildContext context,
+    WidgetRef ref,
+    List<StoryGroup> groups,
+    int index,
+  ) async {
     final visible = groups.where((g) => g.stories.isNotEmpty).toList();
     if (visible.isEmpty) return;
     await Navigator.of(context).push(
       MaterialPageRoute(
-        builder: (_) => StoryViewerScreen(groups: visible, initialGroupIndex: index.clamp(0, visible.length - 1)),
+        builder: (_) => StoryViewerScreen(
+          groups: visible,
+          initialGroupIndex: index.clamp(0, visible.length - 1),
+        ),
       ),
     );
     ref.read(storyFeedProvider.notifier).refresh(silent: true);
   }
 }
 
-class _EmptyTray extends StatelessWidget {
-  final VoidCallback onAdd;
-  const _EmptyTray({required this.onAdd});
+class _StoryEntry {
+  final String label;
+  final String? avatarUrl;
+  final String displayName;
+  final bool hasUnseen;
+  final bool isMine;
+  final bool hasStory;
+  final VoidCallback onTap;
+  final VoidCallback? onView;
+
+  const _StoryEntry({
+    required this.label,
+    this.avatarUrl,
+    required this.displayName,
+    this.hasUnseen = false,
+    this.isMine = false,
+    this.hasStory = false,
+    required this.onTap,
+    this.onView,
+  });
+
+  factory _StoryEntry.mine({
+    String? avatarUrl,
+    String displayName = '',
+    bool hasStory = false,
+    required VoidCallback onTap,
+    VoidCallback? onView,
+  }) =>
+      _StoryEntry(
+        label: 'استوری من',
+        avatarUrl: avatarUrl,
+        displayName: displayName,
+        isMine: true,
+        hasStory: hasStory,
+        onTap: onTap,
+        onView: onView,
+      );
+}
+
+class _StoryStrip extends StatelessWidget {
+  final List<_StoryEntry> entries;
+  const _StoryStrip({required this.entries});
+
   @override
   Widget build(BuildContext context) {
-    return Container(
-      height: 86,
+    return ListView.separated(
+      scrollDirection: Axis.horizontal,
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: Row(children: [
-        _StoryAvatar(label: 'استوری من', displayName: '', isMine: true, hasUnseen: false, onTap: onAdd),
-        const SizedBox(width: 12),
-        const Expanded(
-          child: Text('هنوز استوری نیست. اولین استوری را منتشر کنید!',
-              style: TextStyle(color: Colors.grey, fontSize: 12)),
-        ),
-      ]),
+      itemCount: entries.length,
+      separatorBuilder: (_, __) => const SizedBox(width: 10),
+      itemBuilder: (context, i) => _StoryAvatar(entry: entries[i]),
     );
   }
 }
 
 class _StoryAvatar extends StatelessWidget {
-  final String label;
-  final String? imageUrl;
-  final String displayName;
-  final bool hasUnseen;
-  final bool isMine;
-  final VoidCallback onTap;
-  final VoidCallback? onView;
-  const _StoryAvatar({
-    required this.label,
-    this.imageUrl,
-    required this.displayName,
-    required this.hasUnseen,
-    this.isMine = false,
-    required this.onTap,
-    this.onView,
-  });
+  final _StoryEntry entry;
+  const _StoryAvatar({required this.entry});
 
   @override
   Widget build(BuildContext context) {
-    final ring = hasUnseen ? Colors.blue : Colors.grey.withValues(alpha: 0.35);
+    final theme = Theme.of(context);
+    final showRing = entry.hasUnseen || (entry.isMine && entry.hasStory);
+    final ringColor = entry.hasUnseen
+        ? theme.colorScheme.primary
+        : theme.dividerColor.withValues(alpha: 0.5);
+
     return GestureDetector(
-      onTap: isMine && onView != null ? onView : onTap,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Stack(
-            children: [
-              Container(
-                width: 58,
-                height: 58,
-                padding: const EdgeInsets.all(2.5),
-                decoration: BoxDecoration(shape: BoxShape.circle, border: Border.all(color: isMine ? Colors.grey.withValues(alpha: 0.35) : ring, width: 2.5)),
-                child: CircleAvatar(
-                  backgroundImage: imageUrl != null
-                      ? NetworkImage(imageUrl!, headers: {
-                          'Authorization': 'Bearer ${StorageService.getToken() ?? ""}',
-                        })
-                      : null,
-                  child: imageUrl == null
-                      ? Text(displayName.isNotEmpty ? displayName[0] : '+',
-                          style: const TextStyle(fontWeight: FontWeight.w700))
-                      : null,
-                ),
-              ),
-              if (isMine)
-                Positioned(
-                  bottom: 0,
-                  right: 0,
-                  child: GestureDetector(
-                    onTap: onTap,
-                    child: Container(
-                      padding: const EdgeInsets.all(3),
-                      decoration: BoxDecoration(color: Theme.of(context).colorScheme.primary, shape: BoxShape.circle, border: Border.all(color: Colors.white, width: 2)),
-                      child: const Icon(Icons.add, size: 12, color: Colors.white),
+      onTap: entry.isMine && entry.onView != null ? entry.onView : entry.onTap,
+      behavior: HitTestBehavior.opaque,
+      child: SizedBox(
+        width: 66,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Stack(
+              clipBehavior: Clip.none,
+              children: [
+                Container(
+                  width: 56,
+                  height: 56,
+                  padding: const EdgeInsets.all(2),
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: showRing ? ringColor : Colors.transparent,
+                      width: 2,
                     ),
                   ),
+                  child: CircleAvatar(
+                    backgroundColor:
+                        theme.colorScheme.primary.withValues(alpha: 0.15),
+                    backgroundImage: entry.avatarUrl != null
+                        ? NetworkImage(entry.avatarUrl!, headers: {
+                            'Authorization':
+                                'Bearer ${StorageService.getToken() ?? ""}',
+                          })
+                        : null,
+                    child: entry.avatarUrl == null
+                        ? Text(
+                            entry.displayName.isNotEmpty
+                                ? entry.displayName.characters.first
+                                : '+',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          )
+                        : null,
+                  ),
                 ),
-            ],
-          ),
-          const SizedBox(height: 4),
-          SizedBox(
-            width: 64,
-            child: Text(label,
+                if (entry.isMine)
+                  Positioned(
+                    bottom: -1,
+                    right: -1,
+                    child: GestureDetector(
+                      onTap: entry.onTap,
+                      child: Container(
+                        padding: const EdgeInsets.all(2),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.primary,
+                          shape: BoxShape.circle,
+                          border: Border.all(
+                            color: theme.scaffoldBackgroundColor,
+                            width: 2,
+                          ),
+                        ),
+                        child: const Icon(Icons.add,
+                            size: 11, color: Colors.white),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            // Fixed slot for the caption: text can never push the column past
+            // the tray height, whatever the system font scale is.
+            SizedBox(
+              height: 14,
+              width: 66,
+              child: Text(
+                entry.label,
                 textAlign: TextAlign.center,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(fontSize: 10)),
-          ),
-        ],
+                style: const TextStyle(fontSize: 10, height: 1.2),
+                textScaler: TextScaler.noScaling,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

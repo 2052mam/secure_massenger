@@ -1060,16 +1060,20 @@ def update_live_location(message_id):
         return jsonify({'error': 'فقط فرستنده می‌تواند لوکیشن زنده را به‌روزرسانی کند'}), 403
     if msg.live_until and msg.live_until <= datetime.utcnow():
         return jsonify({'error': 'اشتراک لوکیشن زنده به پایان رسیده است'}), 410
-    try:
-        lat = float(data.get('latitude'))
-        lng = float(data.get('longitude'))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'مختصات نامعتبر است'}), 400
-    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
-        return jsonify({'error': 'مختصات نامعتبر است'}), 400
-    msg.latitude = lat
-    msg.longitude = lng
-    if data.get('stop'):
+    stopping = bool(data.get('stop'))
+    has_coords = data.get('latitude') is not None and data.get('longitude') is not None
+    # Stopping a share keeps the last known pin: coordinates are optional then.
+    if has_coords or not stopping:
+        try:
+            lat = float(data.get('latitude'))
+            lng = float(data.get('longitude'))
+        except (TypeError, ValueError):
+            return jsonify({'error': 'مختصات نامعتبر است'}), 400
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return jsonify({'error': 'مختصات نامعتبر است'}), 400
+        msg.latitude = lat
+        msg.longitude = lng
+    if stopping:
         from datetime import timedelta as _td
         msg.live_until = datetime.utcnow() - _td(seconds=1)
     db.session.commit()

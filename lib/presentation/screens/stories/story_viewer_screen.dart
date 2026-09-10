@@ -26,14 +26,33 @@ class _StoryViewerScreenState extends ConsumerState<StoryViewerScreen> {
   VideoPlayerController? _video;
   bool _paused = false;
 
-  StoryGroup get _group => widget.groups[_groupIndex];
-  StoryModel get _story => _group.stories[_storyIndex];
+  /// Only groups that actually have stories are navigable; an empty list is
+  /// handled in [build] so these getters are never reached with bad indices.
+  StoryGroup get _group =>
+      widget.groups[_groupIndex.clamp(0, widget.groups.length - 1)];
+  StoryModel get _story =>
+      _group.stories[_storyIndex.clamp(0, _group.stories.length - 1)];
+
+  bool get _isEmpty =>
+      widget.groups.isEmpty || widget.groups.every((g) => g.stories.isEmpty);
 
   @override
   void initState() {
     super.initState();
-    _groupIndex = widget.initialGroupIndex.clamp(0, widget.groups.length - 1);
-    _openCurrent();
+    _groupIndex = widget.groups.isEmpty
+        ? 0
+        : widget.initialGroupIndex.clamp(0, widget.groups.length - 1);
+    if (!_isEmpty) {
+      // A group with no stories would break the progress row.
+      if (_group.stories.isEmpty) {
+        _groupIndex = widget.groups.indexWhere((g) => g.stories.isNotEmpty);
+      }
+      _openCurrent();
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) Navigator.pop(context);
+      });
+    }
   }
 
   @override
@@ -78,10 +97,17 @@ class _StoryViewerScreenState extends ConsumerState<StoryViewerScreen> {
     final total = (seconds * 1000 / step.inMilliseconds).ceil().clamp(1, 100000);
     var tick = 0;
     _timer = Timer.periodic(step, (t) {
-      if (_paused || !mounted) return;
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      if (_paused) return;
       tick++;
-      setState(() => _progress = tick / total);
-      if (tick >= total) _next();
+      setState(() => _progress = (tick / total).clamp(0.0, 1.0));
+      if (tick >= total) {
+        t.cancel();
+        _next();
+      }
     });
   }
 
@@ -146,6 +172,12 @@ class _StoryViewerScreenState extends ConsumerState<StoryViewerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isEmpty) {
+      return const Scaffold(
+        backgroundColor: Colors.black,
+        body: Center(child: CircularProgressIndicator(color: Colors.white)),
+      );
+    }
     final myId = ref.watch(authNotifierProvider).valueOrNull?.id;
     final story = _story;
     final author = story.author ?? _group.user;
@@ -304,7 +336,15 @@ class _StoryViewerScreenState extends ConsumerState<StoryViewerScreen> {
     if (story.storyType == 'video') {
       final ctrl = _video;
       if (ctrl != null && ctrl.value.isInitialized) {
-        return Center(child: AspectRatio(aspectRatio: ctrl.value.aspectRatio, child: VideoPlayer(ctrl)));
+        // A zero/NaN aspect ratio from a broken stream would throw during
+        // layout, which is exactly the kind of frame error to avoid here.
+        final ratio = ctrl.value.aspectRatio;
+        return Center(
+          child: AspectRatio(
+            aspectRatio: (ratio.isFinite && ratio > 0) ? ratio : 9 / 16,
+            child: VideoPlayer(ctrl),
+          ),
+        );
       }
       return const Center(child: CircularProgressIndicator(color: Colors.white));
     }
