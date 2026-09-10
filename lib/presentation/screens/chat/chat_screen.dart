@@ -82,6 +82,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   bool _hasChatInfo = false;
   bool _refreshingChatInfo = false;
   bool _chatUnavailable = false;
+  bool _allowForwarding = true;
   bool _openingInvite = false;
   Route<void>? _photoRoute;
   String? _photoMessageId;
@@ -422,7 +423,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     }
   }
 
-  ReplyPreviewModel? _replyPreviewFor(MessageModel me  ReplyPreviewModel? _replyPreviewFor(MessageModel message) {
+  ReplyPreviewModel? _replyPreviewFor(MessageModel message) {
     if (message.replyTo != null) return message.replyTo;
     final id = message.replyToId;
     if (id == null) return null;
@@ -483,7 +484,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     } catch (_) {
       if (mounted)
         ScaffoldMessenger.of(context).showSnackBar(
-      available)),
+          SnackBar(content: Text(MediaLabels.of(context).unavailable)),
         );
     } finally {
       _jumpingToReply = false;
