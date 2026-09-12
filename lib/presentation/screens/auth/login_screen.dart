@@ -2,19 +2,19 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../../core/theme/app_theme.dart';
-import '../../../data/services/api_service.dart';
-import '../../../data/services/account_service.dart';
-import '../../../data/services/device_service.dart';
 import '../../../data/models/user_model.dart';
+import '../../../data/services/account_service.dart';
+import '../../../data/services/api_service.dart';
+import '../../../data/services/device_service.dart';
 import '../../providers/auth_provider.dart';
 import '../../widgets/chat/chat_avatar.dart';
+import 'phone_verification_screen.dart';
 import 'register_screen.dart';
 import 'two_factor_screen.dart';
 
 class LoginScreen extends ConsumerStatefulWidget {
   /// True when this screen was pushed by "Add account" while another account
-  /// is still signed in. In that mode the screen is a normal, dismissible
-  /// route: backing out keeps the current account exactly as it was.
+  /// is still signed in. Backing out keeps the current account unchanged.
   final bool isAddAccount;
 
   const LoginScreen({super.key, this.isAddAccount = false});
@@ -25,14 +25,14 @@ class LoginScreen extends ConsumerStatefulWidget {
 
 class _LoginScreenState extends ConsumerState<LoginScreen> {
   final _formKey = GlobalKey<FormState>();
+  final _mobileCtrl = TextEditingController(text: '+98');
   final _emailCtrl = TextEditingController();
   final _passwordCtrl = TextEditingController();
   bool _loading = false;
   bool _obscure = true;
+  bool _legacyMode = false;
   String? _error;
 
-  /// Accounts already stored on the device. Shown when the user lands here
-  /// signed-out so a previous session is always one tap away.
   List<SavedAccount> _saved = [];
   bool _switching = false;
 
@@ -44,6 +44,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
 
   @override
   void dispose() {
+    _mobileCtrl.dispose();
     _emailCtrl.dispose();
     _passwordCtrl.dispose();
     super.dispose();
@@ -53,9 +54,12 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     final list = await AccountService.list();
     if (!mounted) return;
     final currentId = ref.read(authNotifierProvider).valueOrNull?.id;
-    setState(() {
-      _saved = list.where((a) => a.userId != currentId).toList();
-    });
+    setState(() => _saved = list.where((account) => account.userId != currentId).toList());
+  }
+
+  bool _validPhone(String value) {
+    final compact = value.replaceAll(RegExp(r'[\s()\-.]'), '');
+    return RegExp(r'^(?:\+|00)?[0-9]{8,15}$').hasMatch(compact);
   }
 
   Future<void> _submit() async {
@@ -64,58 +68,68 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
       _loading = true;
       _error = null;
     });
-
     try {
-      // مرحله اول: فقط ایمیل و پسورد → سرور می‌گوید 2FA لازم است
-      final res = await ApiService().post('/auth/login', {
-        'email': _emailCtrl.text.trim(),
-        'password': _passwordCtrl.text,
-        'device_info': await DeviceService.getDeviceInfo(),
-      });
-
-      if (!mounted) return;
-      // اگر مستقیم توکن داد (نباید اتفاق بیفتد چون 2FA اجباری است)
-      if (res['access_token'] != null) {
-        await _saveSession(res);
-        return;
+      if (_legacyMode) {
+        await _submitLegacy();
+      } else {
+        await _submitPhone();
       }
-    } on ApiException catch (e) {
+    } on ApiException catch (error) {
       if (!mounted) return;
-      if (e.statusCode == 401 && e.message.contains('2FA')) {
-        // برو صفحه 2FA
-        if (!mounted) return;
+      if (_legacyMode && error.statusCode == 401 && error.message.contains('2FA')) {
         Navigator.of(context).push(
           MaterialPageRoute(
             builder: (_) => TwoFactorScreen(
               email: _emailCtrl.text.trim(),
               password: _passwordCtrl.text,
-              isLogin: true,
             ),
           ),
         );
       } else {
-        setState(() => _error = e.message);
+        setState(() => _error = error.message);
       }
-    } catch (e) {
+    } catch (_) {
       if (mounted) setState(() => _error = 'خطا در ارتباط با سرور');
     } finally {
       if (mounted) setState(() => _loading = false);
     }
   }
 
-  Future<void> _saveSession(Map<String, dynamic> res) async {
-    final user = UserModel.fromJson(res['user'] as Map<String, dynamic>);
-    await ref
-        .read(authNotifierProvider.notifier)
-        .setLoggedIn(
-          user,
-          res['access_token'] as String,
-          res['refresh_token'] as String? ?? '',
-        );
-    // app.dart resets the auth route stack after the identity changes.
+  Future<void> _submitPhone() async {
+    final response = await ApiService().post('/auth/request-phone-code', {
+      'mobile_number': _mobileCtrl.text.trim(),
+    });
+    if (!mounted) return;
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => PhoneVerificationScreen(
+          verificationId: response['verification_id'] as String,
+          mobileNumber: response['mobile_number'] as String? ?? _mobileCtrl.text.trim(),
+          flow: PhoneVerificationFlow.login,
+        ),
+      ),
+    );
   }
 
-  /// Resume a previously signed-in account without retyping credentials.
+  Future<void> _submitLegacy() async {
+    final response = await ApiService().post('/auth/login', {
+      'email': _emailCtrl.text.trim(),
+      'password': _passwordCtrl.text,
+      'device_info': await DeviceService.getDeviceInfo(),
+    });
+    if (!mounted) return;
+    await _saveSession(response);
+  }
+
+  Future<void> _saveSession(Map<String, dynamic> response) async {
+    final user = UserModel.fromJson(response['user'] as Map<String, dynamic>);
+    await ref.read(authNotifierProvider.notifier).setLoggedIn(
+          user,
+          response['access_token'] as String,
+          response['refresh_token'] as String? ?? '',
+        );
+  }
+
   Future<void> _useSavedAccount(SavedAccount account) async {
     if (_switching) return;
     setState(() {
@@ -124,14 +138,12 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
     });
     try {
       await ref.read(authNotifierProvider.notifier).switchAccount(account);
-      // Identity change rebuilds the app at its chat list; nothing to pop.
-    } catch (e) {
+    } catch (_) {
       if (!mounted) return;
       setState(() {
         _switching = false;
-        _error = 'ورود با این حساب ممکن نشد. رمز عبور را وارد کنید.';
+        _error = 'ورود با این حساب ممکن نشد. شماره موبایل یا رمز عبور را وارد کنید.';
       });
-      // A stale saved session should not linger in the list.
       await AccountService.remove(account.userId);
       await _loadSavedAccounts();
     }
@@ -140,6 +152,7 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
   @override
   Widget build(BuildContext context) {
     final canPop = widget.isAddAccount && Navigator.of(context).canPop();
+    final phoneMode = !_legacyMode;
     return Scaffold(
       appBar: widget.isAddAccount
           ? AppBar(
@@ -161,144 +174,124 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
               key: _formKey,
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(
-                    Icons.lock_outline_rounded,
-                    size: 72,
-                    color: AppTheme.primaryColor,
-                  ),
+                  const Icon(Icons.lock_outline_rounded, size: 72, color: AppTheme.primaryColor),
                   const SizedBox(height: 16),
                   Text(
-                    widget.isAddAccount
-                        ? 'افزودن حساب جدید'
-                        : 'ورود به SecureMessenger',
-                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                      fontWeight: FontWeight.bold,
-                    ),
+                    widget.isAddAccount ? 'افزودن حساب جدید' : 'ورود به SecureMessenger',
+                    style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold),
                     textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    'ایمیل و رمز عبور خود را وارد کنید',
-                    style: Theme.of(
-                      context,
-                    ).textTheme.bodyMedium?.copyWith(color: Colors.grey),
+                    phoneMode
+                        ? 'شماره موبایل خود را وارد کنید تا کد ورود پیامک شود'
+                        : 'ورود ایمیلی فقط برای حساب‌های قدیمیِ بدون شماره موبایل است',
+                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.grey),
+                    textAlign: TextAlign.center,
                   ),
                   const SizedBox(height: 24),
-                  // Signed-out users with saved accounts get a one-tap way
-                  // back into a session they already had.
                   if (_saved.isNotEmpty) ...[
                     Align(
                       alignment: AlignmentDirectional.centerStart,
-                      child: Text(
-                        'ادامه با حساب‌های ذخیره‌شده',
-                        style: Theme.of(context).textTheme.labelLarge,
-                      ),
+                      child: Text('ادامه با حساب‌های ذخیره‌شده', style: Theme.of(context).textTheme.labelLarge),
                     ),
                     const SizedBox(height: 8),
                     ..._saved.map(
-                      (a) => Card(
+                      (account) => Card(
                         margin: const EdgeInsets.only(bottom: 8),
                         child: ListTile(
                           leading: ChatAvatar(
-                            title: a.displayName,
-                            url: a.avatarUrl,
-                            token: a.accessToken,
+                            title: account.displayName,
+                            url: account.avatarUrl,
+                            token: account.accessToken,
                           ),
-                          title: Text(a.displayName),
-                          subtitle: Text(a.handle),
+                          title: Text(account.displayName),
+                          subtitle: Text(account.handle),
                           trailing: _switching
-                              ? const SizedBox(
-                                  width: 18,
-                                  height: 18,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                )
+                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                               : const Icon(Icons.login, size: 20),
-                          onTap: _switching ? null : () => _useSavedAccount(a),
+                          onTap: _switching ? null : () => _useSavedAccount(account),
                         ),
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Row(
+                    const Row(
                       children: [
-                        const Expanded(child: Divider()),
-                        Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          child: Text(
-                            'یا',
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
-                        ),
-                        const Expanded(child: Divider()),
+                        Expanded(child: Divider()),
+                        Padding(padding: EdgeInsets.symmetric(horizontal: 8), child: Text('یا')),
+                        Expanded(child: Divider()),
                       ],
                     ),
                     const SizedBox(height: 16),
                   ],
-                  TextFormField(
-                    controller: _emailCtrl,
-                    keyboardType: TextInputType.emailAddress,
-                    decoration: const InputDecoration(
-                      labelText: 'ایمیل',
-                      prefixIcon: Icon(Icons.email_outlined),
-                    ),
-                    validator: (v) {
-                      if (v == null || v.isEmpty) return 'ایمیل الزامی است';
-                      if (!v.contains('@')) return 'ایمیل نامعتبر';
-                      return null;
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                  TextFormField(
-                    controller: _passwordCtrl,
-                    obscureText: _obscure,
-                    decoration: InputDecoration(
-                      labelText: 'رمز عبور',
-                      prefixIcon: const Icon(Icons.lock_outline),
-                      suffixIcon: IconButton(
-                        icon: Icon(
-                          _obscure ? Icons.visibility_off : Icons.visibility,
-                        ),
-                        onPressed: () => setState(() => _obscure = !_obscure),
+                  if (phoneMode)
+                    TextFormField(
+                      controller: _mobileCtrl,
+                      keyboardType: TextInputType.phone,
+                      decoration: const InputDecoration(
+                        labelText: 'شماره موبایل',
+                        prefixIcon: Icon(Icons.phone_outlined),
+                        helperText: 'با کد کشور وارد کنید؛ مثال: +989121234567',
                       ),
+                      validator: (value) => _validPhone(value ?? '') ? null : 'شماره موبایل نامعتبر است',
+                    )
+                  else ...[
+                    TextFormField(
+                      controller: _emailCtrl,
+                      keyboardType: TextInputType.emailAddress,
+                      decoration: const InputDecoration(
+                        labelText: 'ایمیل',
+                        prefixIcon: Icon(Icons.email_outlined),
+                      ),
+                      validator: (value) {
+                        if (value == null || value.isEmpty) return 'ایمیل الزامی است';
+                        return value.contains('@') ? null : 'ایمیل نامعتبر';
+                      },
                     ),
-                    validator: (v) {
-                      if (v == null || v.length < 8) return 'حداقل ۸ کاراکتر';
-                      return null;
-                    },
-                  ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _passwordCtrl,
+                      obscureText: _obscure,
+                      decoration: InputDecoration(
+                        labelText: 'رمز عبور',
+                        prefixIcon: const Icon(Icons.lock_outline),
+                        suffixIcon: IconButton(
+                          icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility),
+                          onPressed: () => setState(() => _obscure = !_obscure),
+                        ),
+                      ),
+                      validator: (value) => (value == null || value.length < 8) ? 'حداقل ۸ کاراکتر' : null,
+                    ),
+                  ],
                   if (_error != null) ...[
                     const SizedBox(height: 16),
-                    Text(_error!, style: const TextStyle(color: Colors.red)),
+                    Text(_error!, style: const TextStyle(color: Colors.red), textAlign: TextAlign.center),
                   ],
                   const SizedBox(height: 24),
                   SizedBox(
-                    width: double.infinity,
                     height: 50,
                     child: ElevatedButton(
                       onPressed: _loading ? null : _submit,
                       child: _loading
-                          ? const SizedBox(
-                              width: 24,
-                              height: 24,
-                              child: CircularProgressIndicator(
-                                strokeWidth: 2,
-                                color: Colors.white,
-                              ),
-                            )
-                          : const Text('ورود'),
+                          ? const SizedBox(width: 24, height: 24, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white))
+                          : Text(phoneMode ? 'ارسال کد ورود' : 'ورود'),
                     ),
                   ),
-                  const SizedBox(height: 16),
                   TextButton(
-                    onPressed: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => const RegisterScreen(),
-                        ),
-                      );
-                    },
+                    onPressed: _loading
+                        ? null
+                        : () => setState(() {
+                              _legacyMode = !_legacyMode;
+                              _error = null;
+                            }),
+                    child: Text(phoneMode ? 'حساب قدیمی دارم (ورود با ایمیل)' : 'ورود با شماره موبایل'),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(builder: (_) => const RegisterScreen()),
+                    ),
                     child: const Text('حساب ندارید؟ ثبت‌نام کنید'),
                   ),
                   if (canPop)

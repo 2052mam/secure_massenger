@@ -5,7 +5,7 @@ import '../../../data/services/api_service.dart';
 import '../../../data/services/device_service.dart';
 import '../../../data/services/terms_service.dart';
 import '../../widgets/chat/terms_dialog.dart';
-import 'two_factor_setup_screen.dart';
+import 'phone_verification_screen.dart';
 
 class RegisterScreen extends ConsumerStatefulWidget {
   const RegisterScreen({super.key});
@@ -17,6 +17,7 @@ class RegisterScreen extends ConsumerStatefulWidget {
 class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   final _formKey = GlobalKey<FormState>();
   final _emailCtrl = TextEditingController();
+  final _mobileCtrl = TextEditingController(text: '+98');
   final _passwordCtrl = TextEditingController();
   final _usernameCtrl = TextEditingController();
   final _displayNameCtrl = TextEditingController();
@@ -28,6 +29,7 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
   @override
   void dispose() {
     _emailCtrl.dispose();
+    _mobileCtrl.dispose();
     _passwordCtrl.dispose();
     _usernameCtrl.dispose();
     _displayNameCtrl.dispose();
@@ -55,6 +57,7 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
       final username = _usernameCtrl.text.trim().toLowerCase();
       final res = await ApiService().post('/auth/register', {
         'email': _emailCtrl.text.trim().toLowerCase(),
+        'mobile_number': _mobileCtrl.text.trim(),
         'password': _passwordCtrl.text,
         if (username.isNotEmpty) 'username': username,
         'display_name': _displayNameCtrl.text.trim(),
@@ -66,11 +69,10 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
-          builder: (_) => TwoFactorSetupScreen(
-            userId: res['user_id'] as String,
-            totpSecret: res['totp_secret'] as String,
-            totpUri: res['totp_uri'] as String,
-            warning: res['warning'] as String? ?? '',
+          builder: (_) => PhoneVerificationScreen(
+            verificationId: res['verification_id'] as String,
+            mobileNumber: res['mobile_number'] as String? ?? _mobileCtrl.text.trim(),
+            flow: PhoneVerificationFlow.registration,
           ),
         ),
       );
@@ -101,7 +103,7 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                 ),
                 const SizedBox(height: 8),
                 const Text(
-                  'بعد از ثبت‌نام، فعال‌سازی Google Authenticator اجباری است.',
+                  'برای ادامه، یک کد تأیید با پیامک ارسال می‌شود. Google Authenticator اختیاری است.',
                   style: TextStyle(color: Colors.grey),
                 ),
                 const SizedBox(height: 24),
@@ -142,6 +144,23 @@ class _RegisterScreenState extends ConsumerState<RegisterScreen> {
                   ),
                   validator: (v) {
                     if (v == null || !v.contains('@')) return 'ایمیل نامعتبر';
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 16),
+                TextFormField(
+                  controller: _mobileCtrl,
+                  keyboardType: TextInputType.phone,
+                  decoration: const InputDecoration(
+                    labelText: 'شماره موبایل',
+                    prefixIcon: Icon(Icons.phone_outlined),
+                    helperText: 'با کد کشور وارد کنید؛ مثال: +989121234567',
+                  ),
+                  validator: (v) {
+                    final compact = (v ?? '').replaceAll(RegExp(r'[\s()\-.]'), '');
+                    if (!RegExp(r'^(?:\+|00)?[0-9]{8,15}$').hasMatch(compact)) {
+                      return 'شماره موبایل نامعتبر';
+                    }
                     return null;
                   },
                 ),

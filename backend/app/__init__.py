@@ -28,6 +28,20 @@ def create_app():
     app.config['ADMIN_SECRET_PATH'] = os.getenv('ADMIN_SECRET_PATH', 'sm-admin-x9k2p7')
     app.config['MAX_ACCOUNTS_PER_DEVICE'] = int(os.getenv('MAX_ACCOUNTS_PER_DEVICE', 3))
 
+    # SMS.ir credentials deliberately stay server-side. The Flutter client
+    # talks only to this API; it never contains or sees a provider API key.
+    app.config['SMS_DELIVERY_MODE'] = os.getenv('SMS_DELIVERY_MODE', 'sms_ir')
+    app.config['SMS_IR_API_KEY'] = os.getenv('SMS_IR_API_KEY')
+    app.config['SMS_IR_TEMPLATE_ID'] = os.getenv('SMS_IR_TEMPLATE_ID')
+    app.config['SMS_IR_CODE_PARAMETER'] = os.getenv('SMS_IR_CODE_PARAMETER', 'CODE')
+    app.config['SMS_IR_TEMPLATE_PARAMETERS'] = os.getenv('SMS_IR_TEMPLATE_PARAMETERS', '')
+    app.config['SMS_IR_TIMEOUT_SECONDS'] = int(os.getenv('SMS_IR_TIMEOUT_SECONDS', 10))
+    app.config['PHONE_CODE_TTL_SECONDS'] = int(os.getenv('PHONE_CODE_TTL_SECONDS', 600))
+    app.config['PHONE_CODE_RESEND_SECONDS'] = int(os.getenv('PHONE_CODE_RESEND_SECONDS', 60))
+    app.config['PHONE_CODE_MAX_ATTEMPTS'] = int(os.getenv('PHONE_CODE_MAX_ATTEMPTS', 5))
+    app.config['PHONE_CODE_MAX_PER_HOUR'] = int(os.getenv('PHONE_CODE_MAX_PER_HOUR', 5))
+    app.config['PHONE_CODE_MAX_PER_IP_HOUR'] = int(os.getenv('PHONE_CODE_MAX_PER_IP_HOUR', 20))
+
     os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
     db.init_app(app)

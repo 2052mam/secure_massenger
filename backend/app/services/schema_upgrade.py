@@ -9,6 +9,10 @@ from app import db
 def upgrade_schema():
     additions = {
         'users': {
+            # Phone-primary authentication (E.164); existing accounts keep a
+            # NULL value and may use the legacy email/password route.
+            'mobile_number': 'VARCHAR(16) NULL',
+            'mobile_verified_at': 'DATETIME NULL',
             'allow_group_adds': 'BOOLEAN NOT NULL DEFAULT 1',
             'archive_pin_hash': 'VARCHAR(255) NULL',
             'archive_pin_updated_at': 'DATETIME NULL',
@@ -72,6 +76,19 @@ def upgrade_schema():
                 if column not in existing:
                     connection.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {definition}'))
 
+    # ``ALTER TABLE`` does not add the model's unique index on existing
+    # databases. Create it explicitly after the nullable column is present;
+    # NULL values remain valid for pre-phone-auth accounts.
+    with db.engine.begin() as connection:
+        inspector = inspect(connection)
+        if inspector.has_table('users'):
+            index_names = {item['name'] for item in inspector.get_indexes('users')}
+            unique_names = {item['name'] for item in inspector.get_unique_constraints('users')}
+            if 'ux_users_mobile_number' not in index_names | unique_names:
+                connection.execute(text(
+                    'CREATE UNIQUE INDEX ux_users_mobile_number ON users (mobile_number)'
+                ))
+
     # New, self contained tables (folders, profile albums, search history, reports, stickers, gifs).
     # create_all only creates what is missing and never rewrites existing rows.
     from app.models.folder import ChatFolder, ChatFolderItem  # noqa: F401
@@ -81,6 +98,7 @@ def upgrade_schema():
     from app.models.gif import SavedGif  # noqa: F401
     from app.models.message import MessageReaction  # ensure exists
     from app.models.story import Story, StoryView  # noqa: F401
+    from app.models.user import PhoneVerification  # noqa: F401
 
     db.metadata.create_all(bind=db.engine)
     # Also ensure specific tables exist individually for older SQLAlchemy metadata
@@ -89,5 +107,5 @@ def upgrade_schema():
         UserPhoto.__table__, SearchHistory.__table__,
         Report.__table__, StickerPack.__table__, Sticker.__table__, SavedGif.__table__,
         MessageReaction.__table__,
-        Story.__table__, StoryView.__table__,
+        Story.__table__, StoryView.__table__, PhoneVerification.__table__,
     ])

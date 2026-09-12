@@ -4,6 +4,8 @@ import 'package:equatable/equatable.dart';
 class UserModel extends Equatable {
   final String id;
   final String email;
+  /// Private, verified E.164 sign-in number (never present in public users).
+  final String? mobileNumber;
   // Telegram-like: username (@id) is OPTIONAL and may be null.
   final String? username;
   final String displayName;
@@ -17,11 +19,13 @@ class UserModel extends Equatable {
   final bool allowGroupAdds;
   final bool allowForwarding;
   final int termsVersion;
+  final bool isTwoFactorEnabled;
   final bool isAdmin;
 
   const UserModel({
     required this.id,
     required this.email,
+    this.mobileNumber,
     this.username,
     required this.displayName,
     this.bio,
@@ -34,6 +38,7 @@ class UserModel extends Equatable {
     this.allowGroupAdds = true,
     this.allowForwarding = true,
     this.termsVersion = 0,
+    this.isTwoFactorEnabled = false,
     this.isAdmin = false,
   });
 
@@ -49,6 +54,7 @@ class UserModel extends Equatable {
     return UserModel(
       id: json['id'] as String,
       email: json['email'] as String? ?? '',
+      mobileNumber: json['mobile_number'] as String?,
       username: json['username'] as String?,
       displayName: json['display_name'] as String,
       bio: json['bio'] as String?,
@@ -61,6 +67,7 @@ class UserModel extends Equatable {
       allowGroupAdds: json['allow_group_adds'] as bool? ?? true,
       allowForwarding: json['allow_forwarding'] as bool? ?? true,
       termsVersion: json['terms_version'] as int? ?? 0,
+      isTwoFactorEnabled: json['is_2fa_enabled'] as bool? ?? false,
       isAdmin: json['is_admin'] as bool? ?? false,
     );
   }
@@ -69,6 +76,7 @@ class UserModel extends Equatable {
     return {
       'id': id,
       'email': email,
+      'mobile_number': mobileNumber,
       'username': username,
       'display_name': displayName,
       'bio': bio,
@@ -79,6 +87,7 @@ class UserModel extends Equatable {
       'show_profile_photo': showProfilePhoto,
       'show_bio': showBio,
       'allow_group_adds': allowGroupAdds,
+      'is_2fa_enabled': isTwoFactorEnabled,
     };
   }
 
@@ -86,6 +95,7 @@ class UserModel extends Equatable {
   List<Object?> get props => [
     id,
     email,
+    mobileNumber,
     username,
     displayName,
     bio,
@@ -98,6 +108,7 @@ class UserModel extends Equatable {
     allowGroupAdds,
     allowForwarding,
     termsVersion,
+    isTwoFactorEnabled,
     isAdmin,
   ];
 }

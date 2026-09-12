@@ -10,6 +10,10 @@ class User(db.Model):
 
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
+    # E.164 is stored at rest (for example, +989121234567). It is private and
+    # used as the primary sign-in identifier after it has been verified.
+    mobile_number = db.Column(db.String(16), unique=True, nullable=True, index=True)
+    mobile_verified_at = db.Column(db.DateTime, nullable=True)
     password_hash = db.Column(db.String(255), nullable=False)
     # Telegram-like: username (@id) is OPTIONAL. NULL means the user has no
     # public id. Unique only when set (NULLs never collide in MySQL/SQLite).
@@ -17,18 +21,21 @@ class User(db.Model):
     display_name = db.Column(db.String(100), nullable=False)
     bio = db.Column(db.Text, nullable=True)
     avatar_url = db.Column(db.String(500), nullable=True)
-    
-    # 2FA
+
+    # Google Authenticator is optional. A secret is pre-generated for schema
+    # compatibility; it is only exposed when the owner explicitly enables 2FA.
     totp_secret = db.Column(db.String(32), nullable=False)
-    is_2fa_enabled = db.Column(db.Boolean, default=True, nullable=False)
-    
+    is_2fa_enabled = db.Column(
+        db.Boolean, default=False, nullable=False, server_default=db.false()
+    )
+
     # Privacy
     is_online = db.Column(db.Boolean, default=False)
     last_seen = db.Column(db.DateTime, default=datetime.utcnow)
     show_last_seen = db.Column(db.Boolean, default=True)  # Ghost mode = False
     show_profile_photo = db.Column(db.Boolean, default=True)
     show_bio = db.Column(db.Boolean, default=True)
-    
+
     allow_group_adds = db.Column(db.Boolean, nullable=False, default=True, server_default=db.true())
 
     # Telegram-like: block forwarding of my messages (privacy).
@@ -52,12 +59,12 @@ class User(db.Model):
     limited_until = db.Column(db.DateTime, nullable=True)
     limited_reason = db.Column(db.Text, nullable=True)
     limited_by = db.Column(db.String(36), nullable=True)
-    
+
     # Soft Delete
     is_deleted = db.Column(db.Boolean, default=False, index=True)
     deleted_at = db.Column(db.DateTime, nullable=True)
     deleted_by = db.Column(db.String(36), nullable=True)
-    
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -80,8 +87,10 @@ class User(db.Model):
         )
 
     def verify_totp(self, code: str) -> bool:
+        if not self.totp_secret or not isinstance(code, str):
+            return False
         totp = pyotp.TOTP(self.totp_secret)
-        return totp.verify(code, valid_window=2)  # ±60s برای ناهمزمانی ساعت سرور/گوشی (تهران)
+        return totp.verify(code, valid_window=2)  # ±60s for device clock drift
 
     # ----- Archive lock (4 digit PIN) -------------------------------------
     def set_archive_pin(self, pin: str):
@@ -122,6 +131,8 @@ class User(db.Model):
         if include_private:
             data.update({
                 'email': self.email,
+                'mobile_number': self.mobile_number,
+                'mobile_verified_at': utc_iso(self.mobile_verified_at) if self.mobile_verified_at else None,
                 'avatar_url': self.avatar_url,
                 'bio': self.bio,
                 'allow_group_adds': self.allow_group_adds,
@@ -143,7 +154,7 @@ class UserDevice(db.Model):
 
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False, index=True)
-    
+
     device_fingerprint = db.Column(db.String(255), nullable=False, index=True)
     mac_address = db.Column(db.String(64), nullable=True)
     device_name = db.Column(db.String(150), nullable=True)
@@ -151,14 +162,14 @@ class UserDevice(db.Model):
     os_version = db.Column(db.String(100), nullable=True)
     app_version = db.Column(db.String(50), nullable=True)
     user_agent = db.Column(db.Text, nullable=True)
-    
+
     is_active = db.Column(db.Boolean, default=True)
     last_active = db.Column(db.DateTime, default=datetime.utcnow)
-    
+
     # Soft Delete
     is_deleted = db.Column(db.Boolean, default=False)
     deleted_at = db.Column(db.DateTime, nullable=True)
-    
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     __table_args__ = (
@@ -173,14 +184,40 @@ class UserSession(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False, index=True)
     device_id = db.Column(db.String(36), db.ForeignKey('user_devices.id'), nullable=True)
-    
+
     refresh_token = db.Column(db.String(512), unique=True, nullable=False)
     ip_address = db.Column(db.String(45), nullable=True)
     is_active = db.Column(db.Boolean, default=True)
-    
+
     expires_at = db.Column(db.DateTime, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     last_used = db.Column(db.DateTime, default=datetime.utcnow)
+
+
+class PhoneVerification(db.Model):
+    """One-time, server-side phone verification challenge.
+
+    The OTP is stored as a keyed digest in ``code_hash``. It is never returned
+    by an API, written to the audit log, or persisted in clear text.
+    """
+    __tablename__ = 'phone_verifications'
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=True, index=True)
+    mobile_number = db.Column(db.String(16), nullable=False, index=True)
+    purpose = db.Column(db.String(32), nullable=False, index=True)
+    code_hash = db.Column(db.String(64), nullable=False)
+    attempts = db.Column(db.Integer, nullable=False, default=0, server_default='0')
+    expires_at = db.Column(db.DateTime, nullable=False, index=True)
+    verified_at = db.Column(db.DateTime, nullable=True)
+    consumed_at = db.Column(db.DateTime, nullable=True)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+    ip_address = db.Column(db.String(45), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        db.Index('idx_phone_verification_lookup', 'mobile_number', 'purpose', 'created_at'),
+    )
 
 
 class BlockList(db.Model):
@@ -189,9 +226,9 @@ class BlockList(db.Model):
     id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     blocker_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False, index=True)
     blocked_id = db.Column(db.String(36), db.ForeignKey('users.id'), nullable=False, index=True)
-    
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    
+
     # Soft Delete (unblock)
     is_deleted = db.Column(db.Boolean, default=False)
     deleted_at = db.Column(db.DateTime, nullable=True)

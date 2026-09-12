@@ -3,9 +3,9 @@ from app.services.timestamps import utc_iso
 from flask import Blueprint, request, jsonify, current_app, send_from_directory
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from app import db
-from app.models.user import User, BlockList
+from app.models.user import BlockList
 from app.models.chat import Chat, ChatMember
-from app.models.message import Message, MessageStatus, MessageReaction, PinnedMessage, MessageHide
+from app.models.message import Message, MessageStatus, PinnedMessage, MessageHide
 from app.models.media import MediaFile
 from app.models.audit import AuditLog
 from datetime import datetime
@@ -295,8 +295,9 @@ def send_message():
         ).first()
         if media is None:
             return jsonify({'error': 'فایل در دسترس نیست'}), 403
-        # Telegram allows sending images/videos/audio as generic files (document).
-        # So 'file' accepts any media_type; others must match strictly.
+        # Treating an image/video/audio as a generic `file` would let a client
+        # bypass the corresponding group permission. A `file` is therefore a
+        # document upload; media must retain its true message type.
         if message_type != 'file':
             expected = {'image': 'image', 'video': 'video', 'voice': 'audio',
                         'audio': 'audio', 'music': 'audio',
@@ -321,7 +322,8 @@ def send_message():
                     audio_artist = media.artist
                 if audio_title is None and media.original_name:
                     audio_title = media.original_name.rsplit('.', 1)[0][:200]
-        # else file: accept any media_type (image, video, audio, document) like Telegram
+        elif media.media_type != 'document':
+            return jsonify({'error': 'Media type does not match the message type'}), 400
         if is_view_once and media.media_type != 'image':
             return jsonify({'error': 'فایل باید عکس باشد'}), 400
         # Reusing an ephemeral upload as a normal message bypasses view-once.
@@ -765,7 +767,6 @@ def mark_chat_read(chat_id):
             s.read_at = datetime.utcnow()
 
         # برای پیام‌هایی که status ندارن بساز
-        existing_ids = {s.message_id for s in existing_statuses}
         all_statuses = MessageStatus.query.filter(
             MessageStatus.message_id.in_(msg_ids),
             MessageStatus.user_id == user_id,

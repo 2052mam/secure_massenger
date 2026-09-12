@@ -100,7 +100,7 @@ def test_shared_history_clear_is_owner_only(app, client, auth, group, kind, user
     owner = user == 'alice'
     assert post(client, auth, 'messages/chat/group/clear', {'for_all': True}, user).status_code == (200 if owner else 403)
     assert post(client, auth, 'messages/chat/group/clear', {'for_all': False}, user).status_code == 200
-    assert client.get(f'/api/v1/chats/group/info', headers=auth(user)).json[
+    assert client.get('/api/v1/chats/group/info', headers=auth(user)).json[
         'capabilities']['clear_history_for_all'] is owner
     if user == 'bob':
         assert post(client, auth, 'chats/group/delete', {'for_all': True}, user).status_code == 403
@@ -274,6 +274,12 @@ def test_additive_schema_upgrade_preserves_old_rows_and_is_repeatable(app):
         db.session.remove()
         # Simulate an installation before these columns/tables existed.
         with db.engine.begin() as conn:
+            user_indexes = {item['name'] for item in inspect(conn).get_indexes('users')}
+            for name in ('ix_users_mobile_number', 'ux_users_mobile_number'):
+                if name in user_indexes:
+                    conn.execute(text(f'DROP INDEX {name}'))
+            conn.execute(text('ALTER TABLE users DROP COLUMN mobile_number'))
+            conn.execute(text('ALTER TABLE users DROP COLUMN mobile_verified_at'))
             conn.execute(text('ALTER TABLE users DROP COLUMN allow_group_adds'))
             conn.execute(text('ALTER TABLE users DROP COLUMN archive_pin_hash'))
             conn.execute(text('ALTER TABLE chats DROP COLUMN permissions'))
@@ -294,6 +300,9 @@ def test_additive_schema_upgrade_preserves_old_rows_and_is_repeatable(app):
         assert ChatMember.query.count() == 4
         assert ChatMember.query.filter_by(is_archived=False).count() == 4
         assert 'permissions' in {c['name'] for c in inspect(db.engine).get_columns('chats')}
+        user_columns = {c['name'] for c in inspect(db.engine).get_columns('users')}
+        assert {'mobile_number', 'mobile_verified_at'} <= user_columns
+        assert inspect(db.engine).has_table('phone_verifications')
         for table in ('chat_folders', 'chat_folder_items', 'user_photos', 'search_history'):
             assert inspect(db.engine).has_table(table)
 

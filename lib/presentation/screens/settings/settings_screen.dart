@@ -15,6 +15,7 @@ import 'device_management_screen.dart';
 import 'admin_reports_screen.dart';
 import 'sponsored_channels_screen.dart';
 import 'terms_screen.dart';
+import '../auth/two_factor_security_screen.dart';
 import '../home/archived_chats_screen.dart';
 import '../../widgets/chat/chat_labels.dart';
 
@@ -182,6 +183,19 @@ class SettingsScreen extends ConsumerWidget {
               ),
             ),
             const JoinPrivacyTile(),
+            ListTile(
+              key: const ValueKey('two-factor-security-tile'),
+              leading: const Icon(Icons.security_outlined),
+              title: Text(isFa ? 'تأیید دو مرحله‌ای' : 'Two-Step Verification'),
+              subtitle: Text(
+                user?.isTwoFactorEnabled == true
+                    ? (isFa ? 'Google Authenticator فعال است' : 'Google Authenticator is enabled')
+                    : (isFa ? 'اختیاری — ورود اصلی با پیامک است' : 'Optional — SMS remains the primary sign-in'),
+              ),
+              onTap: () => Navigator.of(context).push(
+                MaterialPageRoute(builder: (_) => const TwoFactorSecurityScreen()),
+              ),
+            ),
             ListTile(
               key: const ValueKey('archive-lock-tile'),
               leading: const Icon(Icons.lock_outline),
